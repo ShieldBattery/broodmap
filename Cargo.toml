@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "broodmap",
+    "broodmap-cli",
+]
