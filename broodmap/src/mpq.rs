@@ -9,6 +9,8 @@ use nom::multi::{count, many0, many_till};
 use nom::sequence::tuple;
 use nom::IResult;
 
+use thiserror::Error;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MpqHeader {
     /// The offset the header was found at, relative to the start of the input data.
@@ -26,6 +28,28 @@ struct MpqHeader {
     hash_table_size: u32,
     /// Number of entries in the block table.
     block_table_size: u32,
+}
+
+impl MpqHeader {
+    /// Returns the absolute offset of the hash table, from the beginning of the file.
+    fn hash_table_offset(&self) -> usize {
+        assert!(self.hash_table_pos >= -(self.offset as i32));
+        if self.hash_table_pos >= 0 {
+            (self.offset as usize) + (self.hash_table_pos as usize)
+        } else {
+            (self.offset - self.hash_table_pos.abs() as u32) as usize
+        }
+    }
+
+    /// Returns the absolute offset of the block table, from the beginning of the file.
+    fn block_table_offset(&self) -> usize {
+        assert!(self.block_table_pos >= -(self.offset as i32));
+        if self.block_table_pos >= 0 {
+            (self.offset as usize) + (self.block_table_pos as usize)
+        } else {
+            (self.offset - self.block_table_pos.abs() as u32) as usize
+        }
+    }
 }
 
 fn mpq_header_size(input: &[u8]) -> IResult<&[u8], u32> {
@@ -164,13 +188,14 @@ impl MpqHashType {
 }
 
 fn hash_str(str: &str, hash_type: MpqHashType) -> u32 {
+    let multiplier = hash_type.to_crypt_table_multiplier();
+
     let mut seed_a: u32 = 0x7FED_7FED;
     let mut seed_b: u32 = 0xEEEE_EEEE;
 
     for c in str.chars() {
         let c = c.to_ascii_uppercase();
-        seed_a = CRYPT_TABLE[hash_type.to_crypt_table_multiplier() * 256 + (c as usize)]
-            ^ (seed_a.wrapping_add(seed_b));
+        seed_a = CRYPT_TABLE[multiplier * 256 + (c as usize)] ^ (seed_a.wrapping_add(seed_b));
         seed_b = seed_b
             .wrapping_add(seed_b << 5)
             .wrapping_add(c as u32)
@@ -187,6 +212,9 @@ const BLOCK_INDEX_EMPTY: u32 = 0xFFFF_FFFF;
 /// Indicates that the hash table entry is empty but is due to a deleted file, does not terminate
 /// the search for a file.
 const BLOCK_INDEX_DELETED: u32 = 0xFFFF_FFFE;
+
+/// The size of each MPQ hash table entry in the file, in bytes.
+const MPQ_HASH_TABLE_ENTRY_SIZE: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MpqHashTableEntry {
@@ -233,6 +261,9 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
 
     r
 }
+
+/// The size of each MPQ hash table entry in the file, in bytes.
+const MPQ_BLOCK_TABLE_ENTRY_SIZE: usize = 16;
 
 bitflags! {
     struct MpqBlockFlags: u32 {
@@ -282,6 +313,76 @@ fn mpq_block_table(input: &[u8]) -> IResult<&[u8], Vec<MpqBlockTableEntry>> {
     r
 }
 
+#[derive(Error, Debug)]
+pub enum MpqError {
+    #[error("header not found")]
+    HeaderNotFound,
+    #[error("parser error")]
+    ParserError(nom::error::ErrorKind),
+}
+
+// TODO(tec27): Write a version of this that works with BufReader or similar
+#[derive(Debug)]
+pub struct Mpq<'a> {
+    data: &'a [u8],
+    header: MpqHeader,
+    hash_table: Vec<MpqHashTableEntry>,
+    block_table: Vec<MpqBlockTableEntry>,
+}
+
+impl<'a> Mpq<'a> {
+    /// Initializes an [Mpq] from the given data in-memory, which must be the entire MPQ file. This
+    /// method will eagerly parse the MPQ metadata, which will be used to fulfill later requests for
+    /// specific files.
+    pub fn from_bytes(data: &'a [u8]) -> Result<Self, MpqError> {
+        let header = match mpq_header(data) {
+            Ok((_, header)) => Ok(header),
+            Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
+            Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
+            // This is a Not Found, since we have all the data already
+            Err(nom::Err::Incomplete(_)) => Err(MpqError::HeaderNotFound),
+        }?;
+
+        let hash_table = {
+            let hash_table_offset = header.hash_table_offset();
+            let hash_table_size = ((header.hash_table_size as usize) * MPQ_HASH_TABLE_ENTRY_SIZE)
+                .clamp(0, data.len() - hash_table_offset);
+            let hash_data = &data[hash_table_offset..hash_table_offset + hash_table_size];
+            match mpq_hash_table(hash_data) {
+                Ok((_, hash_table)) => Ok(hash_table),
+                Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
+                Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
+                Err(nom::Err::Incomplete(_)) => {
+                    panic!("incomplete returned from a complete parser")
+                }
+            }
+        }?;
+
+        let block_table = {
+            let block_table_offset = header.block_table_offset();
+            let block_table_size = ((header.block_table_size as usize)
+                * MPQ_BLOCK_TABLE_ENTRY_SIZE)
+                .clamp(0, data.len() - block_table_offset);
+            let block_data = &data[block_table_offset..block_table_offset + block_table_size];
+            match mpq_block_table(block_data) {
+                Ok((_, block_table)) => Ok(block_table),
+                Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
+                Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
+                Err(nom::Err::Incomplete(_)) => {
+                    panic!("incomplete returned from a complete parser")
+                }
+            }
+        }?;
+
+        Ok(Self {
+            data,
+            header,
+            hash_table,
+            block_table,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,8 +393,9 @@ mod tests {
 
     #[test]
     fn header_normal() {
+        let result = mpq_header(&LT[..32]);
         assert_eq!(
-            mpq_header(&LT[..32]),
+            result,
             Ok((
                 &b""[..],
                 MpqHeader {
@@ -306,12 +408,17 @@ mod tests {
                 }
             ))
         );
+
+        let (_, result) = result.unwrap();
+        assert_eq!(result.hash_table_offset(), 69637);
+        assert_eq!(result.block_table_offset(), 86021);
     }
 
     #[test]
     fn header_offset() {
+        let result = mpq_header(&LT_OFFSET_FROM_START[..544]);
         assert_eq!(
-            mpq_header(&LT_OFFSET_FROM_START[..544]),
+            result,
             Ok((
                 &b""[..],
                 MpqHeader {
@@ -324,12 +431,17 @@ mod tests {
                 }
             ))
         );
+
+        let (_, result) = result.unwrap();
+        assert_eq!(result.hash_table_offset(), 69637 + 512);
+        assert_eq!(result.block_table_offset(), 86021 + 512);
     }
 
     #[test]
     fn header_negative_table_pos() {
+        let result = mpq_header(&NEGATIVE_OFFSETS[..0x4220]);
         assert_eq!(
-            mpq_header(&NEGATIVE_OFFSETS[..0x4220]),
+            result,
             Ok((
                 &b""[..],
                 MpqHeader {
@@ -342,6 +454,10 @@ mod tests {
                 }
             ))
         );
+
+        let (_, result) = result.unwrap();
+        assert_eq!(result.hash_table_offset(), 0x4200 - 16672);
+        assert_eq!(result.block_table_offset(), 0x4200 - 288);
     }
 
     #[test]
@@ -472,5 +588,18 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn from_bytes_lt() {
+        let result = Mpq::from_bytes(LT);
+        assert!(matches!(result, Ok(_)));
+    }
+
+    #[test]
+    fn from_bytes_invalid() {
+        let bytes = b"MPQ\x1aDEAD";
+        let result = Mpq::from_bytes(bytes);
+        assert!(matches!(result, Err(MpqError::HeaderNotFound)));
     }
 }
