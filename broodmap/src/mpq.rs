@@ -12,22 +12,22 @@ use nom::IResult;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MpqHeader {
+pub struct MpqHeader {
     /// The offset the header was found at, relative to the start of the input data.
-    offset: u32,
+    pub offset: u32,
     /// Power of two exponent specifying the number of 512-byte disk sectors in each logical sector
     /// in the archive. The size of each logical sector in the archive is 512 * 2^block_size.
-    block_size: u16,
+    pub block_size: u16,
     /// Offset to the beginning of the hash table, relative to the start of the MPQ header. NOTE:
     /// This may be behind you! The BW implementation handles negative offsets here.
-    hash_table_pos: i32,
+    pub hash_table_pos: i32,
     /// Offset to the beginning of the block table, relative to the start of the MPQ header. NOTE:
     /// This may be behind you! The BW implementation handles negative offsets here.
-    block_table_pos: i32,
+    pub block_table_pos: i32,
     /// Number of entries in the hash table. Must be a power of 2, and must be less than 2^16.
-    hash_table_size: u32,
+    pub hash_table_size: u32,
     /// Number of entries in the block table.
-    block_table_size: u32,
+    pub block_table_size: u32,
 }
 
 impl MpqHeader {
@@ -217,20 +217,20 @@ const BLOCK_INDEX_DELETED: u32 = 0xFFFF_FFFE;
 const MPQ_HASH_TABLE_ENTRY_SIZE: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MpqHashTableEntry {
+pub struct MpqHashTableEntry {
     /// The hash of the full file name with constant A
-    hash_a: u32,
+    pub hash_a: u32,
     /// The hash of the full file name with constant B
-    hash_b: u32,
+    pub hash_b: u32,
     /// The language of the file (uses Windows LANGID values). 0 indicates the default language
     /// (American English), and is used if there are not language-specific versions for the current
     /// locale.
-    locale: u16,
+    pub locale: u16,
     /// The platform the file is used for. 0 indicates the default platform. No other values are
     /// current known.
-    platform: u16,
+    pub platform: u16,
     ///
-    block_index: u32,
+    pub block_index: u32,
 }
 
 /// Parse the contents of an MPQ hash table. This is a complete parser, it expects that all data for
@@ -266,7 +266,7 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
 const MPQ_BLOCK_TABLE_ENTRY_SIZE: usize = 16;
 
 bitflags! {
-    struct MpqBlockFlags: u32 {
+    pub struct MpqBlockFlags: u32 {
         const IMPLODED = 0x0000_0100;
         const COMPRESSED = 0x0000_0200;
         const ENCRYPTED = 0x0001_0000;
@@ -277,16 +277,16 @@ bitflags! {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MpqBlockTableEntry {
+pub struct MpqBlockTableEntry {
     /// Offset to the beginning of the file data, relative to the start of the MPQ header. NOTE:
     /// This may be behind you! The BW implementation handles negative offsets here.
-    offset: i32,
+    pub offset: i32,
     /// The size of the compressed file data
-    compressed_size: u32,
+    pub compressed_size: u32,
     /// The size of the uncompressed file data
-    size: u32,
+    pub size: u32,
     /// Information about how the file is stored
-    flags: MpqBlockFlags,
+    pub flags: MpqBlockFlags,
 }
 
 /// Parse the contents of an MPQ block table. This is a complete parser, it expects that all data
@@ -324,10 +324,15 @@ pub enum MpqError {
 // TODO(tec27): Write a version of this that works with BufReader or similar
 #[derive(Debug)]
 pub struct Mpq<'a> {
-    data: &'a [u8],
-    header: MpqHeader,
-    hash_table: Vec<MpqHashTableEntry>,
-    block_table: Vec<MpqBlockTableEntry>,
+    /// The file data of this MPQ.
+    pub data: &'a [u8],
+    /// The header of the MPQ, containing metadata about its structure.
+    pub header: MpqHeader,
+    /// A hash table containing information about the files present in this MPQ archive, allowing
+    /// a file's position in the [block_table] to be located.
+    pub hash_table: Vec<MpqHashTableEntry>,
+    /// A table for file metadata, containing 1 entry for each file present in this MPQ archive.
+    pub block_table: Vec<MpqBlockTableEntry>,
 }
 
 impl<'a> Mpq<'a> {
