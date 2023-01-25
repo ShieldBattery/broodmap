@@ -7,3 +7,8 @@ files, and offers handling for the archive format (MPQ) as well as the internal 
 ## WIP
 
 This library is a work-in-progress, it is not yet complete or ready for use.
+
+## License
+
+broodmap is dual-licensed under the [Apache License, Version 2.0](./LICENSE-APACHE) or the
+[MIT license](./LICENSE-MIT), at your option.
