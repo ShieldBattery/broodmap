@@ -183,15 +183,20 @@ impl Decrypter {
         value
     }
 
-    fn decrypt_bytes(&mut self, value: &[u8]) -> Vec<u8> {
-        // We always decrypt by u32s, any extra bytes are discarded
-        // TODO(tec27): Is that the correct behavior? This is what StormLib does but seems somewhat
-        // suspect
-        value
-            .chunks_exact(4)
+    fn decrypt_bytes(&mut self, data: &[u8]) -> Vec<u8> {
+        // We always decrypt by u32s, any extra bytes are output without any extra decoding
+        let (data, remainder): (&[u8], &[u8]) = if data.len() % 4 == 0 {
+            (data, &[])
+        } else {
+            let extra = data.len() % 4;
+            (&data[0..data.len() - extra], &data[data.len() - extra..])
+        };
+
+        data.chunks_exact(4)
             .flat_map(|val| {
                 u32::to_le_bytes(self.decrypt_u32(u32::from_le_bytes(val.try_into().unwrap())))
             })
+            .chain(remainder.iter().copied())
             .collect()
     }
 }
@@ -637,11 +642,12 @@ impl<'a> Mpq<'a> {
             // possibly, for the very last sector). This is never verified, however, which means map
             // protection schemes can compress less data. When reading it back out, BW will always
             // give sectorSize bytes anyway, so we need to pad the buffer in those cases.
-            if i != sector_table.len() - 1 && sector.len() < sector_size {
+            let is_last_sector = i == sector_table.len() - 2;
+            if !is_last_sector && sector.len() < sector_size {
                 result.resize(result.len() + (sector_size - sector.len()), 0);
-                bytes_left -= sector_size;
+                bytes_left -= sector_size.min(bytes_left);
             } else {
-                bytes_left -= sector.len();
+                bytes_left -= sector.len().min(bytes_left);
             }
         }
 
@@ -1027,7 +1033,6 @@ mod tests {
         );
     }
 
-    /* FIXME: uncomment and fix the explode error
     #[rstest]
     #[case::lt(LT, LT_CHK)]
     fn extract_chk(#[case] input: &[u8], #[case] expected: &[u8]) {
@@ -1035,5 +1040,4 @@ mod tests {
         let chk = assert_ok!(mpq.read_file(CHK_PATH, None));
         assert_eq!(chk.as_slice(), expected);
     }
-     */
 }
