@@ -8,6 +8,7 @@ use nom::combinator::{map, verify};
 use nom::multi::{count, many0, many_till};
 use nom::sequence::tuple;
 use nom::IResult;
+use std::borrow::Cow;
 
 use thiserror::Error;
 
@@ -607,46 +608,23 @@ impl<'a> Mpq<'a> {
             let sector_imploded = block.flags.contains(MpqBlockFlags::IMPLODED) && use_compression;
 
             let end = (start + cur_sector_size).clamp(start, self.data.len());
-            let mut sector = &self.data[start..end];
-
-            // These just keep values from being dropped while we use their underlying data
-            // TODO(tec27): Feels like there's probably some more idiomatic way of referring to a
-            // "slice or Vec" which would make this stuff unnecessary
-            #[allow(unused_assignments)]
-            let mut decrypted_bytes = None;
-            #[allow(unused_assignments)]
-            let mut decompressed_bytes = None;
-            #[allow(unused_assignments)]
-            let mut exploded_bytes = None;
+            let mut sector = Cow::from(&self.data[start..end]);
 
             if let Some(key) = encryption_key {
                 let mut d = Decrypter::from_key_value(key.wrapping_add(i as u32));
-                decrypted_bytes = Some(d.decrypt_bytes(sector));
-                sector = decrypted_bytes.as_ref().unwrap().as_slice();
+                sector = Cow::from(d.decrypt_bytes(sector.as_ref()));
             }
             if sector_compressed {
                 if sector.is_empty() {
                     return Err(MpqError::MalformedSectorTable);
                 }
-
-                decompressed_bytes = Some(decompress_sector(sector)?);
-                sector = decompressed_bytes.as_ref().unwrap().as_slice();
-                #[allow(unused_assignments)]
-                {
-                    decrypted_bytes = None;
-                }
+                sector = Cow::from(decompress_sector(sector.as_ref())?);
             }
             if sector_imploded {
-                exploded_bytes = Some(explode_data(sector)?);
-                sector = exploded_bytes.as_ref().unwrap().as_slice();
-                #[allow(unused_assignments)]
-                {
-                    decrypted_bytes = None;
-                    decompressed_bytes = None;
-                }
+                sector = Cow::from(explode_data(sector.as_ref())?);
             }
 
-            result.extend_from_slice(sector);
+            result.extend_from_slice(sector.as_ref());
 
             // BW expects that every decompression will result in sectorSize bytes of data (except,
             // possibly, for the very last sector). This is never verified, however, which means map
