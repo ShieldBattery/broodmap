@@ -17,7 +17,7 @@ pub struct MpqHeader {
     pub offset: u32,
     /// Power of two exponent specifying the number of 512-byte disk sectors in each logical sector
     /// in the archive. The size of each logical sector in the archive is 512 * 2^block_size.
-    pub block_size_exponent: u16,
+    pub sector_size_shift: u16,
     /// Offset to the beginning of the hash table, relative to the start of the MPQ header. NOTE:
     /// This may be behind you! The BW implementation handles negative offsets here.
     pub hash_table_pos: i32,
@@ -54,7 +54,7 @@ impl MpqHeader {
     /// Returns the size of each block of file data (each file is split into blocks of this size
     /// for storage).
     pub fn sector_size(&self) -> usize {
-        512usize * 2usize.pow(self.block_size_exponent as u32)
+        512usize * 2usize.pow(self.sector_size_shift as u32)
     }
 }
 
@@ -102,10 +102,20 @@ fn mpq_header(input: &[u8]) -> IResult<&[u8], MpqHeader> {
             le_u32,
             le_u32,
         )),
-        move |(block_size, hash_table_pos, block_table_pos, hash_table_size, block_table_size)| {
+        move |(sector_size, hash_table_pos, block_table_pos, hash_table_size, block_table_size)| {
+            let mut sector_size = sector_size & 0xFF;
+            // Certain maps (see smallest.scm) set very high sector sizes that overflow the bounds
+            // of the u32 it's stored in. This is undefined behavior in C++ so I'm uncertain
+            // whether these maps work everywhere anyway (they seem to be broken for SC:R, but that
+            // may be an unrelated problem), but we set the value back down to try and make them
+            // work
+            if sector_size > 22 {
+                sector_size = 3
+            }
+
             MpqHeader {
                 offset,
-                block_size_exponent: block_size,
+                sector_size_shift: sector_size,
                 hash_table_pos,
                 block_table_pos,
                 // Discard the high 4 bits of hash_table_size, as C code multiplying that u32 by
@@ -783,9 +793,43 @@ mod tests {
 
     const LT: &[u8] = include_bytes!("../assets/lt.scm");
     const LT_CHK: &[u8] = include_bytes!("../assets/lt.chk");
-
     const LT_OFFSET_FROM_START: &[u8] = include_bytes!("../assets/lt-offset-from-start.scm");
+
     const NEGATIVE_OFFSETS: &[u8] = include_bytes!("../assets/negativeoffsets.scx");
+    const NEGATIVE_OFFSETS_CHK: &[u8] = include_bytes!("../assets/negativeoffsets.chk");
+
+    const IMPLODED: &[u8] = include_bytes!("../assets/imploded.scm");
+    const IMPLODED_CHK: &[u8] = include_bytes!("../assets/imploded.chk");
+
+    const PROTECTED_0: &[u8] = include_bytes!("../assets/protected-0.scx");
+    const PROTECTED_0_CHK: &[u8] = include_bytes!("../assets/protected-0.chk");
+
+    const PROTECTED_1: &[u8] = include_bytes!("../assets/protected-1.scm");
+    const PROTECTED_1_CHK: &[u8] = include_bytes!("../assets/protected-1.chk");
+
+    const PROTECTED_2: &[u8] = include_bytes!("../assets/protected-2.scx");
+    const PROTECTED_2_CHK: &[u8] = include_bytes!("../assets/protected-2.chk");
+
+    const PROTECTED_3: &[u8] = include_bytes!("../assets/protected-3.scx");
+    const PROTECTED_3_CHK: &[u8] = include_bytes!("../assets/protected-3.chk");
+
+    const PROTECTED_4: &[u8] = include_bytes!("../assets/protected-4.scx");
+    const PROTECTED_4_CHK: &[u8] = include_bytes!("../assets/protected-4.chk");
+
+    const PROTECTED_5: &[u8] = include_bytes!("../assets/protected-5.scm");
+    const PROTECTED_5_CHK: &[u8] = include_bytes!("../assets/protected-5.chk");
+
+    const PROTECTED_6: &[u8] = include_bytes!("../assets/protected-6.scx");
+    const PROTECTED_6_CHK: &[u8] = include_bytes!("../assets/protected-6.chk");
+
+    const SMALLEST: &[u8] = include_bytes!("../assets/smallest.scm");
+    const SMALLEST_CHK: &[u8] = include_bytes!("../assets/smallest.chk");
+
+    const OCOC_BOUND_2: &[u8] = include_bytes!("../assets/OcOc_Bound_2(p).scx");
+    const OCOC_BOUND_2_CHK: &[u8] = include_bytes!("../assets/OcOc_Bound_2(p).chk");
+
+    const SNIPER_SEED: &[u8] = include_bytes!("../assets/Sniper_Seed_vA.scx");
+    const SNIPER_SEED_CHK: &[u8] = include_bytes!("../assets/Sniper_Seed_vA.chk");
 
     #[test]
     fn header_normal() {
@@ -796,7 +840,7 @@ mod tests {
                 &b""[..],
                 MpqHeader {
                     offset: 0,
-                    block_size_exponent: 3,
+                    sector_size_shift: 3,
                     hash_table_pos: 69637,
                     block_table_pos: 86021,
                     hash_table_size: 1024,
@@ -819,7 +863,7 @@ mod tests {
                 &b""[..],
                 MpqHeader {
                     offset: 512,
-                    block_size_exponent: 3,
+                    sector_size_shift: 3,
                     hash_table_pos: 69637,
                     block_table_pos: 86021,
                     hash_table_size: 1024,
@@ -842,7 +886,7 @@ mod tests {
                 &b""[..],
                 MpqHeader {
                     offset: 0x4200,
-                    block_size_exponent: 3,
+                    sector_size_shift: 3,
                     hash_table_pos: -16672,
                     block_table_pos: -288,
                     hash_table_size: 1024,
@@ -1035,6 +1079,18 @@ mod tests {
 
     #[rstest]
     #[case::lt(LT, LT_CHK)]
+    #[case::negative(NEGATIVE_OFFSETS, NEGATIVE_OFFSETS_CHK)]
+    #[case::imploded(IMPLODED, IMPLODED_CHK)]
+    #[case::protected_0(PROTECTED_0, PROTECTED_0_CHK)]
+    #[case::protected_1(PROTECTED_1, PROTECTED_1_CHK)]
+    #[case::protected_2(PROTECTED_2, PROTECTED_2_CHK)]
+    #[case::protected_3(PROTECTED_3, PROTECTED_3_CHK)]
+    #[case::protected_4(PROTECTED_4, PROTECTED_4_CHK)]
+    #[case::protected_5(PROTECTED_5, PROTECTED_5_CHK)]
+    #[case::protected_6(PROTECTED_6, PROTECTED_6_CHK)]
+    #[case::smallest(SMALLEST, SMALLEST_CHK)]
+    #[case::ococ_bound_2(OCOC_BOUND_2, OCOC_BOUND_2_CHK)]
+    #[case::sniper_seed(SNIPER_SEED, SNIPER_SEED_CHK)]
     fn extract_chk(#[case] input: &[u8], #[case] expected: &[u8]) {
         let mpq = assert_ok!(Mpq::from_bytes(input));
         let chk = assert_ok!(mpq.read_file(CHK_PATH, None));
