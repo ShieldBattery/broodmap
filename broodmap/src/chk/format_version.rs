@@ -1,4 +1,3 @@
-use crate::chk::ChkChunk;
 use thiserror::Error;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -41,16 +40,12 @@ pub enum FormatVersionError {
 }
 
 /// Reads the format version from the given `b"VER "` chunks.
-pub fn read_format_version(
-    data: &[u8],
-    chunks: &[ChkChunk],
-) -> Result<FormatVersion, FormatVersionError> {
-    let chunk = chunks.last().ok_or(FormatVersionError::NoVersion)?;
-    if chunk.length != 2 {
+pub fn read_format_version(data: Option<&[u8]>) -> Result<FormatVersion, FormatVersionError> {
+    let data = data.ok_or(FormatVersionError::NoVersion)?;
+    if data.len() != 2 {
         return Err(FormatVersionError::InvalidDataLength);
     }
 
-    let data = &data[chunk.offset..chunk.offset + chunk.length];
     let version = u16::from_le_bytes(data.try_into().unwrap());
     version
         .try_into()

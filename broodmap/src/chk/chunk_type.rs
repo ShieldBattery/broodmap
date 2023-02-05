@@ -2,6 +2,17 @@ use std::fmt::{Display, Formatter};
 
 pub type ChunkTag = [u8; 4];
 
+/// Specifies how multiple entries of the same chunk type should be handled.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum MultiChunkHandling {
+    /// Only the last entry of this type is used.
+    FullOverwrite,
+    /// Later entries overwrite earlier entries, but leave earlier data intact if they are shorter.
+    PartialOverwrite,
+    /// All entries are included, behaving as if they were a single entry.
+    Append,
+}
+
 /// A type of chunk in a StarCraft map file.
 ///
 /// For a description of the different types and their data format, see the
@@ -94,6 +105,55 @@ pub enum ChunkType {
     Custom([u8; 4]),
 }
 
+impl ChunkType {
+    /// Returns the minimum size of data for this chunk type. Data sections smaller than this size
+    /// will be skipped.
+    pub fn min_size(&self) -> Option<usize> {
+        // These should generally match BW's behavior (but I took these from bw-chk for the moment,
+        // so these should probably be double-checked at some point).
+        match self {
+            ChunkType::VER => Some(2),
+            ChunkType::STR => Some(2),
+            ChunkType::STRx => Some(4),
+            ChunkType::ERA => Some(2),
+            ChunkType::OWNR => Some(12),
+            ChunkType::SIDE => Some(12),
+            ChunkType::SPRP => Some(4),
+            ChunkType::DIM => Some(4),
+            ChunkType::UNIS => Some(4048),
+            ChunkType::UNIx => Some(4168),
+            _ => None,
+        }
+    }
+
+    /// Returns the maximum size of data for this chunk type. Data sections larger than this size
+    /// will be truncated. TODO(tec27): Does that match BW's behavior, or does it just fail?
+    pub fn max_size(&self) -> Option<usize> {
+        match self {
+            ChunkType::ERA => Some(2),
+            ChunkType::FORC => Some(20),
+            ChunkType::OWNR => Some(12),
+            ChunkType::SIDE => Some(12),
+            ChunkType::SPRP => Some(4),
+            ChunkType::DIM => Some(4),
+            _ => None,
+        }
+    }
+
+    pub fn multi_chunk_handling(&self) -> MultiChunkHandling {
+        match self {
+            ChunkType::MTXM => MultiChunkHandling::PartialOverwrite,
+            ChunkType::STR => MultiChunkHandling::PartialOverwrite,
+            ChunkType::STRx => MultiChunkHandling::PartialOverwrite,
+            ChunkType::UNIT => MultiChunkHandling::Append,
+            ChunkType::THG2 => MultiChunkHandling::Append,
+            ChunkType::TRIG => MultiChunkHandling::Append,
+            ChunkType::MBRF => MultiChunkHandling::Append,
+            _ => MultiChunkHandling::FullOverwrite,
+        }
+    }
+}
+
 impl From<&ChunkTag> for ChunkType {
     fn from(value: &[u8; 4]) -> Self {
         use ChunkType::*;
@@ -141,6 +201,12 @@ impl From<&ChunkTag> for ChunkType {
             b"TECx" => TECx,
             tag => Custom(*tag),
         }
+    }
+}
+
+impl From<ChunkTag> for ChunkType {
+    fn from(value: ChunkTag) -> Self {
+        (&value).into()
     }
 }
 

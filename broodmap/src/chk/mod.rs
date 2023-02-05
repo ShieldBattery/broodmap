@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use smallvec::SmallVec;
 use thiserror::Error;
 
+use crate::chk::chunk_type::MultiChunkHandling;
 use crate::chk::format_version::read_format_version;
 pub use chunk_type::{ChunkTag, ChunkType};
 pub use format_version::{FormatVersion, FormatVersionError};
@@ -27,68 +29,132 @@ pub enum ChkError {
     InvalidJumpChunk,
 }
 
+pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
+
 pub struct Chk<'a> {
     pub data: &'a [u8],
-    pub sections: HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>,
+    pub chunks: ChunkMap,
 
     pub format_version: FormatVersion,
 }
 
 impl<'a> Chk<'a> {
     pub fn from_bytes(data: &'a [u8]) -> Result<Self, ChkError> {
-        let mut sections: HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>> = HashMap::new();
-        // NOTE(tec27): Some maps use "jump" chunks to skip back and reuse parts of previous chunks
-        // as new chunks. They could potentially jump back to a chunk we had already seen before, in
-        // which case they'd introduce an infinite loop in the parsing. To stop this, we track the
-        // starting offsets we've already seen and bail if we see one again.
-        let mut by_offset: HashMap<usize, usize> = HashMap::new();
+        let chunks = gather_chunk_map(data)?;
 
-        let mut offset = 0;
-        while data.len() - offset >= 8 {
-            if let Some(&length) = by_offset.get(&offset) {
-                // We've already processed this chunk (i.e. a jump chunk caused us to go back, now
-                // we're hitting chunks we've already seen before). We can just skip this
-                offset += length + 8;
-                continue;
-            }
+        let format_version = read_format_version(
+            read_chunk_data(data, &chunks, ChunkType::VER)
+                .as_ref()
+                .map(|d| &d[..]),
+        )
+        .map_err(ChkError::InvalidFormatVersion)?;
 
-            let tag = data[offset..offset + 4].try_into().unwrap();
-            let length = i32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-            offset += 8;
+        Ok(Chk {
+            data,
+            chunks,
 
-            if length >= 0 {
-                let length = (length as usize).min(data.len() - offset);
+            format_version,
+        })
+    }
+}
+
+fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
+    let mut sections = ChunkMap::new();
+    // NOTE(tec27): Some maps use "jump" chunks to skip back and reuse parts of previous chunks
+    // as new chunks. They could potentially jump back to a chunk we had already seen before, in
+    // which case they'd introduce an infinite loop in the parsing. To stop this, we track the
+    // starting offsets we've already seen and skip them if we see one again.
+    let mut by_offset: HashMap<usize, usize> = HashMap::new();
+
+    let mut offset = 0;
+    while data.len() - offset >= 8 {
+        if let Some(&length) = by_offset.get(&offset) {
+            // We've already processed this chunk (i.e. a jump chunk caused us to go back, now
+            // we're hitting chunks we've already seen before). We can just skip this
+            offset += length + 8;
+            continue;
+        }
+
+        let tag: ChunkTag = data[offset..offset + 4].try_into().unwrap();
+        let length = i32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        if length >= 0 {
+            let chunk_type: ChunkType = tag.into();
+            let length = (length as usize).min(data.len() - offset);
+            let min_size = chunk_type.min_size().unwrap_or(length);
+            let max_size = chunk_type.max_size().unwrap_or(length);
+
+            if length >= min_size {
+                let length = length.min(max_size);
                 sections
                     .entry(tag)
                     .or_default()
                     .push(ChkChunk { offset, length });
-                by_offset.insert(offset - 8, length);
-                offset += length;
-            } else {
-                // This is a negative value, i.e. a "jump chunk" that reuses some previous data for
-                // a new chunk
-                if length.unsigned_abs() as usize > offset {
-                    return Err(ChkError::InvalidJumpChunk);
-                }
+            }
+            by_offset.insert(offset - 8, length);
+            offset += length;
+        } else {
+            // This is a negative value, i.e. a "jump chunk" that reuses some previous data for
+            // a new chunk
+            if length.unsigned_abs() as usize > offset {
+                return Err(ChkError::InvalidJumpChunk);
+            }
 
-                // Jump sections have no data, they purely modify the current read position
-                by_offset.insert(offset - 8, 0);
-                offset -= length.unsigned_abs() as usize;
+            // Jump sections have no data, they purely modify the current read position
+            by_offset.insert(offset - 8, 0);
+            offset -= length.unsigned_abs() as usize;
+        }
+    }
+
+    Ok(sections)
+}
+
+fn read_chunk_data<'a>(
+    data: &'a [u8],
+    chunk_map: &ChunkMap,
+    chunk_type: ChunkType,
+) -> Option<Cow<'a, [u8]>> {
+    let chunks = chunk_map
+        .get::<ChunkTag>(&chunk_type.into())
+        .map(|v| v.as_slice());
+    let Some(chunks) = chunks else {
+        return None;
+    };
+
+    match chunks.len() {
+        0 => None,
+        1 => {
+            let chunk = &chunks[0];
+            Some(Cow::Borrowed(
+                &data[chunk.offset..chunk.offset + chunk.length],
+            ))
+        }
+        _ => {
+            match chunk_type.multi_chunk_handling() {
+                MultiChunkHandling::FullOverwrite => chunks
+                    .last()
+                    .map(|c| Cow::Borrowed(&data[c.offset..c.offset + c.length])),
+                MultiChunkHandling::PartialOverwrite => {
+                    let max_length = chunks.iter().fold(0, |acc, c| acc.max(c.length));
+                    let mut result = vec![0; max_length];
+                    for chunk in chunks {
+                        // We have to chop the slice down to the length of this chunk first, so that
+                        // copy_from_slice doesn't panic
+                        let result = &mut result[..chunk.length];
+                        result.copy_from_slice(&data[chunk.offset..chunk.offset + chunk.length]);
+                    }
+                    Some(Cow::Owned(result))
+                }
+                MultiChunkHandling::Append => {
+                    let mut result = Vec::new();
+                    for chunk in chunks {
+                        result.extend_from_slice(&data[chunk.offset..chunk.offset + chunk.length]);
+                    }
+                    Some(Cow::Owned(result))
+                }
             }
         }
-
-        let version_chunks = sections
-            .get::<ChunkTag>(&ChunkType::VER.into())
-            .map_or([].as_slice(), |v| v.as_slice());
-        let format_version =
-            read_format_version(data, version_chunks).map_err(ChkError::InvalidFormatVersion)?;
-
-        Ok(Chk {
-            data,
-            sections,
-
-            format_version,
-        })
     }
 }
 
@@ -109,15 +175,15 @@ mod tests {
 
         assert_eq!(result.format_version, FormatVersion::OriginalRetail);
 
-        let mut sections = result
-            .sections
+        let mut chunks = result
+            .chunks
             .iter()
             .map(|(k, v)| (ChunkType::from(k), v.clone()))
             .collect::<Vec<_>>();
-        sections.sort_by_key(|(_, v)| v[0].offset);
+        chunks.sort_by_key(|(_, v)| v[0].offset);
 
         assert_eq!(
-            sections,
+            chunks,
             vec![
                 (
                     VER,
