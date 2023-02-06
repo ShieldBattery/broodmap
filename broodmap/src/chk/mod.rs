@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::chk::chunk_type::MultiChunkHandling;
-use crate::chk::format_version::read_format_version;
-pub use chunk_type::{ChunkTag, ChunkType};
-pub use format_version::{FormatVersion, FormatVersionError};
+use chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
+use format_version::{read_format_version, FormatVersion, FormatVersionError};
+use strings::{StringsChunk, StringsChunkError};
 
-mod chunk_type;
-mod format_version;
+pub mod chunk_type;
+pub mod format_version;
+pub mod strings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChkChunk {
@@ -27,6 +27,8 @@ pub enum ChkError {
     /// A chunk was encountered that jumped past the beginning of the file.
     #[error("Invalid jump chunk")]
     InvalidJumpChunk,
+    #[error("Invalid strings chunk: {0}")]
+    InvalidStringsChunk(StringsChunkError),
 }
 
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
@@ -36,6 +38,7 @@ pub struct Chk<'a> {
     pub chunks: ChunkMap,
 
     pub format_version: FormatVersion,
+    pub strings: StringsChunk<'a>,
 }
 
 impl<'a> Chk<'a> {
@@ -48,12 +51,18 @@ impl<'a> Chk<'a> {
                 .map(|d| &d[..]),
         )
         .map_err(ChkError::InvalidFormatVersion)?;
+        let strings = StringsChunk::from_bytes(
+            read_chunk_data(data, &chunks, ChunkType::STR),
+            read_chunk_data(data, &chunks, ChunkType::STRx),
+        )
+        .map_err(ChkError::InvalidStringsChunk)?;
 
         Ok(Chk {
             data,
             chunks,
 
             format_version,
+            strings,
         })
     }
 }
@@ -163,6 +172,7 @@ mod tests {
     use assert_ok::assert_ok;
     use smallvec::smallvec;
 
+    use super::strings::*;
     use super::*;
 
     const LT_CHK: &[u8] = include_bytes!("../../assets/lt.chk");
@@ -446,5 +456,20 @@ mod tests {
                 )
             ]
         )
+    }
+
+    #[test]
+    fn lt_strings() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK));
+
+        assert!(matches!(
+            result.strings.data,
+            StringsChunkData::LegacyStringChunk(_)
+        ));
+        assert_eq!(result.strings.max_len, 1024);
+        assert_eq!(
+            result.strings.get_raw_bytes(1).unwrap(),
+            b"Untitled Scenario"
+        );
     }
 }
