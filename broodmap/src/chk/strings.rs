@@ -9,26 +9,44 @@ pub enum StringsChunkError {
     DataTooShort,
 }
 
-pub enum StringsChunkData<'a> {
-    LegacyStringChunk(Cow<'a, [u8]>),
-    ExtendedStringChunk(Cow<'a, [u8]>),
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum StringsChunkKind {
+    Legacy,
+    Extended,
+}
+
+#[derive(Debug)]
+pub struct StringsChunkData<'a> {
+    pub kind: StringsChunkKind,
+    data: Cow<'a, [u8]>,
 }
 
 impl<'a> StringsChunkData<'a> {
+    pub fn legacy(data: Cow<'a, [u8]>) -> Self {
+        Self {
+            kind: StringsChunkKind::Legacy,
+            data,
+        }
+    }
+
+    pub fn extended(data: Cow<'a, [u8]>) -> Self {
+        Self {
+            kind: StringsChunkKind::Extended,
+            data,
+        }
+    }
+
     /// Returns the size of a dimension (an offset or the string count) in this strings chunk.
     pub fn dim_size(&self) -> usize {
-        match self {
-            StringsChunkData::LegacyStringChunk(_) => 2,
-            StringsChunkData::ExtendedStringChunk(_) => 4,
+        match self.kind {
+            StringsChunkKind::Legacy => 2,
+            StringsChunkKind::Extended => 4,
         }
     }
 
     /// Returns the length of the total data section in bytes.
     pub fn bytes_len(&self) -> usize {
-        match self {
-            StringsChunkData::LegacyStringChunk(data) => data.len(),
-            StringsChunkData::ExtendedStringChunk(data) => data.len(),
-        }
+        self.data.len()
     }
 
     /// Returns the bytes for a particular string at `offset`, reading all bytes until a null byte
@@ -38,11 +56,7 @@ impl<'a> StringsChunkData<'a> {
     /// This does not check the bounds of the data section, and will panic if `offset` exceeds the
     /// bounds.
     pub fn read_str_bytes(&'a self, offset: usize) -> &'a [u8] {
-        let data = match self {
-            StringsChunkData::LegacyStringChunk(data) => data,
-            StringsChunkData::ExtendedStringChunk(data) => data,
-        };
-        let data = &data[offset..];
+        let data = &self.data[offset..];
         data.split(|b| *b == 0).next().unwrap_or(data)
     }
 
@@ -51,21 +65,27 @@ impl<'a> StringsChunkData<'a> {
     /// section, so indexes that exceed the chunk's stated maximum length but still reside in the
     /// string data will return a value.
     pub fn get_dim(&self, index: usize) -> Option<usize> {
-        match self {
-            StringsChunkData::LegacyStringChunk(data) => {
+        match self.kind {
+            StringsChunkKind::Legacy => {
                 let offset = index * 2;
-                if offset > data.len() - 2 {
+                if offset > self.data.len() - 2 {
                     None
                 } else {
-                    Some(u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize)
+                    Some(
+                        u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap())
+                            as usize,
+                    )
                 }
             }
-            StringsChunkData::ExtendedStringChunk(data) => {
+            StringsChunkKind::Extended => {
                 let offset = index * 4;
-                if offset > data.len() - 4 {
+                if offset > self.data.len() - 4 {
                     None
                 } else {
-                    Some(u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize)
+                    Some(
+                        u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap())
+                            as usize,
+                    )
                 }
             }
         }
@@ -74,14 +94,14 @@ impl<'a> StringsChunkData<'a> {
     /// Returns a dimension-sized value at the specified index. Will panic if the index exceeds the
     /// bounds of the data section.
     pub fn get_dim_unchecked(&self, index: usize) -> usize {
-        match self {
-            StringsChunkData::LegacyStringChunk(data) => {
+        match self.kind {
+            StringsChunkKind::Legacy => {
                 let offset = index * 2;
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize
+                u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap()) as usize
             }
-            StringsChunkData::ExtendedStringChunk(data) => {
+            StringsChunkKind::Extended => {
                 let offset = index * 4;
-                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize
+                u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as usize
             }
         }
     }
@@ -101,8 +121,8 @@ impl<'a> StringsChunk<'a> {
         extended_bytes: Option<Cow<'a, [u8]>>,
     ) -> Result<StringsChunk<'a>, StringsChunkError> {
         let data = match (legacy_bytes, extended_bytes) {
-            (_, Some(extended_bytes)) => StringsChunkData::ExtendedStringChunk(extended_bytes),
-            (Some(legacy_bytes), None) => StringsChunkData::LegacyStringChunk(legacy_bytes),
+            (_, Some(extended_bytes)) => StringsChunkData::extended(extended_bytes),
+            (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes),
             (None, None) => return Err(StringsChunkError::NoStringsChunk),
         };
 

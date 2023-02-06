@@ -462,10 +462,7 @@ mod tests {
     fn lt_strings() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK));
 
-        assert!(matches!(
-            result.strings.data,
-            StringsChunkData::LegacyStringChunk(_)
-        ));
+        assert_eq!(result.strings.data.kind, StringsChunkKind::Legacy);
         assert_eq!(result.strings.max_len, 1024);
         assert_eq!(
             result.strings.get_raw_bytes(1).unwrap(),
