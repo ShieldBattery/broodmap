@@ -31,8 +31,6 @@ impl TryFrom<u16> for FormatVersion {
 
 #[derive(Error, Debug)]
 pub enum FormatVersionError {
-    #[error("No version specified")]
-    NoVersion,
     #[error("Invalid data length")]
     InvalidDataLength,
     #[error("Unrecognized version: {0}")]
@@ -40,8 +38,7 @@ pub enum FormatVersionError {
 }
 
 /// Reads the format version from the given `b"VER "` chunks.
-pub fn read_format_version(data: Option<&[u8]>) -> Result<FormatVersion, FormatVersionError> {
-    let data = data.ok_or(FormatVersionError::NoVersion)?;
+pub fn read_format_version(data: &[u8]) -> Result<FormatVersion, FormatVersionError> {
     if data.len() != 2 {
         return Err(FormatVersionError::InvalidDataLength);
     }

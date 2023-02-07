@@ -6,10 +6,12 @@ use thiserror::Error;
 
 use chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
 use format_version::{read_format_version, FormatVersion, FormatVersionError};
+use scenario_props::{read_scenario_props, ScenarioProps, ScenarioPropsError};
 use strings::{StringsChunk, StringsChunkError};
 
 pub mod chunk_type;
 pub mod format_version;
+pub mod scenario_props;
 pub mod strings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,8 +29,12 @@ pub enum ChkError {
     /// A chunk was encountered that jumped past the beginning of the file.
     #[error("Invalid jump chunk")]
     InvalidJumpChunk,
+    #[error("Invalid scenario props: {0}")]
+    InvalidScenarioProps(ScenarioPropsError),
     #[error("Invalid strings chunk: {0}")]
     InvalidStringsChunk(StringsChunkError),
+    #[error("Missing required chunk: {0}")]
+    MissingRequiredChunk(ChunkType),
 }
 
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
@@ -39,6 +45,7 @@ pub struct Chk<'a> {
 
     pub format_version: FormatVersion,
     pub strings: StringsChunk<'a>,
+    pub scenario_props: ScenarioProps,
 }
 
 impl<'a> Chk<'a> {
@@ -46,9 +53,8 @@ impl<'a> Chk<'a> {
         let chunks = gather_chunk_map(data)?;
 
         let format_version = read_format_version(
-            read_chunk_data(data, &chunks, ChunkType::VER)
-                .as_ref()
-                .map(|d| &d[..]),
+            &read_chunk_data(data, &chunks, ChunkType::VER)
+                .ok_or(ChkError::MissingRequiredChunk(ChunkType::VER))?,
         )
         .map_err(ChkError::InvalidFormatVersion)?;
         let strings = StringsChunk::from_bytes(
@@ -56,6 +62,11 @@ impl<'a> Chk<'a> {
             read_chunk_data(data, &chunks, ChunkType::STRx),
         )
         .map_err(ChkError::InvalidStringsChunk)?;
+        let scenario_props = read_scenario_props(
+            &read_chunk_data(data, &chunks, ChunkType::SPRP)
+                .ok_or(ChkError::MissingRequiredChunk(ChunkType::SPRP))?,
+        )
+        .map_err(ChkError::InvalidScenarioProps)?;
 
         Ok(Chk {
             data,
@@ -63,6 +74,7 @@ impl<'a> Chk<'a> {
 
             format_version,
             strings,
+            scenario_props,
         })
     }
 }
@@ -468,5 +480,8 @@ mod tests {
             result.strings.get_raw_bytes(1).unwrap(),
             b"Untitled Scenario"
         );
+
+        assert_eq!(result.scenario_props.name_id, 4);
+        assert_eq!(result.scenario_props.description_id, 5);
     }
 }
