@@ -1,4 +1,4 @@
-use crate::chk::strings::StringId;
+use crate::chk::strings::{ChkDecode, StringId, StringsChunk, UsedChkStrings};
 use thiserror::Error;
 
 /// The SPRP chunk of a CHK file (Scenario Properties) with strings that are not decoded.
@@ -13,8 +13,35 @@ pub struct RawScenarioProps {
     pub description_id: StringId,
 }
 
-#[derive(Error, Debug)]
+/// The SPRP chunk of a CHK file (Scenario Properties).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScenarioProps {
+    /// The scenario name. [None] indicates this should be the map's filename.
+    pub name: Option<String>,
+    /// The scenario description. [None] indicates this should be a default string.
+    // TODO(tec27): look up what the default is
+    pub description: Option<String>,
+}
+
+impl ChkDecode<ScenarioProps> for RawScenarioProps {
+    fn decode_strings(&self, strings_chunk: &StringsChunk<'_>) -> ScenarioProps {
+        ScenarioProps {
+            name: strings_chunk.get(self.name_id).map(|s| s.into()),
+            description: strings_chunk.get(self.description_id).map(|s| s.into()),
+        }
+    }
+}
+
+impl UsedChkStrings for RawScenarioProps {
+    fn used_string_ids(&self) -> Box<dyn Iterator<Item = StringId>> {
+        Box::new([self.name_id, self.description_id].into_iter())
+    }
+}
+
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ScenarioPropsError {
+    #[error("Chunk missing")]
+    ChunkMissing,
     #[error("Invalid data length")]
     InvalidDataLength,
 }

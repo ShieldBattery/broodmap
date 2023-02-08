@@ -1,15 +1,21 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use once_cell::sync::OnceCell;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
-use forces::{read_force_settings, ForceSettingsError, RawForceSettings};
-use format_version::{read_format_version, FormatVersion, FormatVersionError};
-use scenario_props::{read_scenario_props, RawScenarioProps, ScenarioPropsError};
-use strings::{RawStringsChunk, StringsChunkError};
-use strings::{StringEncoding, StringsChunk};
+use crate::chk::chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
+use crate::chk::forces::{
+    read_force_settings, ForceSettings, ForceSettingsError, RawForceSettings,
+};
+use crate::chk::format_version::{read_format_version, FormatVersion, FormatVersionError};
+use crate::chk::scenario_props::{
+    read_scenario_props, RawScenarioProps, ScenarioProps, ScenarioPropsError,
+};
+use crate::chk::strings::{
+    ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
+};
 
 pub mod chunk_type;
 pub mod forces;
@@ -27,15 +33,11 @@ pub struct ChkChunk {
 
 #[derive(Error, Debug)]
 pub enum ChkError {
-    #[error("Invalid force settings: {0}")]
-    InvalidForceSettings(ForceSettingsError),
     #[error("Invalid format version: {0}")]
     InvalidFormatVersion(FormatVersionError),
     /// A chunk was encountered that jumped past the beginning of the file.
     #[error("Invalid jump chunk")]
     InvalidJumpChunk,
-    #[error("Invalid scenario props: {0}")]
-    InvalidScenarioProps(ScenarioPropsError),
     #[error("Invalid strings chunk: {0}")]
     InvalidStringsChunk(StringsChunkError),
     #[error("Missing required chunk: {0}")]
@@ -50,11 +52,13 @@ pub struct Chk<'a> {
     pub chunks: ChunkMap,
 
     format_version: FormatVersion,
-    scenario_props: RawScenarioProps,
-    force_settings: RawForceSettings,
+    raw_strings: RawStringsChunk<'a>,
+    raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
+    raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
 
-    pub strings: StringsChunk<'a>,
-    // TODO(tec27): Replace these with string-decoded versions
+    strings: OnceCell<StringsChunk<'a>>,
+    scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
+    force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
 }
 
 impl<'a> Chk<'a> {
@@ -74,27 +78,11 @@ impl<'a> Chk<'a> {
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::VER))?,
         )
         .map_err(ChkError::InvalidFormatVersion)?;
-        let strings = RawStringsChunk::from_bytes(
+        let raw_strings = RawStringsChunk::from_bytes(
             read_chunk_data(data, &chunks, ChunkType::STR),
             read_chunk_data(data, &chunks, ChunkType::STRx),
         )
         .map_err(ChkError::InvalidStringsChunk)?;
-        let scenario_props = read_scenario_props(
-            &read_chunk_data(data, &chunks, ChunkType::SPRP)
-                .ok_or(ChkError::MissingRequiredChunk(ChunkType::SPRP))?,
-        )
-        .map_err(ChkError::InvalidScenarioProps)?;
-        let force_settings = read_force_settings(
-            &read_chunk_data(data, &chunks, ChunkType::FORC)
-                .ok_or(ChkError::MissingRequiredChunk(ChunkType::FORC))?,
-        )
-        .map_err(ChkError::InvalidForceSettings)?;
-
-        let strings = if let Some(encoding) = str_encoding {
-            StringsChunk::with_known_encoding(strings, encoding)
-        } else {
-            StringsChunk::with_auto_encoding(strings, &scenario_props, &force_settings)
-        };
 
         Ok(Chk {
             data,
@@ -102,10 +90,71 @@ impl<'a> Chk<'a> {
             chunks,
 
             format_version,
-            strings,
-            scenario_props,
-            force_settings,
+            raw_strings,
+            raw_scenario_props: OnceCell::new(),
+            raw_force_settings: OnceCell::new(),
+
+            strings: OnceCell::new(),
+            scenario_props: OnceCell::new(),
+            force_settings: OnceCell::new(),
         })
+    }
+
+    pub fn strings(&'a self) -> &'a StringsChunk<'a> {
+        self.strings.get_or_init(|| {
+            if let Some(encoding) = self.desired_encoding {
+                StringsChunk::with_known_encoding(&self.raw_strings, encoding)
+            } else {
+                let used_strings = [
+                    self.raw_scenario_props().used_string_ids(),
+                    self.raw_force_settings().used_string_ids(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<HashSet<_>>();
+                StringsChunk::with_auto_encoding(&self.raw_strings, used_strings)
+            }
+        })
+    }
+
+    pub fn format_version(&self) -> FormatVersion {
+        self.format_version
+    }
+
+    fn raw_scenario_props(&'a self) -> &'a Result<RawScenarioProps, ScenarioPropsError> {
+        self.raw_scenario_props.get_or_init(|| {
+            read_scenario_props(
+                &read_chunk_data(self.data, &self.chunks, ChunkType::SPRP)
+                    .ok_or(ScenarioPropsError::ChunkMissing)?,
+            )
+        })
+    }
+
+    pub fn scenario_props(&'a self) -> Result<&'a ScenarioProps, &'a ScenarioPropsError> {
+        self.scenario_props
+            .get_or_init(|| {
+                self.raw_scenario_props()
+                    .map(|raw| raw.decode_strings(self.strings()))
+            })
+            .as_ref()
+    }
+
+    fn raw_force_settings(&'a self) -> &'a Result<RawForceSettings, ForceSettingsError> {
+        self.raw_force_settings.get_or_init(|| {
+            read_force_settings(
+                &read_chunk_data(self.data, &self.chunks, ChunkType::FORC)
+                    .ok_or(ForceSettingsError::ChunkMissing)?,
+            )
+        })
+    }
+
+    pub fn force_settings(&'a self) -> Result<&'a ForceSettings, &'a ForceSettingsError> {
+        self.force_settings
+            .get_or_init(|| {
+                self.raw_force_settings()
+                    .map(|raw| raw.decode_strings(self.strings()))
+            })
+            .as_ref()
     }
 }
 
@@ -225,7 +274,7 @@ mod tests {
 
         let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
 
-        assert_eq!(result.format_version, FormatVersion::OriginalRetail);
+        assert_eq!(result.format_version(), FormatVersion::OriginalRetail);
 
         let mut chunks = result
             .chunks
@@ -504,19 +553,14 @@ mod tests {
     fn lt_strings() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
 
-        assert_eq!(result.strings.inner.data.kind, StringsChunkKind::Legacy);
-        assert_eq!(result.strings.inner.max_len, 1024);
+        assert_eq!(result.raw_strings.data.kind, StringsChunkKind::Legacy);
+        assert_eq!(result.raw_strings.max_len, 1024);
         assert_eq!(
-            result.strings.inner.get_raw_bytes(1.into()).unwrap(),
+            result.raw_strings.get_raw_bytes(1.into()).unwrap(),
             b"Untitled Scenario"
         );
 
-        assert_eq!(result.scenario_props.name_id, 4.into());
-        assert_eq!(result.scenario_props.description_id, 5.into());
-
-        assert_eq!(
-            result.strings.get(result.scenario_props.name_id),
-            Some("The Lost Temple".into())
-        );
+        let scenario_props = assert_ok!(result.scenario_props());
+        assert_eq!(scenario_props.name, Some("The Lost Temple".into()));
     }
 }

@@ -1,5 +1,3 @@
-use crate::chk::forces::RawForceSettings;
-use crate::chk::scenario_props::RawScenarioProps;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -10,6 +8,31 @@ pub struct StringId(pub usize);
 impl From<u16> for StringId {
     fn from(value: u16) -> Self {
         Self(value as usize)
+    }
+}
+
+/// A CHK structure that contains string IDs that need to be decoded from the strings chunk. This
+/// allows you to specify a general way to decode the whole struct.
+pub trait ChkDecode<T> {
+    /// Decodes this CHK structure into a [T] using the strings from `strings_chunk`.
+    fn decode_strings(&self, strings_chunk: &StringsChunk<'_>) -> T;
+}
+
+/// A type that can return an iterator over all the CHK string IDs it references.
+pub trait UsedChkStrings {
+    /// Returns an iterator over all the string IDs that this CHK structure references.
+    fn used_string_ids(&self) -> Box<dyn Iterator<Item = StringId> + '_>;
+}
+
+impl<T, E> UsedChkStrings for &Result<T, E>
+where
+    T: UsedChkStrings,
+{
+    fn used_string_ids(&self) -> Box<dyn Iterator<Item = StringId> + '_> {
+        match self {
+            Ok(v) => v.used_string_ids(),
+            Err(_) => Box::new(std::iter::empty()),
+        }
     }
 }
 
@@ -191,12 +214,12 @@ pub enum StringEncoding {
 #[derive(Debug, Clone)]
 pub struct StringsChunk<'a> {
     pub encoding: StringEncoding,
-    pub inner: RawStringsChunk<'a>,
+    pub inner: &'a RawStringsChunk<'a>,
 }
 
 impl<'a> StringsChunk<'a> {
     pub fn with_known_encoding(
-        strings_chunk: RawStringsChunk<'a>,
+        strings_chunk: &'a RawStringsChunk<'a>,
         encoding: StringEncoding,
     ) -> StringsChunk<'a> {
         StringsChunk {
@@ -206,17 +229,9 @@ impl<'a> StringsChunk<'a> {
     }
 
     pub fn with_auto_encoding(
-        strings_chunk: RawStringsChunk<'a>,
-        scenario_props: &RawScenarioProps,
-        force_settings: &RawForceSettings,
+        strings_chunk: &'a RawStringsChunk<'a>,
+        used_string_ids: HashSet<StringId>,
     ) -> StringsChunk<'a> {
-        // TODO(tec27): Add strings from triggers, mission briefings, and unit settings as well
-        let scenario_strings = [scenario_props.name_id, scenario_props.description_id];
-        let used_string_ids = scenario_strings
-            .into_iter()
-            .chain(force_settings.forces.iter().map(|f| f.name_id))
-            .collect::<HashSet<_>>();
-
         // SC 1.16.1 used either CP-949 or CP-1252 encoding for all map strings depending on whether
         // the system locale was set to Korea or not. SC:R considers each string separately,
         // defaulting to UTF-8(*), and if the string cannot be decoded with UTF-8, SC:R guesses
