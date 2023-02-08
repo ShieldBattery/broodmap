@@ -5,11 +5,14 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
+use forces::{read_force_settings, ForceSettings, ForceSettingsError};
 use format_version::{read_format_version, FormatVersion, FormatVersionError};
 use scenario_props::{read_scenario_props, ScenarioProps, ScenarioPropsError};
+use strings::{DecodedStringsChunk, StringEncoding};
 use strings::{StringsChunk, StringsChunkError};
 
 pub mod chunk_type;
+pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
 pub mod strings;
@@ -24,6 +27,8 @@ pub struct ChkChunk {
 
 #[derive(Error, Debug)]
 pub enum ChkError {
+    #[error("Invalid force settings: {0}")]
+    InvalidForceSettings(ForceSettingsError),
     #[error("Invalid format version: {0}")]
     InvalidFormatVersion(FormatVersionError),
     /// A chunk was encountered that jumped past the beginning of the file.
@@ -44,12 +49,22 @@ pub struct Chk<'a> {
     pub chunks: ChunkMap,
 
     pub format_version: FormatVersion,
-    pub strings: StringsChunk<'a>,
+    pub strings: DecodedStringsChunk<'a>,
+    // TODO(tec27): Replace these with string-decoded versions
     pub scenario_props: ScenarioProps,
+    pub force_settings: ForceSettings,
 }
 
 impl<'a> Chk<'a> {
-    pub fn from_bytes(data: &'a [u8]) -> Result<Self, ChkError> {
+    /// Creates a [Chk] from the specified bytes in memory.
+    ///
+    /// If `str_encoding` is [None], the string encoding will be automatically detected from the
+    /// contents of the file. Note that this detection is not guaranteed to be correct (but neither
+    /// is BW's own detection).
+    pub fn from_bytes(
+        data: &'a [u8],
+        str_encoding: Option<StringEncoding>,
+    ) -> Result<Self, ChkError> {
         let chunks = gather_chunk_map(data)?;
 
         let format_version = read_format_version(
@@ -67,6 +82,17 @@ impl<'a> Chk<'a> {
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::SPRP))?,
         )
         .map_err(ChkError::InvalidScenarioProps)?;
+        let force_settings = read_force_settings(
+            &read_chunk_data(data, &chunks, ChunkType::FORC)
+                .ok_or(ChkError::MissingRequiredChunk(ChunkType::FORC))?,
+        )
+        .map_err(ChkError::InvalidForceSettings)?;
+
+        let strings = if let Some(encoding) = str_encoding {
+            DecodedStringsChunk::with_known_encoding(strings, encoding)
+        } else {
+            DecodedStringsChunk::with_auto_encoding(strings, &scenario_props, &force_settings)
+        };
 
         Ok(Chk {
             data,
@@ -75,6 +101,7 @@ impl<'a> Chk<'a> {
             format_version,
             strings,
             scenario_props,
+            force_settings,
         })
     }
 }
@@ -193,7 +220,7 @@ mod tests {
     fn sections_normal() {
         use crate::chk::chunk_type::ChunkType::*;
 
-        let result = assert_ok!(Chk::from_bytes(LT_CHK));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
 
         assert_eq!(result.format_version, FormatVersion::OriginalRetail);
 
@@ -472,16 +499,21 @@ mod tests {
 
     #[test]
     fn lt_strings() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
 
-        assert_eq!(result.strings.data.kind, StringsChunkKind::Legacy);
-        assert_eq!(result.strings.max_len, 1024);
+        assert_eq!(result.strings.inner.data.kind, StringsChunkKind::Legacy);
+        assert_eq!(result.strings.inner.max_len, 1024);
         assert_eq!(
-            result.strings.get_raw_bytes(1).unwrap(),
+            result.strings.inner.get_raw_bytes(1.into()).unwrap(),
             b"Untitled Scenario"
         );
 
-        assert_eq!(result.scenario_props.name_id, 4);
-        assert_eq!(result.scenario_props.description_id, 5);
+        assert_eq!(result.scenario_props.name_id, 4.into());
+        assert_eq!(result.scenario_props.description_id, 5.into());
+
+        assert_eq!(
+            result.strings.get(result.scenario_props.name_id),
+            Some("The Lost Temple".into())
+        );
     }
 }
