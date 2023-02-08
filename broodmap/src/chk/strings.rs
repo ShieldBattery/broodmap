@@ -254,7 +254,7 @@ impl<'a> DecodedStringsChunk<'a> {
                 // This was not valid 949 encoding. Sometimes there may be maps that have been
                 // edited in both encodings, so just take this as a heavy hint towards 1252
                 if !is_valid_utf8 {
-                    weight_other = weight_other + 5
+                    weight_other += 5
                 }
             } else {
                 (hangul_chars, possible_non_ascii) =
@@ -277,9 +277,7 @@ impl<'a> DecodedStringsChunk<'a> {
             if is_valid_utf8 && non_ascii_1252 > 10 {
                 // This map definitely should be counted as having UTF-8 strings
                 weight_utf8 += 50
-            } else if had_hangul && hangul_chars >= 5 {
-                weight_korean += 1
-            } else if had_hangul && hangul_chars > possible_non_ascii {
+            } else if had_hangul && (hangul_chars >= 5 || hangul_chars > possible_non_ascii) {
                 weight_korean += 1
             } else if non_ascii_1252 > 0 {
                 if is_valid_utf8 {
