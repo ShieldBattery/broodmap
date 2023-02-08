@@ -1,6 +1,7 @@
 use crate::chk::forces::ForceSettings;
 use crate::chk::scenario_props::ScenarioProps;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -210,10 +211,11 @@ impl<'a> DecodedStringsChunk<'a> {
         force_settings: &ForceSettings,
     ) -> DecodedStringsChunk<'a> {
         // TODO(tec27): Add strings from triggers, mission briefings, and unit settings as well
-        let mut used_string_ids = vec![scenario_props.name_id, scenario_props.description_id];
-        used_string_ids.extend_from_slice(force_settings.forces.map(|f| f.name_id).as_slice());
-        used_string_ids.sort();
-        used_string_ids.dedup();
+        let scenario_strings = [scenario_props.name_id, scenario_props.description_id];
+        let used_string_ids = scenario_strings
+            .into_iter()
+            .chain(force_settings.forces.iter().map(|f| f.name_id))
+            .collect::<HashSet<_>>();
 
         // SC 1.16.1 used either CP-949 or CP-1252 encoding for all map strings depending on whether
         // the system locale was set to Korea or not. SC:R considers each string separately,
@@ -240,10 +242,11 @@ impl<'a> DecodedStringsChunk<'a> {
                 continue;
             };
 
-            let mut non_ascii_1252 = bytes.iter().filter(|&b| *b >= 0x80).collect::<Vec<_>>();
-            non_ascii_1252.sort();
-            non_ascii_1252.dedup();
-            let non_ascii_1252 = non_ascii_1252.len();
+            let non_ascii_1252 = bytes
+                .iter()
+                .filter(|&b| *b >= 0x80)
+                .collect::<HashSet<_>>()
+                .len();
 
             let is_valid_utf8 = std::str::from_utf8(bytes).is_ok();
 
