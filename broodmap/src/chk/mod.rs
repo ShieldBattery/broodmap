@@ -5,11 +5,11 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
-use forces::{read_force_settings, ForceSettings, ForceSettingsError};
+use forces::{read_force_settings, ForceSettingsError, RawForceSettings};
 use format_version::{read_format_version, FormatVersion, FormatVersionError};
-use scenario_props::{read_scenario_props, ScenarioProps, ScenarioPropsError};
-use strings::{DecodedStringsChunk, StringEncoding};
-use strings::{StringsChunk, StringsChunkError};
+use scenario_props::{read_scenario_props, RawScenarioProps, ScenarioPropsError};
+use strings::{RawStringsChunk, StringsChunkError};
+use strings::{StringEncoding, StringsChunk};
 
 pub mod chunk_type;
 pub mod forces;
@@ -46,13 +46,15 @@ pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
 
 pub struct Chk<'a> {
     pub data: &'a [u8],
+    pub desired_encoding: Option<StringEncoding>,
     pub chunks: ChunkMap,
 
-    pub format_version: FormatVersion,
-    pub strings: DecodedStringsChunk<'a>,
+    format_version: FormatVersion,
+    scenario_props: RawScenarioProps,
+    force_settings: RawForceSettings,
+
+    pub strings: StringsChunk<'a>,
     // TODO(tec27): Replace these with string-decoded versions
-    pub scenario_props: ScenarioProps,
-    pub force_settings: ForceSettings,
 }
 
 impl<'a> Chk<'a> {
@@ -72,7 +74,7 @@ impl<'a> Chk<'a> {
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::VER))?,
         )
         .map_err(ChkError::InvalidFormatVersion)?;
-        let strings = StringsChunk::from_bytes(
+        let strings = RawStringsChunk::from_bytes(
             read_chunk_data(data, &chunks, ChunkType::STR),
             read_chunk_data(data, &chunks, ChunkType::STRx),
         )
@@ -89,13 +91,14 @@ impl<'a> Chk<'a> {
         .map_err(ChkError::InvalidForceSettings)?;
 
         let strings = if let Some(encoding) = str_encoding {
-            DecodedStringsChunk::with_known_encoding(strings, encoding)
+            StringsChunk::with_known_encoding(strings, encoding)
         } else {
-            DecodedStringsChunk::with_auto_encoding(strings, &scenario_props, &force_settings)
+            StringsChunk::with_auto_encoding(strings, &scenario_props, &force_settings)
         };
 
         Ok(Chk {
             data,
+            desired_encoding: str_encoding,
             chunks,
 
             format_version,

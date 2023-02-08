@@ -12,21 +12,21 @@ bitflags! {
     }
 }
 
-/// A force in a scenario file. Scenarios have 4 forces under which players are grouped, each force
-/// having its own settings.
+/// A force in a scenario file, with its strings not decoded. Scenarios have 4 forces under which
+/// players are grouped, each force having its own settings.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct Force {
+pub struct RawForce {
     /// The string ID of the force name. Must be looked up/decoded from the strings chunk. `0`
     /// indicates this should default to a "Force #" string.
     pub name_id: StringId,
     pub flags: ForceFlags,
 }
 
-/// The contents of the FORC chunk of a CHK file (Force Settings).
+/// The contents of the FORC chunk of a CHK file (Force Settings) with its strings not decoded.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct ForceSettings {
+pub struct RawForceSettings {
     /// The configuration for each force in the scenario.
-    pub forces: [Force; 4],
+    pub forces: [RawForce; 4],
     /// The assignment of players to forces (indexed by player ID, value is the index in [forces]).
     /// Players can be outside of 1 of the 4 forces, however they will not appear in the game lobby.
     pub assigned_forces: [u8; 8],
@@ -38,7 +38,7 @@ pub enum ForceSettingsError {
     InvalidDataLength,
 }
 
-pub fn read_force_settings(data: &[u8]) -> Result<ForceSettings, ForceSettingsError> {
+pub fn read_force_settings(data: &[u8]) -> Result<RawForceSettings, ForceSettingsError> {
     if data.len() > 20 {
         return Err(ForceSettingsError::InvalidDataLength);
     }
@@ -58,12 +58,12 @@ pub fn read_force_settings(data: &[u8]) -> Result<ForceSettings, ForceSettingsEr
 
     let forces = force_names_iter
         .zip(force_flags_iter)
-        .map(|(name_id, flags)| Force { name_id, flags })
+        .map(|(name_id, flags)| RawForce { name_id, flags })
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
 
-    Ok(ForceSettings {
+    Ok(RawForceSettings {
         forces,
         assigned_forces,
     })

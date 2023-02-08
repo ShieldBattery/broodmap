@@ -1,5 +1,5 @@
-use crate::chk::forces::ForceSettings;
-use crate::chk::scenario_props::ScenarioProps;
+use crate::chk::forces::RawForceSettings;
+use crate::chk::scenario_props::RawScenarioProps;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -120,7 +120,7 @@ impl<'a> StringsChunkData<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct StringsChunk<'a> {
+pub struct RawStringsChunk<'a> {
     /// The string data any reads will be done from.
     pub data: StringsChunkData<'a>,
     /// The maximum number of strings this chunk contains. This is the value its header claims it
@@ -128,11 +128,11 @@ pub struct StringsChunk<'a> {
     pub max_len: usize,
 }
 
-impl<'a> StringsChunk<'a> {
+impl<'a> RawStringsChunk<'a> {
     pub fn from_bytes(
         legacy_bytes: Option<Cow<'a, [u8]>>,
         extended_bytes: Option<Cow<'a, [u8]>>,
-    ) -> Result<StringsChunk<'a>, StringsChunkError> {
+    ) -> Result<RawStringsChunk<'a>, StringsChunkError> {
         let data = match (legacy_bytes, extended_bytes) {
             (_, Some(extended_bytes)) => StringsChunkData::extended(extended_bytes),
             (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes),
@@ -145,7 +145,7 @@ impl<'a> StringsChunk<'a> {
             .ok_or(StringsChunkError::DataTooShort)?
             .min((data.bytes_len() - dim_size) / dim_size);
 
-        Ok(StringsChunk { data, max_len })
+        Ok(RawStringsChunk { data, max_len })
     }
 
     /// Returns the bytes that make up the string at index `index`, or [None] if the index is out of
@@ -189,27 +189,27 @@ pub enum StringEncoding {
 }
 
 #[derive(Debug, Clone)]
-pub struct DecodedStringsChunk<'a> {
+pub struct StringsChunk<'a> {
     pub encoding: StringEncoding,
-    pub inner: StringsChunk<'a>,
+    pub inner: RawStringsChunk<'a>,
 }
 
-impl<'a> DecodedStringsChunk<'a> {
+impl<'a> StringsChunk<'a> {
     pub fn with_known_encoding(
-        strings_chunk: StringsChunk<'a>,
+        strings_chunk: RawStringsChunk<'a>,
         encoding: StringEncoding,
-    ) -> DecodedStringsChunk<'a> {
-        DecodedStringsChunk {
+    ) -> StringsChunk<'a> {
+        StringsChunk {
             encoding,
             inner: strings_chunk,
         }
     }
 
     pub fn with_auto_encoding(
-        strings_chunk: StringsChunk<'a>,
-        scenario_props: &ScenarioProps,
-        force_settings: &ForceSettings,
-    ) -> DecodedStringsChunk<'a> {
+        strings_chunk: RawStringsChunk<'a>,
+        scenario_props: &RawScenarioProps,
+        force_settings: &RawForceSettings,
+    ) -> StringsChunk<'a> {
         // TODO(tec27): Add strings from triggers, mission briefings, and unit settings as well
         let scenario_strings = [scenario_props.name_id, scenario_props.description_id];
         let used_string_ids = scenario_strings
