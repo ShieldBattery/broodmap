@@ -16,12 +16,14 @@ use crate::chk::scenario_props::{
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
+use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 
 pub mod chunk_type;
 pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
 pub mod strings;
+pub mod triggers;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChkChunk {
@@ -55,6 +57,7 @@ pub struct Chk<'a> {
     raw_strings: RawStringsChunk<'a>,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
     raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
+    raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
 
     strings: OnceCell<StringsChunk<'a>>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
@@ -93,6 +96,7 @@ impl<'a> Chk<'a> {
             raw_strings,
             raw_scenario_props: OnceCell::new(),
             raw_force_settings: OnceCell::new(),
+            raw_triggers: OnceCell::new(),
 
             strings: OnceCell::new(),
             scenario_props: OnceCell::new(),
@@ -108,6 +112,7 @@ impl<'a> Chk<'a> {
                 let used_strings = [
                     self.raw_scenario_props().used_string_ids(),
                     self.raw_force_settings().used_string_ids(),
+                    self.raw_triggers_private().used_string_ids(),
                 ]
                 .into_iter()
                 .flatten()
@@ -155,6 +160,23 @@ impl<'a> Chk<'a> {
                     .map(|raw| raw.decode_strings(self.strings()))
             })
             .as_ref()
+    }
+
+    // NOTE(tec27): This is private because we don't generally want to return references to the
+    // Result, just their contents. Triggers are sort of weird because we don't provide a non-raw
+    // vresion of them, and thus do expose the raw version. So we need a different name here
+    fn raw_triggers_private(&'a self) -> &'a Result<Vec<RawTrigger>, TriggersError> {
+        self.raw_triggers.get_or_init(|| {
+            let chunk_data = read_chunk_data(self.data, &self.chunks, ChunkType::TRIG);
+            match chunk_data {
+                Some(ref data) => read_triggers(data),
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn raw_triggers(&'a self) -> Result<&'a Vec<RawTrigger>, &'a TriggersError> {
+        self.raw_triggers_private().as_ref()
     }
 }
 
@@ -260,6 +282,9 @@ fn read_chunk_data<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::chk::triggers::{
+        NumericComparison, PlayerGroup, RawTriggerAction, TriggerCondition,
+    };
     use assert_ok::assert_ok;
     use smallvec::smallvec;
 
@@ -556,11 +581,38 @@ mod tests {
         assert_eq!(result.raw_strings.data.kind, StringsChunkKind::Legacy);
         assert_eq!(result.raw_strings.max_len, 1024);
         assert_eq!(
-            result.raw_strings.get_raw_bytes(1.into()).unwrap(),
+            result.raw_strings.get_raw_bytes(1u16.into()).unwrap(),
             b"Untitled Scenario"
         );
 
         let scenario_props = assert_ok!(result.scenario_props());
         assert_eq!(scenario_props.name, Some("The Lost Temple".into()));
+    }
+
+    #[test]
+    fn lt_triggers() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+
+        let triggers = assert_ok!(result.raw_triggers());
+        assert_eq!(triggers.len(), 3);
+
+        let first = &triggers[0];
+        assert_eq!(first.conditions.len(), 16);
+        assert_eq!(first.actions.len(), 64);
+        let mut all_players = [false; 27];
+        all_players[PlayerGroup::AllPlayers as usize] = true;
+        assert_eq!(first.enabled_for, all_players);
+
+        assert_eq!(
+            first.conditions[0].condition,
+            TriggerCondition::Command {
+                player_group: PlayerGroup::CurrentPlayer,
+                comparison: NumericComparison::AtMost,
+                unit_id: 229, /* any unit */
+                amount: 0,
+            }
+        );
+
+        assert_eq!(first.actions[0].action, RawTriggerAction::Defeat);
     }
 }

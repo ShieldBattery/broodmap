@@ -11,6 +11,12 @@ impl From<u16> for StringId {
     }
 }
 
+impl From<u32> for StringId {
+    fn from(value: u32) -> Self {
+        Self(value as usize)
+    }
+}
+
 /// A CHK structure that contains string IDs that need to be decoded from the strings chunk. This
 /// allows you to specify a general way to decode the whole struct.
 pub trait ChkDecode<T> {

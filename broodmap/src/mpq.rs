@@ -489,7 +489,8 @@ impl<'a> Mpq<'a> {
                 Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Incomplete(_)) => {
-                    panic!("incomplete returned from a complete parser")
+                    // We're using complete parsers here so this should never happen
+                    unreachable!()
                 }
             }
         }?;
@@ -505,7 +506,8 @@ impl<'a> Mpq<'a> {
                 Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Incomplete(_)) => {
-                    panic!("incomplete returned from a complete parser")
+                    // We're using complete parsers here so this should never happen
+                    unreachable!()
                 }
             }
         }?;
@@ -742,7 +744,8 @@ impl<'a> Mpq<'a> {
                 Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
                 Err(nom::Err::Incomplete(_)) => {
-                    panic!("incomplete returned from a complete parser")
+                    // We're using complete parsers here so this should never happen
+                    unreachable!()
                 }
             }?;
 

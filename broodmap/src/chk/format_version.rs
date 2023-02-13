@@ -29,7 +29,7 @@ impl TryFrom<u16> for FormatVersion {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FormatVersionError {
     #[error("Invalid data length")]
     InvalidDataLength,
