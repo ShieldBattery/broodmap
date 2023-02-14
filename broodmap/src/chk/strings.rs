@@ -42,7 +42,7 @@ where
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StringsChunkError {
     #[error("No strings chunk found")]
     NoStringsChunk,

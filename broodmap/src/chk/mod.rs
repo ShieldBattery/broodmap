@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::chk::briefing::{read_briefing, BriefingError, RawBriefingTrigger};
 use once_cell::sync::OnceCell;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -18,6 +19,7 @@ use crate::chk::strings::{
 };
 use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 
+pub mod briefing;
 pub mod chunk_type;
 pub mod forces;
 pub mod format_version;
@@ -58,6 +60,7 @@ pub struct Chk<'a> {
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
     raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
     raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
+    raw_briefing: OnceCell<Result<Vec<RawBriefingTrigger>, BriefingError>>,
 
     strings: OnceCell<StringsChunk<'a>>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
@@ -97,6 +100,7 @@ impl<'a> Chk<'a> {
             raw_scenario_props: OnceCell::new(),
             raw_force_settings: OnceCell::new(),
             raw_triggers: OnceCell::new(),
+            raw_briefing: OnceCell::new(),
 
             strings: OnceCell::new(),
             scenario_props: OnceCell::new(),
@@ -113,6 +117,7 @@ impl<'a> Chk<'a> {
                     self.raw_scenario_props().used_string_ids(),
                     self.raw_force_settings().used_string_ids(),
                     self.raw_triggers_private().used_string_ids(),
+                    self.raw_briefing_private().used_string_ids(),
                 ]
                 .into_iter()
                 .flatten()
@@ -177,6 +182,23 @@ impl<'a> Chk<'a> {
 
     pub fn raw_triggers(&'a self) -> Result<&'a Vec<RawTrigger>, &'a TriggersError> {
         self.raw_triggers_private().as_ref()
+    }
+
+    // NOTE(tec27): This is private because we don't generally want to return references to the
+    // Result, just their contents. Triggers are sort of weird because we don't provide a non-raw
+    // vresion of them, and thus do expose the raw version. So we need a different name here
+    fn raw_briefing_private(&'a self) -> &'a Result<Vec<RawBriefingTrigger>, BriefingError> {
+        self.raw_briefing.get_or_init(|| {
+            let chunk_data = read_chunk_data(self.data, &self.chunks, ChunkType::MBRF);
+            match chunk_data {
+                Some(ref data) => read_briefing(data),
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn raw_briefing(&'a self) -> Result<&'a Vec<RawBriefingTrigger>, &'a BriefingError> {
+        self.raw_briefing_private().as_ref()
     }
 }
 

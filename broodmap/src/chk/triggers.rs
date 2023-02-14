@@ -3,7 +3,7 @@ use bitflags::bitflags;
 use nom::bytes::complete::take;
 use nom::combinator::map;
 use nom::multi::{count, many0};
-use nom::number::complete::{le_u16, le_u32, u8 as nom_u8};
+use nom::number::complete::{le_u16, le_u32, le_u8};
 use nom::sequence::tuple;
 use nom::IResult;
 use std::time::Duration;
@@ -17,15 +17,21 @@ pub enum NumericComparison {
     Exactly = 10,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum NumericComparisonConversionError {
+    #[error("Invalid NumericComparison value: {0}")]
+    InvalidValue(u8),
+}
+
 impl TryFrom<u8> for NumericComparison {
-    type Error = ();
+    type Error = NumericComparisonConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             x if x == NumericComparison::AtLeast as u8 => Ok(NumericComparison::AtLeast),
             x if x == NumericComparison::AtMost as u8 => Ok(NumericComparison::AtMost),
             x if x == NumericComparison::Exactly as u8 => Ok(NumericComparison::Exactly),
-            _ => Err(()),
+            x => Err(NumericComparisonConversionError::InvalidValue(x)),
         }
     }
 }
@@ -37,14 +43,20 @@ pub enum SwitchState {
     Cleared = 3,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SwitchStateConversionError {
+    #[error("Invalid SwitchState value: {0}")]
+    InvalidValue(u8),
+}
+
 impl TryFrom<u8> for SwitchState {
-    type Error = ();
+    type Error = SwitchStateConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             x if x == SwitchState::Set as u8 => Ok(SwitchState::Set),
             x if x == SwitchState::Cleared as u8 => Ok(SwitchState::Cleared),
-            _ => Err(()),
+            x => Err(SwitchStateConversionError::InvalidValue(x)),
         }
     }
 }
@@ -81,8 +93,14 @@ pub enum PlayerGroup {
     NonAlliedVictoryPlayers = 26,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum PlayerGroupConversionError {
+    #[error("Invalid PlayerGroup value: {0}")]
+    InvalidValue(u32),
+}
+
 impl TryFrom<u32> for PlayerGroup {
-    type Error = ();
+    type Error = PlayerGroupConversionError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
@@ -115,7 +133,7 @@ impl TryFrom<u32> for PlayerGroup {
             x if x == PlayerGroup::NonAlliedVictoryPlayers as u32 => {
                 Ok(PlayerGroup::NonAlliedVictoryPlayers)
             }
-            _ => Err(()),
+            x => Err(PlayerGroupConversionError::InvalidValue(x)),
         }
     }
 }
@@ -128,28 +146,34 @@ pub enum ResourceKind {
     OreAndGas = 2,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ResourceKindConversionError {
+    #[error("Invalid ResourceKind value: {0}")]
+    InvalidValue(u16),
+}
+
 impl TryFrom<u8> for ResourceKind {
-    type Error = ();
+    type Error = ResourceKindConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             x if x == ResourceKind::Ore as u8 => Ok(ResourceKind::Ore),
             x if x == ResourceKind::Gas as u8 => Ok(ResourceKind::Gas),
             x if x == ResourceKind::OreAndGas as u8 => Ok(ResourceKind::OreAndGas),
-            _ => Err(()),
+            x => Err(ResourceKindConversionError::InvalidValue(x.into())),
         }
     }
 }
 
 impl TryFrom<u16> for ResourceKind {
-    type Error = ();
+    type Error = ResourceKindConversionError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             x if x == ResourceKind::Ore as u16 => Ok(ResourceKind::Ore),
             x if x == ResourceKind::Gas as u16 => Ok(ResourceKind::Gas),
             x if x == ResourceKind::OreAndGas as u16 => Ok(ResourceKind::OreAndGas),
-            _ => Err(()),
+            x => Err(ResourceKindConversionError::InvalidValue(x)),
         }
     }
 }
@@ -167,8 +191,14 @@ pub enum ScoreKind {
     Custom = 7,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ScoreKindConversionError {
+    #[error("Invalid ScoreKind value: {0}")]
+    InvalidValue(u16),
+}
+
 impl TryFrom<u8> for ScoreKind {
-    type Error = ();
+    type Error = ScoreKindConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -180,13 +210,13 @@ impl TryFrom<u8> for ScoreKind {
             x if x == ScoreKind::Razings as u8 => Ok(ScoreKind::Razings),
             x if x == ScoreKind::KillsAndRazings as u8 => Ok(ScoreKind::KillsAndRazings),
             x if x == ScoreKind::Custom as u8 => Ok(ScoreKind::Custom),
-            _ => Err(()),
+            _ => Err(ScoreKindConversionError::InvalidValue(value.into())),
         }
     }
 }
 
 impl TryFrom<u16> for ScoreKind {
-    type Error = ();
+    type Error = ScoreKindConversionError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
@@ -198,7 +228,7 @@ impl TryFrom<u16> for ScoreKind {
             x if x == ScoreKind::Razings as u16 => Ok(ScoreKind::Razings),
             x if x == ScoreKind::KillsAndRazings as u16 => Ok(ScoreKind::KillsAndRazings),
             x if x == ScoreKind::Custom as u16 => Ok(ScoreKind::Custom),
-            _ => Err(()),
+            x => Err(ScoreKindConversionError::InvalidValue(x)),
         }
     }
 }
@@ -320,11 +350,17 @@ pub enum TriggerCondition {
     Never,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ParseTriggerConditionError {
+    #[error("Unknown condition type: {0}")]
+    UnknownType(u8),
+}
+
 impl TriggerCondition {
     // Blame Blizzard for the arguments :( And returning an error here is a pain given how many
     // different things would fail, and we'd just discard it anyway. Ideally we'd add some
     // (optional) verbose logging around this stuff I think
-    #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_raw_info(
         condition: u8,
         location_or_bitmask: u32,
@@ -334,7 +370,7 @@ impl TriggerCondition {
         comparison_or_switch_state: u8,
         resource_score_switch: u8,
         eud_mask: bool,
-    ) -> Result<TriggerCondition, ()> {
+    ) -> Result<TriggerCondition, Box<dyn std::error::Error>> {
         let c = match condition {
             0 => TriggerCondition::None,
             1 => TriggerCondition::CountdownTimer {
@@ -446,7 +482,7 @@ impl TriggerCondition {
             },
             22 => TriggerCondition::Always,
             23 => TriggerCondition::Never,
-            _ => return Err(()),
+            value => return Err(ParseTriggerConditionError::UnknownType(value).into()),
         };
 
         Ok(c)
@@ -477,10 +513,10 @@ pub(crate) fn trigger_condition_data(input: &[u8]) -> IResult<&[u8], Option<Trig
             le_u32,
             le_u32,
             le_u16,
-            nom_u8,
-            nom_u8,
-            nom_u8,
-            nom_u8,
+            le_u8,
+            le_u8,
+            le_u8,
+            le_u8,
             take(2usize),
         )),
         |(
@@ -522,15 +558,21 @@ pub enum NumberOperation {
     Subtract = 9,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum NumberOperationConversionError {
+    #[error("Invalid NumberOperation value: {0}")]
+    InvalidValue(u8),
+}
+
 impl TryFrom<u8> for NumberOperation {
-    type Error = ();
+    type Error = NumberOperationConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             x if x == NumberOperation::SetTo as u8 => Ok(NumberOperation::SetTo),
             x if x == NumberOperation::Add as u8 => Ok(NumberOperation::Add),
             x if x == NumberOperation::Subtract as u8 => Ok(NumberOperation::Subtract),
-            _ => Err(()),
+            x => Err(NumberOperationConversionError::InvalidValue(x)),
         }
     }
 }
@@ -544,8 +586,14 @@ pub enum ActionState {
     Randomize = 11,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ActionStateConversionError {
+    #[error("Invalid ActionState value: {0}")]
+    InvalidValue(u8),
+}
+
 impl TryFrom<u8> for ActionState {
-    type Error = ();
+    type Error = ActionStateConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -553,7 +601,7 @@ impl TryFrom<u8> for ActionState {
             x if x == ActionState::Clear as u8 => Ok(ActionState::Clear),
             x if x == ActionState::Toggle as u8 => Ok(ActionState::Toggle),
             x if x == ActionState::Randomize as u8 => Ok(ActionState::Randomize),
-            _ => Err(()),
+            x => Err(ActionStateConversionError::InvalidValue(x)),
         }
     }
 }
@@ -566,15 +614,21 @@ pub enum UnitOrder {
     Attack = 2,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum UnitOrderConversionError {
+    #[error("Invalid UnitOrder value: {0}")]
+    InvalidValue(u8),
+}
+
 impl TryFrom<u8> for UnitOrder {
-    type Error = ();
+    type Error = UnitOrderConversionError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             x if x == UnitOrder::Move as u8 => Ok(UnitOrder::Move),
             x if x == UnitOrder::Patrol as u8 => Ok(UnitOrder::Patrol),
             x if x == UnitOrder::Attack as u8 => Ok(UnitOrder::Attack),
-            _ => Err(()),
+            x => Err(UnitOrderConversionError::InvalidValue(x)),
         }
     }
 }
@@ -587,15 +641,21 @@ pub enum AllianceStatus {
     AlliedVictory = 2,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum AllianceStatusConversionError {
+    #[error("Invalid AllianceStatus value: {0}")]
+    InvalidValue(u16),
+}
+
 impl TryFrom<u16> for AllianceStatus {
-    type Error = ();
+    type Error = AllianceStatusConversionError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             x if x == AllianceStatus::Enemy as u16 => Ok(AllianceStatus::Enemy),
             x if x == AllianceStatus::Ally as u16 => Ok(AllianceStatus::Ally),
             x if x == AllianceStatus::AlliedVictory as u16 => Ok(AllianceStatus::AlliedVictory),
-            _ => Err(()),
+            x => Err(AllianceStatusConversionError::InvalidValue(x)),
         }
     }
 }
@@ -882,11 +942,17 @@ pub enum RawTriggerAction {
     EnableDebugMode,
 }
 
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ParseRawTriggerActionError {
+    #[error("Unknown action type: {0}")]
+    UnknownType(u8),
+}
+
 impl RawTriggerAction {
     // Blame Blizzard for the arguments :( And returning an error here is a pain given how many
     // different things would fail, and we'd just discard it anyway. Ideally we'd add some
     // (optional) verbose logging around this stuff I think
-    #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_raw_info(
         action: u8,
         location_or_bitmask: u32,
@@ -898,7 +964,7 @@ impl RawTriggerAction {
         unit_id_or_type: u16,
         unit_amount_or_state_or_op: u8,
         eud_mask: bool,
-    ) -> Result<RawTriggerAction, ()> {
+    ) -> Result<RawTriggerAction, Box<dyn std::error::Error>> {
         let a = match action {
             0 => RawTriggerAction::NoAction,
             1 => RawTriggerAction::Victory,
@@ -1169,7 +1235,7 @@ impl RawTriggerAction {
             },
             58 => RawTriggerAction::DisableDebugMode,
             59 => RawTriggerAction::EnableDebugMode,
-            _ => return Err(()),
+            value => return Err(ParseRawTriggerActionError::UnknownType(value).into()),
         };
 
         Ok(a)
@@ -1205,10 +1271,10 @@ fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionDa
             le_u32,
             le_u32,
             le_u16,
-            nom_u8,
-            nom_u8,
-            nom_u8,
-            nom_u8,
+            le_u8,
+            le_u8,
+            le_u8,
+            le_u8,
             take(2usize),
         )),
         |(
@@ -1250,6 +1316,7 @@ fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionDa
 // actions. It seems to be a weird mix of bookkeeping things that BW presumably uses (or used)
 // at runtime and I guess didn't want to have to allocate elsewhere? but also some stuff that
 // might be used in more advanced maps (e.g. the preserve trigger flag).
+#[derive(Debug, Clone)]
 pub struct RawTrigger {
     pub conditions: Vec<TriggerConditionData>,
     pub actions: Vec<RawTriggerActionData>,
@@ -1269,7 +1336,7 @@ fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
             .try_into()
             .unwrap()
     })(input)?;
-    let (input, _action_index) = nom_u8(input)?;
+    let (input, _action_index) = le_u8(input)?;
 
     Ok((
         input,
@@ -1284,37 +1351,39 @@ fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
 impl UsedChkStrings for Vec<RawTrigger> {
     fn used_string_ids(&self) -> Box<dyn Iterator<Item = StringId> + '_> {
         Box::new(self.iter().flat_map(|trigger| {
-            let mut result = vec![];
-            for action in &trigger.actions {
-                match action.action {
-                    RawTriggerAction::Transmission { text, sound, .. } => {
-                        result.push(text);
-                        result.push(sound);
-                    }
-                    RawTriggerAction::PlaySound { sound, .. } => result.push(sound),
-                    RawTriggerAction::DisplayTextMessage { text, .. } => result.push(text),
-                    RawTriggerAction::SetMissionObjectives { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardControl { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardControlAtLocation { text, .. } => {
-                        result.push(text)
-                    }
-                    RawTriggerAction::LeaderboardResources { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardKills { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardScore { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardGoalControl { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardGoalControlAtLocation { text, .. } => {
-                        result.push(text)
-                    }
-                    RawTriggerAction::LeaderboardGoalResources { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardGoalKills { text, .. } => result.push(text),
-                    RawTriggerAction::LeaderboardGoalScore { text, .. } => result.push(text),
-                    RawTriggerAction::SetNextScenario(scenario) => result.push(scenario),
-                    RawTriggerAction::Comment(text) => result.push(text),
-                    _ => {}
-                }
-            }
-
-            result
+            trigger
+                .actions
+                .iter()
+                .flat_map(|action| match action.action {
+                    RawTriggerAction::Transmission { text, .. } => Some(text),
+                    RawTriggerAction::DisplayTextMessage { text, .. } => Some(text),
+                    RawTriggerAction::PlaySound { sound, .. } => Some(sound),
+                    RawTriggerAction::SetMissionObjectives { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardControl { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardControlAtLocation { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardResources { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardKills { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardScore { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardGoalControl { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardGoalControlAtLocation { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardGoalResources { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardGoalKills { text, .. } => Some(text),
+                    RawTriggerAction::LeaderboardGoalScore { text, .. } => Some(text),
+                    RawTriggerAction::SetNextScenario(scenario) => Some(scenario),
+                    RawTriggerAction::Comment(text) => Some(text),
+                    _ => None,
+                })
+                .chain(
+                    trigger
+                        .actions
+                        .iter()
+                        .flat_map(|action| match action.action {
+                            // TODO(tec27): Find a better way to deal with this having 2 string IDs
+                            // in it that doesn't require double-iterating
+                            RawTriggerAction::Transmission { sound, .. } => Some(sound),
+                            _ => None,
+                        }),
+                )
         }))
     }
 }
