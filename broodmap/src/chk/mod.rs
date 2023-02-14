@@ -18,6 +18,7 @@ use crate::chk::scenario_props::{
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
+use crate::chk::tileset::{read_tileset, Tileset, TilesetError};
 use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 
 pub mod briefing;
@@ -27,6 +28,7 @@ pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
 pub mod strings;
+pub mod tileset;
 pub mod triggers;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub enum ChkError {
     InvalidJumpChunk,
     #[error("Invalid strings chunk: {0}")]
     InvalidStringsChunk(StringsChunkError),
+    #[error("Invalid tileset: {0}")]
+    InvalidTileset(TilesetError),
     #[error("Missing required chunk: {0}")]
     MissingRequiredChunk(ChunkType),
 }
@@ -62,6 +66,7 @@ pub struct Chk<'a> {
     format_version: FormatVersion,
     raw_strings: RawStringsChunk<'a>,
     dimensions: MapDimensions,
+    tileset: Tileset,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
     raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
     raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
@@ -99,6 +104,11 @@ impl<'a> Chk<'a> {
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::DIM))?,
         )
         .map_err(ChkError::InvalidDimensions)?;
+        let tileset = read_tileset(
+            &read_chunk_data(data, &chunks, ChunkType::ERA)
+                .ok_or(ChkError::MissingRequiredChunk(ChunkType::ERA))?,
+        )
+        .map_err(ChkError::InvalidTileset)?;
 
         Ok(Chk {
             data,
@@ -108,6 +118,7 @@ impl<'a> Chk<'a> {
             format_version,
             raw_strings,
             dimensions,
+            tileset,
             raw_scenario_props: OnceCell::new(),
             raw_force_settings: OnceCell::new(),
             raw_triggers: OnceCell::new(),
@@ -150,6 +161,11 @@ impl<'a> Chk<'a> {
     /// Returns the height of the map in 32x32 tiles.
     pub fn height(&self) -> usize {
         self.dimensions.height.into()
+    }
+
+    /// Returns the tileset used by the map.
+    pub fn tileset(&self) -> Tileset {
+        self.tileset
     }
 
     fn raw_scenario_props(&'a self) -> &'a Result<RawScenarioProps, ScenarioPropsError> {
@@ -664,5 +680,11 @@ mod tests {
         let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
         assert_eq!(result.width(), 128);
         assert_eq!(result.height(), 128);
+    }
+
+    #[test]
+    fn lt_tileset() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        assert_eq!(result.tileset(), Tileset::Jungle);
     }
 }
