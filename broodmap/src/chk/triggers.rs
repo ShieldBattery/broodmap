@@ -1357,7 +1357,6 @@ impl UsedChkStrings for Vec<RawTrigger> {
                 .flat_map(|action| match action.action {
                     RawTriggerAction::Transmission { text, .. } => Some(text),
                     RawTriggerAction::DisplayTextMessage { text, .. } => Some(text),
-                    RawTriggerAction::PlaySound { sound, .. } => Some(sound),
                     RawTriggerAction::SetMissionObjectives { text, .. } => Some(text),
                     RawTriggerAction::LeaderboardControl { text, .. } => Some(text),
                     RawTriggerAction::LeaderboardControlAtLocation { text, .. } => Some(text),
@@ -1373,17 +1372,6 @@ impl UsedChkStrings for Vec<RawTrigger> {
                     RawTriggerAction::Comment(text) => Some(text),
                     _ => None,
                 })
-                .chain(
-                    trigger
-                        .actions
-                        .iter()
-                        .flat_map(|action| match action.action {
-                            // TODO(tec27): Find a better way to deal with this having 2 string IDs
-                            // in it that doesn't require double-iterating
-                            RawTriggerAction::Transmission { sound, .. } => Some(sound),
-                            _ => None,
-                        }),
-                )
         }))
     }
 }

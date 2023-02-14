@@ -205,23 +205,11 @@ impl UsedChkStrings for Vec<RawBriefingTrigger> {
                 .actions
                 .iter()
                 .flat_map(|action| match action.action {
-                    RawBriefingAction::PlaySound { sound, .. } => Some(sound),
                     RawBriefingAction::DisplayTextMessage { text, .. } => Some(text),
                     RawBriefingAction::MissionObjectives { text } => Some(text),
                     RawBriefingAction::Transmission { text, .. } => Some(text),
                     _ => None,
                 })
-                .chain(
-                    trigger
-                        .actions
-                        .iter()
-                        .flat_map(|action| match action.action {
-                            // TODO(tec27): Find a better way to deal with this having 2 string IDs
-                            // in it that doesn't require double-iterating
-                            RawBriefingAction::Transmission { sound, .. } => Some(sound),
-                            _ => None,
-                        }),
-                )
         }))
     }
 }

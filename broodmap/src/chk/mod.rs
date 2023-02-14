@@ -345,6 +345,7 @@ mod tests {
         NumericComparison, PlayerGroup, RawTriggerAction, TriggerCondition,
     };
     use assert_ok::assert_ok;
+    use rstest::rstest;
     use smallvec::smallvec;
 
     use super::strings::*;
@@ -686,5 +687,114 @@ mod tests {
     fn lt_tileset() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
         assert_eq!(result.tileset(), Tileset::Jungle);
+    }
+
+    const KOR_1: &[u8] = include_bytes!("../../assets/kor_encoding/1.chk");
+    const KOR_2: &[u8] = include_bytes!("../../assets/kor_encoding/2.chk");
+    // TODO(tec27): Re-enable once we parse unit stats and include them in encoding guess
+    // const KOR_3: &[u8] = include_bytes!("../../assets/kor_encoding/3.chk");
+    // Note: 4.chk is a Korean map which has been edited later to have Western text.
+    // As such, the heuristic is more fragile than usual.
+    const KOR_4: &[u8] = include_bytes!("../../assets/kor_encoding/4.chk");
+    const KOR_5: &[u8] = include_bytes!("../../assets/kor_encoding/5.chk");
+    const KOR_6: &[u8] = include_bytes!("../../assets/kor_encoding/6.chk");
+    const KOR_7: &[u8] = include_bytes!("../../assets/kor_encoding/7.chk");
+    const KOR_8: &[u8] = include_bytes!("../../assets/kor_encoding/8.chk");
+    const KOR_9: &[u8] = include_bytes!("../../assets/kor_encoding/9.chk");
+
+    const LATIN_1: &[u8] = include_bytes!("../../assets/lat_encoding/w1.chk");
+    const LATIN_2: &[u8] = include_bytes!("../../assets/lat_encoding/w2.chk");
+    const LATIN_3: &[u8] = include_bytes!("../../assets/lat_encoding/w3.chk");
+    const LATIN_4: &[u8] = include_bytes!("../../assets/lat_encoding/w4.chk");
+
+    #[rstest]
+    #[case::kor_1(KOR_1, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_2(KOR_2, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    // #[case::kor_3(KOR_3, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_4(KOR_4, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_5(KOR_5, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_6(KOR_6, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_7(KOR_7, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_8(KOR_8, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_9(KOR_9, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::latin_1(LATIN_1, StringEncoding::Legacy(LegacyCodePage::Latin))]
+    #[case::latin_2(LATIN_2, StringEncoding::Legacy(LegacyCodePage::Latin))]
+    #[case::latin_3(LATIN_3, StringEncoding::Legacy(LegacyCodePage::Latin))]
+    #[case::latin_4(LATIN_4, StringEncoding::Legacy(LegacyCodePage::Latin))]
+    fn encoding_heuristic(#[case] chk: &[u8], #[case] expected: StringEncoding) {
+        let result = assert_ok!(Chk::from_bytes(chk, None));
+        assert_eq!(result.strings().encoding, expected);
+    }
+
+    // const MIXED_1: &[u8] = include_bytes!("../../assets/mixed_encoding_1.chk");
+
+    // TODO(tec27): Re-enable once we parse unit stats and include them in encoding guess
+    /*
+    #[test]
+    fn mixed_encoding_1() {
+        let result = assert_ok!(Chk::from_bytes(MIXED_1, None));
+        assert_eq!(
+            result.strings().encoding,
+            StringEncoding::Utf8WithFallback(LegacyCodePage::Korean)
+        );
+
+        let scenario_props = assert_ok!(result.scenario_props());
+        assert_eq!(
+            scenario_props.name,
+            Some("\x06피아노\x03 마스터\x04v5.3A".into())
+        );
+        assert_eq!(
+            scenario_props.description,
+            Some(
+                concat!(
+                    "제작 : 믹넛 TTNSM / korea\r\n",
+                    "아이디어 : DeratoY (EDAC)\r\n\r\n",
+                    "Thanks for Artanis / 맛있는빙수 / Terran_Wraith\r\n",
+                    "Thanks for You"
+                )
+                .into()
+            )
+        )
+    }
+    */
+
+    const MIXED_2: &[u8] = include_bytes!("../../assets/mixed_encoding_2.chk");
+
+    #[test]
+    fn mixed_encoding_2() {
+        let result = assert_ok!(Chk::from_bytes(MIXED_2, None));
+        assert_eq!(
+            result.strings().encoding,
+            StringEncoding::Utf8WithFallback(LegacyCodePage::Latin)
+        );
+
+        let scenario_props = assert_ok!(result.scenario_props());
+        assert_eq!(
+            scenario_props.description,
+            Some("Défendre Map by Sadrio Fuck you No join me ist not me, not sex".into())
+        );
+    }
+
+    const UTF8_MAP: &[u8] = include_bytes!("../../assets/utf8_encoding_1.chk");
+
+    #[test]
+    fn utf8_encoding() {
+        let result = assert_ok!(Chk::from_bytes(UTF8_MAP, None));
+        assert_eq!(result.strings().encoding, StringEncoding::Utf8);
+
+        let scenario_props = assert_ok!(result.scenario_props());
+        assert_eq!(
+            scenario_props.description,
+            Some(
+                concat!(
+                    "Fall asleep in the mirror,\r\n",
+                    "Inside of this endless forever repeating nightmare\r\n",
+                    "Please be stuck here like this forever\r\n\r\n",
+                    "Created by - 효진(CrystalDrag)\r\n",
+                    "Version 1.31"
+                )
+                .into()
+            )
+        );
     }
 }
