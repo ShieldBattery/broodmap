@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::chk::chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
+use crate::chk::dimensions::{read_dimensions, DimensionsError, MapDimensions};
 use crate::chk::forces::{
     read_force_settings, ForceSettings, ForceSettingsError, RawForceSettings,
 };
@@ -21,6 +22,7 @@ use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 
 pub mod briefing;
 pub mod chunk_type;
+pub mod dimensions;
 pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
@@ -37,6 +39,8 @@ pub struct ChkChunk {
 
 #[derive(Error, Debug)]
 pub enum ChkError {
+    #[error("Invalid dimensions: {0}")]
+    InvalidDimensions(DimensionsError),
     #[error("Invalid format version: {0}")]
     InvalidFormatVersion(FormatVersionError),
     /// A chunk was encountered that jumped past the beginning of the file.
@@ -57,6 +61,7 @@ pub struct Chk<'a> {
 
     format_version: FormatVersion,
     raw_strings: RawStringsChunk<'a>,
+    dimensions: MapDimensions,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
     raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
     raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
@@ -89,6 +94,11 @@ impl<'a> Chk<'a> {
             read_chunk_data(data, &chunks, ChunkType::STRx),
         )
         .map_err(ChkError::InvalidStringsChunk)?;
+        let dimensions = read_dimensions(
+            &read_chunk_data(data, &chunks, ChunkType::DIM)
+                .ok_or(ChkError::MissingRequiredChunk(ChunkType::DIM))?,
+        )
+        .map_err(ChkError::InvalidDimensions)?;
 
         Ok(Chk {
             data,
@@ -97,6 +107,7 @@ impl<'a> Chk<'a> {
 
             format_version,
             raw_strings,
+            dimensions,
             raw_scenario_props: OnceCell::new(),
             raw_force_settings: OnceCell::new(),
             raw_triggers: OnceCell::new(),
@@ -129,6 +140,16 @@ impl<'a> Chk<'a> {
 
     pub fn format_version(&self) -> FormatVersion {
         self.format_version
+    }
+
+    /// Returns the width of the map in 32x32 tiles.
+    pub fn width(&self) -> usize {
+        self.dimensions.width.into()
+    }
+
+    /// Returns the height of the map in 32x32 tiles.
+    pub fn height(&self) -> usize {
+        self.dimensions.height.into()
     }
 
     fn raw_scenario_props(&'a self) -> &'a Result<RawScenarioProps, ScenarioPropsError> {
@@ -636,5 +657,12 @@ mod tests {
         );
 
         assert_eq!(first.actions[0].action, RawTriggerAction::Defeat);
+    }
+
+    #[test]
+    fn lt_dimensions() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        assert_eq!(result.width(), 128);
+        assert_eq!(result.height(), 128);
     }
 }
