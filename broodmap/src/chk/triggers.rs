@@ -6,7 +6,6 @@ use nom::multi::{count, many0};
 use nom::number::complete::{le_u16, le_u32, u8 as nom_u8};
 use nom::sequence::tuple;
 use nom::IResult;
-use std::ops::Deref;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -469,14 +468,6 @@ bitflags! {
 pub struct TriggerConditionData {
     pub condition: TriggerCondition,
     pub flags: ConditionFlags,
-}
-
-impl Deref for TriggerConditionData {
-    type Target = TriggerCondition;
-
-    fn deref(&self) -> &Self::Target {
-        &self.condition
-    }
 }
 
 pub(crate) fn trigger_condition_data(input: &[u8]) -> IResult<&[u8], Option<TriggerConditionData>> {
@@ -1202,14 +1193,6 @@ bitflags! {
 pub struct RawTriggerActionData {
     pub action: RawTriggerAction,
     pub flags: ActionFlags,
-}
-
-impl Deref for RawTriggerActionData {
-    type Target = RawTriggerAction;
-
-    fn deref(&self) -> &Self::Target {
-        &self.action
-    }
 }
 
 fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionData>> {
