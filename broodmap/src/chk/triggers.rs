@@ -1368,8 +1368,6 @@ impl UsedChkStrings for Vec<RawTrigger> {
                     RawTriggerAction::LeaderboardGoalResources { text, .. } => Some(text),
                     RawTriggerAction::LeaderboardGoalKills { text, .. } => Some(text),
                     RawTriggerAction::LeaderboardGoalScore { text, .. } => Some(text),
-                    RawTriggerAction::SetNextScenario(scenario) => Some(scenario),
-                    RawTriggerAction::Comment(text) => Some(text),
                     _ => None,
                 })
         }))

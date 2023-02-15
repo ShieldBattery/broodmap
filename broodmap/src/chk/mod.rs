@@ -20,6 +20,7 @@ use crate::chk::strings::{
 };
 use crate::chk::tileset::{read_tileset, Tileset, TilesetError};
 use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
+use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
 
 pub mod briefing;
 pub mod chunk_type;
@@ -30,6 +31,7 @@ pub mod scenario_props;
 pub mod strings;
 pub mod tileset;
 pub mod triggers;
+pub mod unit_settings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChkChunk {
@@ -71,6 +73,7 @@ pub struct Chk<'a> {
     raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
     raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
     raw_briefing: OnceCell<Result<Vec<RawBriefingTrigger>, BriefingError>>,
+    raw_unit_settings: OnceCell<Result<RawUnitSettings, UnitSettingsError>>,
 
     strings: OnceCell<StringsChunk<'a>>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
@@ -123,6 +126,7 @@ impl<'a> Chk<'a> {
             raw_force_settings: OnceCell::new(),
             raw_triggers: OnceCell::new(),
             raw_briefing: OnceCell::new(),
+            raw_unit_settings: OnceCell::new(),
 
             strings: OnceCell::new(),
             scenario_props: OnceCell::new(),
@@ -140,6 +144,7 @@ impl<'a> Chk<'a> {
                     self.raw_force_settings().used_string_ids(),
                     self.raw_triggers_private().used_string_ids(),
                     self.raw_briefing_private().used_string_ids(),
+                    self.raw_unit_settings().used_string_ids(),
                 ]
                 .into_iter()
                 .flatten()
@@ -236,6 +241,16 @@ impl<'a> Chk<'a> {
 
     pub fn raw_briefing(&'a self) -> Result<&'a Vec<RawBriefingTrigger>, &'a BriefingError> {
         self.raw_briefing_private().as_ref()
+    }
+
+    // TODO(tec27): Provide a way to retrieve non-raw unit settings
+    fn raw_unit_settings(&'a self) -> &'a Result<RawUnitSettings, UnitSettingsError> {
+        self.raw_unit_settings.get_or_init(|| {
+            RawUnitSettings::from_bytes(
+                read_chunk_data(self.data, &self.chunks, ChunkType::UNIS),
+                read_chunk_data(self.data, &self.chunks, ChunkType::UNIx),
+            )
+        })
     }
 }
 
@@ -689,10 +704,20 @@ mod tests {
         assert_eq!(result.tileset(), Tileset::Jungle);
     }
 
+    const PROTECTED_2: &[u8] = include_bytes!("../../assets/protected-2.chk");
+
+    #[test]
+    fn unit_settings_expanded() {
+        let result = assert_ok!(Chk::from_bytes(PROTECTED_2, None));
+        let unit_settings = assert_ok!(result.raw_unit_settings());
+        assert_ne!(unit_settings.use_defaults, [true; 228]);
+        assert_eq!(unit_settings.hp[0], 40 * 256);
+        assert_eq!(unit_settings.name_id[0], 0x0162u16.into())
+    }
+
     const KOR_1: &[u8] = include_bytes!("../../assets/kor_encoding/1.chk");
     const KOR_2: &[u8] = include_bytes!("../../assets/kor_encoding/2.chk");
-    // TODO(tec27): Re-enable once we parse unit stats and include them in encoding guess
-    // const KOR_3: &[u8] = include_bytes!("../../assets/kor_encoding/3.chk");
+    const KOR_3: &[u8] = include_bytes!("../../assets/kor_encoding/3.chk");
     // Note: 4.chk is a Korean map which has been edited later to have Western text.
     // As such, the heuristic is more fragile than usual.
     const KOR_4: &[u8] = include_bytes!("../../assets/kor_encoding/4.chk");
@@ -710,7 +735,7 @@ mod tests {
     #[rstest]
     #[case::kor_1(KOR_1, StringEncoding::Legacy(LegacyCodePage::Korean))]
     #[case::kor_2(KOR_2, StringEncoding::Legacy(LegacyCodePage::Korean))]
-    // #[case::kor_3(KOR_3, StringEncoding::Legacy(LegacyCodePage::Korean))]
+    #[case::kor_3(KOR_3, StringEncoding::Legacy(LegacyCodePage::Korean))]
     #[case::kor_4(KOR_4, StringEncoding::Legacy(LegacyCodePage::Korean))]
     #[case::kor_5(KOR_5, StringEncoding::Legacy(LegacyCodePage::Korean))]
     #[case::kor_6(KOR_6, StringEncoding::Legacy(LegacyCodePage::Korean))]
@@ -726,10 +751,8 @@ mod tests {
         assert_eq!(result.strings().encoding, expected);
     }
 
-    // const MIXED_1: &[u8] = include_bytes!("../../assets/mixed_encoding_1.chk");
+    const MIXED_1: &[u8] = include_bytes!("../../assets/mixed_encoding_1.chk");
 
-    // TODO(tec27): Re-enable once we parse unit stats and include them in encoding guess
-    /*
     #[test]
     fn mixed_encoding_1() {
         let result = assert_ok!(Chk::from_bytes(MIXED_1, None));
@@ -756,7 +779,6 @@ mod tests {
             )
         )
     }
-    */
 
     const MIXED_2: &[u8] = include_bytes!("../../assets/mixed_encoding_2.chk");
 
