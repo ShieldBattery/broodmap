@@ -35,7 +35,7 @@ pub mod tileset;
 pub mod triggers;
 pub mod unit_settings;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ChkChunk {
     /// The offset of the data for this chunk (*not* the chunk header).
     pub offset: usize,
@@ -62,6 +62,7 @@ pub enum ChkError {
 
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
 
+#[derive(Debug, Clone)]
 pub struct Chk<'a> {
     pub data: Vec<u8>,
     pub desired_encoding: Option<StringEncoding>,
