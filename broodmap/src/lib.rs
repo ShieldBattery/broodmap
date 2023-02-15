@@ -31,7 +31,7 @@ pub fn extract_chk_from_map(
     map_bytes: &[u8],
     locale: Option<u16>,
     str_encoding: Option<StringEncoding>,
-) -> Result<(Chk<'_>, Mpq<'_>), ChkExtractionError> {
+) -> Result<(Chk, Mpq<'_>), ChkExtractionError> {
     let locale = match locale {
         Some(0) => None,
         l => l,

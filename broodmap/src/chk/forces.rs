@@ -52,7 +52,7 @@ pub struct ForceSettings {
 }
 
 impl ChkDecode<ForceSettings> for RawForceSettings {
-    fn decode_strings(&self, strings_chunk: &StringsChunk<'_>) -> ForceSettings {
+    fn decode_strings(&self, strings_chunk: &StringsChunk) -> ForceSettings {
         ForceSettings {
             forces: self.forces.map(|f| Force {
                 name: strings_chunk.get(f.name_id).map(|s| s.into()),

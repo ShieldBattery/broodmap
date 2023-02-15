@@ -24,7 +24,7 @@ pub struct ScenarioProps {
 }
 
 impl ChkDecode<ScenarioProps> for RawScenarioProps {
-    fn decode_strings(&self, strings_chunk: &StringsChunk<'_>) -> ScenarioProps {
+    fn decode_strings(&self, strings_chunk: &StringsChunk) -> ScenarioProps {
         ScenarioProps {
             name: strings_chunk.get(self.name_id).map(|s| s.into()),
             description: strings_chunk.get(self.description_id).map(|s| s.into()),

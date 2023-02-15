@@ -21,7 +21,7 @@ impl From<u32> for StringId {
 /// allows you to specify a general way to decode the whole struct.
 pub trait ChkDecode<T> {
     /// Decodes this CHK structure into a [T] using the strings from `strings_chunk`.
-    fn decode_strings(&self, strings_chunk: &StringsChunk<'_>) -> T;
+    fn decode_strings(&self, strings_chunk: &StringsChunk) -> T;
 }
 
 /// A type that can return an iterator over all the CHK string IDs it references.
@@ -218,16 +218,16 @@ pub enum StringEncoding {
 }
 
 #[derive(Debug, Clone)]
-pub struct StringsChunk<'a> {
+pub struct StringsChunk {
     pub encoding: StringEncoding,
-    pub inner: &'a RawStringsChunk,
+    pub inner: RawStringsChunk,
 }
 
-impl<'a> StringsChunk<'a> {
+impl StringsChunk {
     pub fn with_known_encoding(
-        strings_chunk: &'a RawStringsChunk,
+        strings_chunk: RawStringsChunk,
         encoding: StringEncoding,
-    ) -> StringsChunk<'a> {
+    ) -> StringsChunk {
         StringsChunk {
             encoding,
             inner: strings_chunk,
@@ -235,9 +235,9 @@ impl<'a> StringsChunk<'a> {
     }
 
     pub fn with_auto_encoding(
-        strings_chunk: &'a RawStringsChunk,
+        strings_chunk: RawStringsChunk,
         used_string_ids: HashSet<StringId>,
-    ) -> StringsChunk<'a> {
+    ) -> StringsChunk {
         // SC 1.16.1 used either CP-949 or CP-1252 encoding for all map strings depending on whether
         // the system locale was set to Korea or not. SC:R considers each string separately,
         // defaulting to UTF-8(*), and if the string cannot be decoded with UTF-8, SC:R guesses
@@ -343,10 +343,7 @@ impl<'a> StringsChunk<'a> {
         Self::with_known_encoding(strings_chunk, encoding)
     }
 
-    fn decode_bytes(
-        bytes: &'a [u8],
-        encoding: StringEncoding,
-    ) -> Option<(Cow<'a, str>, StringEncoding)> {
+    fn decode_bytes(bytes: &[u8], encoding: StringEncoding) -> Option<(Cow<str>, StringEncoding)> {
         match encoding {
             StringEncoding::Utf8 => Some((String::from_utf8_lossy(bytes), encoding)),
             StringEncoding::Utf8WithFallback(fallback) => std::str::from_utf8(bytes)
@@ -363,7 +360,7 @@ impl<'a> StringsChunk<'a> {
         }
     }
 
-    pub fn get(&'a self, index: StringId) -> Option<Cow<'a, str>> {
+    pub fn get(&self, index: StringId) -> Option<Cow<str>> {
         self.inner
             .get_raw_bytes(index)
             .and_then(|bytes| Self::decode_bytes(bytes, self.encoding).map(|(s, _)| s))

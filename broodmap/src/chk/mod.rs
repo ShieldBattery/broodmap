@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::chk::briefing::{read_briefing, BriefingError, RawBriefingTrigger};
@@ -63,13 +64,13 @@ pub enum ChkError {
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
 
 #[derive(Debug, Clone)]
-pub struct Chk<'a> {
+pub struct Chk {
     pub data: Vec<u8>,
     pub desired_encoding: Option<StringEncoding>,
     pub chunks: ChunkMap,
 
     format_version: FormatVersion,
-    raw_strings: RawStringsChunk,
+    raw_strings: RefCell<Option<RawStringsChunk>>,
     dimensions: MapDimensions,
     tileset: Tileset,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
@@ -78,13 +79,13 @@ pub struct Chk<'a> {
     raw_briefing: OnceCell<Result<Vec<RawBriefingTrigger>, BriefingError>>,
     raw_unit_settings: OnceCell<Result<RawUnitSettings, UnitSettingsError>>,
 
-    strings: OnceCell<StringsChunk<'a>>,
+    strings: OnceCell<StringsChunk>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
     force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
     terrain_mega_tiles: OnceCell<Result<TerrainMegaTiles, TerrainMegaTilesError>>,
 }
 
-impl<'a> Chk<'a> {
+impl Chk {
     /// Creates a [Chk] from the specified bytes in memory.
     ///
     /// If `str_encoding` is [None], the string encoding will be automatically detected from the
@@ -123,7 +124,7 @@ impl<'a> Chk<'a> {
             chunks,
 
             format_version,
-            raw_strings,
+            raw_strings: RefCell::new(Some(raw_strings)),
             dimensions,
             tileset,
             raw_scenario_props: OnceCell::new(),
@@ -139,10 +140,14 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn strings(&'a self) -> &'a StringsChunk<'a> {
+    pub fn strings(&self) -> &StringsChunk {
         self.strings.get_or_init(|| {
+            let Some(raw_strings) = self.raw_strings.take() else {
+                panic!("Raw strings chunk was already consumed")
+            };
+
             if let Some(encoding) = self.desired_encoding {
-                StringsChunk::with_known_encoding(&self.raw_strings, encoding)
+                StringsChunk::with_known_encoding(raw_strings, encoding)
             } else {
                 let used_strings = [
                     self.raw_scenario_props().used_string_ids(),
@@ -154,7 +159,7 @@ impl<'a> Chk<'a> {
                 .into_iter()
                 .flatten()
                 .collect::<HashSet<_>>();
-                StringsChunk::with_auto_encoding(&self.raw_strings, used_strings)
+                StringsChunk::with_auto_encoding(raw_strings, used_strings)
             }
         })
     }
@@ -178,7 +183,7 @@ impl<'a> Chk<'a> {
         self.tileset
     }
 
-    fn raw_scenario_props(&'a self) -> &'a Result<RawScenarioProps, ScenarioPropsError> {
+    fn raw_scenario_props(&self) -> &Result<RawScenarioProps, ScenarioPropsError> {
         self.raw_scenario_props.get_or_init(|| {
             read_scenario_props(
                 &read_chunk_data(&self.data, &self.chunks, ChunkType::SPRP)
@@ -187,7 +192,7 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn scenario_props(&'a self) -> Result<&'a ScenarioProps, &'a ScenarioPropsError> {
+    pub fn scenario_props(&self) -> Result<&ScenarioProps, &ScenarioPropsError> {
         self.scenario_props
             .get_or_init(|| {
                 self.raw_scenario_props()
@@ -196,7 +201,7 @@ impl<'a> Chk<'a> {
             .as_ref()
     }
 
-    fn raw_force_settings(&'a self) -> &'a Result<RawForceSettings, ForceSettingsError> {
+    fn raw_force_settings(&self) -> &Result<RawForceSettings, ForceSettingsError> {
         self.raw_force_settings.get_or_init(|| {
             read_force_settings(
                 &read_chunk_data(&self.data, &self.chunks, ChunkType::FORC)
@@ -205,7 +210,7 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn force_settings(&'a self) -> Result<&'a ForceSettings, &'a ForceSettingsError> {
+    pub fn force_settings(&self) -> Result<&ForceSettings, &ForceSettingsError> {
         self.force_settings
             .get_or_init(|| {
                 self.raw_force_settings()
@@ -217,7 +222,7 @@ impl<'a> Chk<'a> {
     // NOTE(tec27): This is private because we don't generally want to return references to the
     // Result, just their contents. Triggers are sort of weird because we don't provide a non-raw
     // vresion of them, and thus do expose the raw version. So we need a different name here
-    fn raw_triggers_private(&'a self) -> &'a Result<Vec<RawTrigger>, TriggersError> {
+    fn raw_triggers_private(&self) -> &Result<Vec<RawTrigger>, TriggersError> {
         self.raw_triggers.get_or_init(|| {
             let chunk_data = read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG);
             match chunk_data {
@@ -227,14 +232,14 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn raw_triggers(&'a self) -> Result<&'a Vec<RawTrigger>, &'a TriggersError> {
+    pub fn raw_triggers(&self) -> Result<&Vec<RawTrigger>, &TriggersError> {
         self.raw_triggers_private().as_ref()
     }
 
     // NOTE(tec27): This is private because we don't generally want to return references to the
     // Result, just their contents. Triggers are sort of weird because we don't provide a non-raw
     // vresion of them, and thus do expose the raw version. So we need a different name here
-    fn raw_briefing_private(&'a self) -> &'a Result<Vec<RawBriefingTrigger>, BriefingError> {
+    fn raw_briefing_private(&self) -> &Result<Vec<RawBriefingTrigger>, BriefingError> {
         self.raw_briefing.get_or_init(|| {
             let chunk_data = read_chunk_data(&self.data, &self.chunks, ChunkType::MBRF);
             match chunk_data {
@@ -244,12 +249,12 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn raw_briefing(&'a self) -> Result<&'a Vec<RawBriefingTrigger>, &'a BriefingError> {
+    pub fn raw_briefing(&self) -> Result<&Vec<RawBriefingTrigger>, &BriefingError> {
         self.raw_briefing_private().as_ref()
     }
 
     // TODO(tec27): Provide a way to retrieve non-raw unit settings
-    fn raw_unit_settings(&'a self) -> &'a Result<RawUnitSettings, UnitSettingsError> {
+    fn raw_unit_settings(&self) -> &Result<RawUnitSettings, UnitSettingsError> {
         self.raw_unit_settings.get_or_init(|| {
             RawUnitSettings::from_bytes(
                 read_chunk_data(&self.data, &self.chunks, ChunkType::UNIS),
@@ -258,7 +263,7 @@ impl<'a> Chk<'a> {
         })
     }
 
-    pub fn terrain_mega_tiles(&'a self) -> Result<&'a TerrainMegaTiles, &'a TerrainMegaTilesError> {
+    pub fn terrain_mega_tiles(&self) -> Result<&TerrainMegaTiles, &TerrainMegaTilesError> {
         self.terrain_mega_tiles
             .get_or_init(|| {
                 read_terrain_mega_tiles(
@@ -671,12 +676,16 @@ mod tests {
     fn lt_strings() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
 
-        assert_eq!(result.raw_strings.data.kind, StringsChunkKind::Legacy);
-        assert_eq!(result.raw_strings.max_len, 1024);
-        assert_eq!(
-            result.raw_strings.get_raw_bytes(1u16.into()).unwrap(),
-            b"Untitled Scenario"
-        );
+        {
+            let borrowed = result.raw_strings.borrow();
+            let raw_strings = borrowed.as_ref().unwrap();
+            assert_eq!(raw_strings.data.kind, StringsChunkKind::Legacy);
+            assert_eq!(raw_strings.max_len, 1024);
+            assert_eq!(
+                raw_strings.get_raw_bytes(1u16.into()).unwrap(),
+                b"Untitled Scenario"
+            );
+        }
 
         let scenario_props = assert_ok!(result.scenario_props());
         assert_eq!(scenario_props.name, Some("The Lost Temple".into()));
