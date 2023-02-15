@@ -293,6 +293,15 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
         let locale_platform = decrypter.decrypt_u32(entries[2]);
         let block_index = decrypter.decrypt_u32(entries[3]);
 
+        let block_index = if block_index != BLOCK_INDEX_EMPTY && block_index != BLOCK_INDEX_DELETED
+        {
+            // Mask out high bits that will overflow out when doing uint32 multiplication by 0x10,
+            // which protections abuse to mess up block table length checks outside of BW
+            block_index & 0x0FFF_FFFF
+        } else {
+            block_index
+        };
+
         MpqHashTableEntry {
             hash_a,
             hash_b,
@@ -591,6 +600,10 @@ impl<'a> Mpq<'a> {
         // NOTE(tec27): BW is okay with file data being truncated by the end of the file, so we
         // reproduce that handling
         for (i, w) in sector_table.windows(2).enumerate() {
+            if bytes_left == 0 {
+                break;
+            }
+
             let (sector_offset, next_sector_offset) = (w[0], w[1]);
             let cur_sector_size = (next_sector_offset - sector_offset) as usize;
             // Convert to an absolute offset in the data
@@ -626,7 +639,11 @@ impl<'a> Mpq<'a> {
                 sector = Cow::from(explode_data(sector.as_ref())?);
             }
 
-            result.extend_from_slice(sector.as_ref());
+            // Some protectors will add extra data to the end of the file that extends past its
+            // stated length. We truncate the last sector to the correct size in that case.
+            let slice_len = sector.len().min(bytes_left);
+
+            result.extend_from_slice(&sector[..slice_len]);
 
             // BW expects that every decompression will result in sectorSize bytes of data (except,
             // possibly, for the very last sector). This is never verified, however, which means map
@@ -1076,5 +1093,16 @@ mod tests {
         let mpq = assert_ok!(Mpq::from_bytes(input));
         let chk = assert_ok!(mpq.read_file(CHK_PATH, None));
         assert_eq!(chk.as_slice(), expected);
+    }
+
+    const DESERT_STRIKE: &[u8] = include_bytes!("../assets/DSA_7.4.3a_Desert_Strike_Angel.scx");
+    const DESERT_STRIKE_CHK: &[u8] = include_bytes!("../assets/DSA_7.4.3a_Desert_Strike_Angel.chk");
+
+    #[test]
+    fn extract_chk_in_language() {
+        // This file has a CHK that's only under English
+        let mpq = assert_ok!(Mpq::from_bytes(DESERT_STRIKE));
+        let chk = assert_ok!(mpq.read_file(CHK_PATH, Some(0x409)));
+        assert_eq!(chk.as_slice(), DESERT_STRIKE_CHK);
     }
 }

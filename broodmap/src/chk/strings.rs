@@ -329,11 +329,6 @@ impl<'a> StringsChunk<'a> {
             None => true,
         };
 
-        println!(
-            "utf8: {}, korean: {}, other: {}",
-            weight_utf8, weight_korean, weight_other
-        );
-
         let encoding = if use_utf8 {
             if let Some(fallback) = fallback {
                 StringEncoding::Utf8WithFallback(fallback)
