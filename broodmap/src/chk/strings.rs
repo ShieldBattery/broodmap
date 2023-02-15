@@ -57,20 +57,20 @@ pub enum StringsChunkKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct StringsChunkData<'a> {
+pub struct StringsChunkData {
     pub kind: StringsChunkKind,
-    data: Cow<'a, [u8]>,
+    data: Vec<u8>,
 }
 
-impl<'a> StringsChunkData<'a> {
-    pub fn legacy(data: Cow<'a, [u8]>) -> Self {
+impl StringsChunkData {
+    pub fn legacy(data: Vec<u8>) -> Self {
         Self {
             kind: StringsChunkKind::Legacy,
             data,
         }
     }
 
-    pub fn extended(data: Cow<'a, [u8]>) -> Self {
+    pub fn extended(data: Vec<u8>) -> Self {
         Self {
             kind: StringsChunkKind::Extended,
             data,
@@ -96,7 +96,7 @@ impl<'a> StringsChunkData<'a> {
     ///
     /// This does not check the bounds of the data section, and will panic if `offset` exceeds the
     /// bounds.
-    pub fn read_str_bytes(&'a self, offset: usize) -> &'a [u8] {
+    pub fn read_str_bytes(&self, offset: usize) -> &[u8] {
         let data = &self.data[offset..];
         data.split(|b| *b == 0).next().unwrap_or(data)
     }
@@ -149,22 +149,24 @@ impl<'a> StringsChunkData<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RawStringsChunk<'a> {
+pub struct RawStringsChunk {
     /// The string data any reads will be done from.
-    pub data: StringsChunkData<'a>,
+    pub data: StringsChunkData,
     /// The maximum number of strings this chunk contains. This is the value its header claims it
     /// contains (but due to map protection techniques, the actual number may be less).
     pub max_len: usize,
 }
 
-impl<'a> RawStringsChunk<'a> {
+impl RawStringsChunk {
     pub fn from_bytes(
-        legacy_bytes: Option<Cow<'a, [u8]>>,
-        extended_bytes: Option<Cow<'a, [u8]>>,
-    ) -> Result<RawStringsChunk<'a>, StringsChunkError> {
+        legacy_bytes: Option<Cow<'_, [u8]>>,
+        extended_bytes: Option<Cow<'_, [u8]>>,
+    ) -> Result<RawStringsChunk, StringsChunkError> {
         let data = match (legacy_bytes, extended_bytes) {
-            (_, Some(extended_bytes)) => StringsChunkData::extended(extended_bytes),
-            (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes),
+            (_, Some(extended_bytes)) => {
+                StringsChunkData::extended(extended_bytes.to_owned().into())
+            }
+            (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes.to_owned().into()),
             (None, None) => return Err(StringsChunkError::NoStringsChunk),
         };
 
@@ -179,7 +181,7 @@ impl<'a> RawStringsChunk<'a> {
 
     /// Returns the bytes that make up the string at index `index`, or [None] if the index is out of
     /// bounds. The encoding of this string is not guaranteed, and it should be decoded before use.
-    pub fn get_raw_bytes(&'a self, index: StringId) -> Option<&'a [u8]> {
+    pub fn get_raw_bytes(&self, index: StringId) -> Option<&[u8]> {
         let index = index.0;
         if index == 0 || index >= self.max_len {
             return None;
@@ -220,12 +222,12 @@ pub enum StringEncoding {
 #[derive(Debug, Clone)]
 pub struct StringsChunk<'a> {
     pub encoding: StringEncoding,
-    pub inner: &'a RawStringsChunk<'a>,
+    pub inner: &'a RawStringsChunk,
 }
 
 impl<'a> StringsChunk<'a> {
     pub fn with_known_encoding(
-        strings_chunk: &'a RawStringsChunk<'a>,
+        strings_chunk: &'a RawStringsChunk,
         encoding: StringEncoding,
     ) -> StringsChunk<'a> {
         StringsChunk {
@@ -235,7 +237,7 @@ impl<'a> StringsChunk<'a> {
     }
 
     pub fn with_auto_encoding(
-        strings_chunk: &'a RawStringsChunk<'a>,
+        strings_chunk: &'a RawStringsChunk,
         used_string_ids: HashSet<StringId>,
     ) -> StringsChunk<'a> {
         // SC 1.16.1 used either CP-949 or CP-1252 encoding for all map strings depending on whether

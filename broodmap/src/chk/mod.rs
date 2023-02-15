@@ -63,12 +63,12 @@ pub enum ChkError {
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
 
 pub struct Chk<'a> {
-    pub data: &'a [u8],
+    pub data: Vec<u8>,
     pub desired_encoding: Option<StringEncoding>,
     pub chunks: ChunkMap,
 
     format_version: FormatVersion,
-    raw_strings: RawStringsChunk<'a>,
+    raw_strings: RawStringsChunk,
     dimensions: MapDimensions,
     tileset: Tileset,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
@@ -90,28 +90,28 @@ impl<'a> Chk<'a> {
     /// contents of the file. Note that this detection is not guaranteed to be correct (but neither
     /// is BW's own detection).
     pub fn from_bytes(
-        data: &'a [u8],
+        data: Vec<u8>,
         str_encoding: Option<StringEncoding>,
     ) -> Result<Self, ChkError> {
-        let chunks = gather_chunk_map(data)?;
+        let chunks = gather_chunk_map(&*data)?;
 
         let format_version = read_format_version(
-            &read_chunk_data(data, &chunks, ChunkType::VER)
+            &read_chunk_data(&data, &chunks, ChunkType::VER)
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::VER))?,
         )
         .map_err(ChkError::InvalidFormatVersion)?;
         let raw_strings = RawStringsChunk::from_bytes(
-            read_chunk_data(data, &chunks, ChunkType::STR),
-            read_chunk_data(data, &chunks, ChunkType::STRx),
+            read_chunk_data(&data, &chunks, ChunkType::STR),
+            read_chunk_data(&data, &chunks, ChunkType::STRx),
         )
         .map_err(ChkError::InvalidStringsChunk)?;
         let dimensions = read_dimensions(
-            &read_chunk_data(data, &chunks, ChunkType::DIM)
+            &read_chunk_data(&data, &chunks, ChunkType::DIM)
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::DIM))?,
         )
         .map_err(ChkError::InvalidDimensions)?;
         let tileset = read_tileset(
-            &read_chunk_data(data, &chunks, ChunkType::ERA)
+            &read_chunk_data(&data, &chunks, ChunkType::ERA)
                 .ok_or(ChkError::MissingRequiredChunk(ChunkType::ERA))?,
         )
         .map_err(ChkError::InvalidTileset)?;
@@ -180,7 +180,7 @@ impl<'a> Chk<'a> {
     fn raw_scenario_props(&'a self) -> &'a Result<RawScenarioProps, ScenarioPropsError> {
         self.raw_scenario_props.get_or_init(|| {
             read_scenario_props(
-                &read_chunk_data(self.data, &self.chunks, ChunkType::SPRP)
+                &read_chunk_data(&self.data, &self.chunks, ChunkType::SPRP)
                     .ok_or(ScenarioPropsError::ChunkMissing)?,
             )
         })
@@ -198,7 +198,7 @@ impl<'a> Chk<'a> {
     fn raw_force_settings(&'a self) -> &'a Result<RawForceSettings, ForceSettingsError> {
         self.raw_force_settings.get_or_init(|| {
             read_force_settings(
-                &read_chunk_data(self.data, &self.chunks, ChunkType::FORC)
+                &read_chunk_data(&self.data, &self.chunks, ChunkType::FORC)
                     .ok_or(ForceSettingsError::ChunkMissing)?,
             )
         })
@@ -218,7 +218,7 @@ impl<'a> Chk<'a> {
     // vresion of them, and thus do expose the raw version. So we need a different name here
     fn raw_triggers_private(&'a self) -> &'a Result<Vec<RawTrigger>, TriggersError> {
         self.raw_triggers.get_or_init(|| {
-            let chunk_data = read_chunk_data(self.data, &self.chunks, ChunkType::TRIG);
+            let chunk_data = read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG);
             match chunk_data {
                 Some(ref data) => read_triggers(data),
                 None => Ok(Vec::new()),
@@ -235,7 +235,7 @@ impl<'a> Chk<'a> {
     // vresion of them, and thus do expose the raw version. So we need a different name here
     fn raw_briefing_private(&'a self) -> &'a Result<Vec<RawBriefingTrigger>, BriefingError> {
         self.raw_briefing.get_or_init(|| {
-            let chunk_data = read_chunk_data(self.data, &self.chunks, ChunkType::MBRF);
+            let chunk_data = read_chunk_data(&self.data, &self.chunks, ChunkType::MBRF);
             match chunk_data {
                 Some(ref data) => read_briefing(data),
                 None => Ok(Vec::new()),
@@ -251,8 +251,8 @@ impl<'a> Chk<'a> {
     fn raw_unit_settings(&'a self) -> &'a Result<RawUnitSettings, UnitSettingsError> {
         self.raw_unit_settings.get_or_init(|| {
             RawUnitSettings::from_bytes(
-                read_chunk_data(self.data, &self.chunks, ChunkType::UNIS),
-                read_chunk_data(self.data, &self.chunks, ChunkType::UNIx),
+                read_chunk_data(&self.data, &self.chunks, ChunkType::UNIS),
+                read_chunk_data(&self.data, &self.chunks, ChunkType::UNIx),
             )
         })
     }
@@ -261,7 +261,7 @@ impl<'a> Chk<'a> {
         self.terrain_mega_tiles
             .get_or_init(|| {
                 read_terrain_mega_tiles(
-                    &read_chunk_data(self.data, &self.chunks, ChunkType::MTXM)
+                    &read_chunk_data(&self.data, &self.chunks, ChunkType::MTXM)
                         .ok_or(TerrainMegaTilesError::ChunkMissing)?,
                     self.width(),
                     self.height(),
@@ -389,7 +389,7 @@ mod tests {
     fn sections_normal() {
         use crate::chk::chunk_type::ChunkType::*;
 
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
 
         assert_eq!(result.format_version(), FormatVersion::OriginalRetail);
 
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn lt_strings() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
 
         assert_eq!(result.raw_strings.data.kind, StringsChunkKind::Legacy);
         assert_eq!(result.raw_strings.max_len, 1024);
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn lt_triggers() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
 
         let triggers = assert_ok!(result.raw_triggers());
         assert_eq!(triggers.len(), 3);
@@ -710,20 +710,20 @@ mod tests {
 
     #[test]
     fn lt_dimensions() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
         assert_eq!(result.width(), 128);
         assert_eq!(result.height(), 128);
     }
 
     #[test]
     fn lt_tileset() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
         assert_eq!(result.tileset(), Tileset::Jungle);
     }
 
     #[test]
     fn lt_terrain() {
-        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
         let terrain = assert_ok!(result.terrain_mega_tiles());
         assert_eq!(terrain.tiles.len(), 128 * 128);
         assert_eq!(terrain[0][0], 0x16A0);
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn unit_settings_expanded() {
-        let result = assert_ok!(Chk::from_bytes(PROTECTED_2, None));
+        let result = assert_ok!(Chk::from_bytes(PROTECTED_2.into(), None));
         let unit_settings = assert_ok!(result.raw_unit_settings());
         assert_ne!(unit_settings.use_defaults, [true; 228]);
         assert_eq!(unit_settings.hp[0], 40 * 256);
@@ -776,7 +776,7 @@ mod tests {
     #[case::latin_3(LATIN_3, StringEncoding::Legacy(LegacyCodePage::Latin))]
     #[case::latin_4(LATIN_4, StringEncoding::Legacy(LegacyCodePage::Latin))]
     fn encoding_heuristic(#[case] chk: &[u8], #[case] expected: StringEncoding) {
-        let result = assert_ok!(Chk::from_bytes(chk, None));
+        let result = assert_ok!(Chk::from_bytes(chk.into(), None));
         assert_eq!(result.strings().encoding, expected);
     }
 
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn mixed_encoding_1() {
-        let result = assert_ok!(Chk::from_bytes(MIXED_1, None));
+        let result = assert_ok!(Chk::from_bytes(MIXED_1.into(), None));
         assert_eq!(
             result.strings().encoding,
             StringEncoding::Utf8WithFallback(LegacyCodePage::Korean)
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn mixed_encoding_2() {
-        let result = assert_ok!(Chk::from_bytes(MIXED_2, None));
+        let result = assert_ok!(Chk::from_bytes(MIXED_2.into(), None));
         assert_eq!(
             result.strings().encoding,
             StringEncoding::Utf8WithFallback(LegacyCodePage::Latin)
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn utf8_encoding() {
-        let result = assert_ok!(Chk::from_bytes(UTF8_MAP, None));
+        let result = assert_ok!(Chk::from_bytes(UTF8_MAP.into(), None));
         assert_eq!(result.strings().encoding, StringEncoding::Utf8);
 
         let scenario_props = assert_ok!(result.scenario_props());
