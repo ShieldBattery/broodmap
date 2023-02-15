@@ -163,10 +163,8 @@ impl RawStringsChunk {
         extended_bytes: Option<Cow<'_, [u8]>>,
     ) -> Result<RawStringsChunk, StringsChunkError> {
         let data = match (legacy_bytes, extended_bytes) {
-            (_, Some(extended_bytes)) => {
-                StringsChunkData::extended(extended_bytes.to_owned().into())
-            }
-            (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes.to_owned().into()),
+            (_, Some(extended_bytes)) => StringsChunkData::extended(extended_bytes.into_owned()),
+            (Some(legacy_bytes), None) => StringsChunkData::legacy(legacy_bytes.into_owned()),
             (None, None) => return Err(StringsChunkError::NoStringsChunk),
         };
 

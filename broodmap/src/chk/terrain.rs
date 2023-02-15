@@ -69,7 +69,7 @@ pub fn read_terrain_mega_tiles(
         return Err(TerrainMegaTilesError::BadDimensions(width, height));
     }
 
-    let tile_count = (width * height) as usize;
+    let tile_count = width * height;
     let max_data_len = tile_count * 2;
     let data = if data.len() > max_data_len {
         &data[..max_data_len]

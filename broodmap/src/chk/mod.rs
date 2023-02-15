@@ -93,7 +93,7 @@ impl<'a> Chk<'a> {
         data: Vec<u8>,
         str_encoding: Option<StringEncoding>,
     ) -> Result<Self, ChkError> {
-        let chunks = gather_chunk_map(&*data)?;
+        let chunks = gather_chunk_map(&data)?;
 
         let format_version = read_format_version(
             &read_chunk_data(&data, &chunks, ChunkType::VER)
