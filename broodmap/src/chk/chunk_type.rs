@@ -136,6 +136,7 @@ impl ChunkType {
             ChunkType::SIDE => Some(12),
             ChunkType::SPRP => Some(4),
             ChunkType::DIM => Some(4),
+            ChunkType::MTXM => Some(256 * 256 * 2),
             _ => None,
         }
     }

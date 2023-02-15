@@ -18,6 +18,7 @@ use crate::chk::scenario_props::{
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
+use crate::chk::terrain::{read_terrain_mega_tiles, TerrainMegaTiles, TerrainMegaTilesError};
 use crate::chk::tileset::{read_tileset, Tileset, TilesetError};
 use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
@@ -29,6 +30,7 @@ pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
 pub mod strings;
+pub mod terrain;
 pub mod tileset;
 pub mod triggers;
 pub mod unit_settings;
@@ -78,6 +80,7 @@ pub struct Chk<'a> {
     strings: OnceCell<StringsChunk<'a>>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
     force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
+    terrain_mega_tiles: OnceCell<Result<TerrainMegaTiles, TerrainMegaTilesError>>,
 }
 
 impl<'a> Chk<'a> {
@@ -131,6 +134,7 @@ impl<'a> Chk<'a> {
             strings: OnceCell::new(),
             scenario_props: OnceCell::new(),
             force_settings: OnceCell::new(),
+            terrain_mega_tiles: OnceCell::new(),
         })
     }
 
@@ -251,6 +255,19 @@ impl<'a> Chk<'a> {
                 read_chunk_data(self.data, &self.chunks, ChunkType::UNIx),
             )
         })
+    }
+
+    pub fn terrain_mega_tiles(&'a self) -> Result<&'a TerrainMegaTiles, &'a TerrainMegaTilesError> {
+        self.terrain_mega_tiles
+            .get_or_init(|| {
+                read_terrain_mega_tiles(
+                    &read_chunk_data(self.data, &self.chunks, ChunkType::MTXM)
+                        .ok_or(TerrainMegaTilesError::ChunkMissing)?,
+                    self.width(),
+                    self.height(),
+                )
+            })
+            .as_ref()
     }
 }
 
@@ -702,6 +719,18 @@ mod tests {
     fn lt_tileset() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
         assert_eq!(result.tileset(), Tileset::Jungle);
+    }
+
+    #[test]
+    fn lt_terrain() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK, None));
+        let terrain = assert_ok!(result.terrain_mega_tiles());
+        assert_eq!(terrain.tiles.len(), 128 * 128);
+        assert_eq!(terrain[0][0], 0x16A0);
+        assert_eq!(terrain[127][127], 0x1710);
+
+        assert_eq!(terrain.get(0, 0), Some(0x16A0));
+        assert_eq!(terrain.get(128, 0), None);
     }
 
     const PROTECTED_2: &[u8] = include_bytes!("../../assets/protected-2.chk");
