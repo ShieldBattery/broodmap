@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::chk::briefing::{read_briefing, BriefingError, RawBriefingTrigger};
 use once_cell::sync::OnceCell;
@@ -70,7 +70,7 @@ pub struct Chk {
     pub chunks: ChunkMap,
 
     format_version: FormatVersion,
-    raw_strings: RefCell<Option<RawStringsChunk>>,
+    raw_strings: Arc<RawStringsChunk>,
     dimensions: MapDimensions,
     tileset: Tileset,
     raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
@@ -124,7 +124,7 @@ impl Chk {
             chunks,
 
             format_version,
-            raw_strings: RefCell::new(Some(raw_strings)),
+            raw_strings: Arc::new(raw_strings),
             dimensions,
             tileset,
             raw_scenario_props: OnceCell::new(),
@@ -142,12 +142,8 @@ impl Chk {
 
     pub fn strings(&self) -> &StringsChunk {
         self.strings.get_or_init(|| {
-            let Some(raw_strings) = self.raw_strings.take() else {
-                panic!("Raw strings chunk was already consumed")
-            };
-
             if let Some(encoding) = self.desired_encoding {
-                StringsChunk::with_known_encoding(raw_strings, encoding)
+                StringsChunk::with_known_encoding(self.raw_strings.clone(), encoding)
             } else {
                 let used_strings = [
                     self.raw_scenario_props().used_string_ids(),
@@ -159,7 +155,7 @@ impl Chk {
                 .into_iter()
                 .flatten()
                 .collect::<HashSet<_>>();
-                StringsChunk::with_auto_encoding(raw_strings, used_strings)
+                StringsChunk::with_auto_encoding(self.raw_strings.clone(), used_strings)
             }
         })
     }
@@ -388,6 +384,12 @@ mod tests {
 
     use super::strings::*;
     use super::*;
+
+    #[test]
+    fn chk_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Chk>();
+    }
 
     const LT_CHK: &[u8] = include_bytes!("../../assets/lt.chk");
 
@@ -676,16 +678,13 @@ mod tests {
     fn lt_strings() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
 
-        {
-            let borrowed = result.raw_strings.borrow();
-            let raw_strings = borrowed.as_ref().unwrap();
-            assert_eq!(raw_strings.data.kind, StringsChunkKind::Legacy);
-            assert_eq!(raw_strings.max_len, 1024);
-            assert_eq!(
-                raw_strings.get_raw_bytes(1u16.into()).unwrap(),
-                b"Untitled Scenario"
-            );
-        }
+        let raw_strings = result.raw_strings.clone();
+        assert_eq!(raw_strings.data.kind, StringsChunkKind::Legacy);
+        assert_eq!(raw_strings.max_len, 1024);
+        assert_eq!(
+            raw_strings.get_raw_bytes(1u16.into()).unwrap(),
+            b"Untitled Scenario"
+        );
 
         let scenario_props = assert_ok!(result.scenario_props());
         assert_eq!(scenario_props.name, Some("The Lost Temple".into()));

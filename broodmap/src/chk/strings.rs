@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -220,12 +221,12 @@ pub enum StringEncoding {
 #[derive(Debug, Clone)]
 pub struct StringsChunk {
     pub encoding: StringEncoding,
-    pub inner: RawStringsChunk,
+    pub inner: Arc<RawStringsChunk>,
 }
 
 impl StringsChunk {
     pub fn with_known_encoding(
-        strings_chunk: RawStringsChunk,
+        strings_chunk: Arc<RawStringsChunk>,
         encoding: StringEncoding,
     ) -> StringsChunk {
         StringsChunk {
@@ -235,7 +236,7 @@ impl StringsChunk {
     }
 
     pub fn with_auto_encoding(
-        strings_chunk: RawStringsChunk,
+        strings_chunk: Arc<RawStringsChunk>,
         used_string_ids: HashSet<StringId>,
     ) -> StringsChunk {
         // SC 1.16.1 used either CP-949 or CP-1252 encoding for all map strings depending on whether
