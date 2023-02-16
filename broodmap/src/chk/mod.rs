@@ -19,7 +19,7 @@ use crate::chk::scenario_props::{
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
-use crate::chk::terrain::{read_terrain_mega_tiles, TerrainMegaTiles, TerrainMegaTilesError};
+use crate::chk::terrain::{read_terrain, TerrainError, TerrainTileIds};
 use crate::chk::tileset::{read_tileset, Tileset, TilesetError};
 use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
@@ -82,7 +82,7 @@ pub struct Chk {
     strings: OnceCell<StringsChunk>,
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
     force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
-    terrain_mega_tiles: OnceCell<Result<TerrainMegaTiles, TerrainMegaTilesError>>,
+    terrain: OnceCell<Result<TerrainTileIds, TerrainError>>,
 }
 
 impl Chk {
@@ -136,7 +136,7 @@ impl Chk {
             strings: OnceCell::new(),
             scenario_props: OnceCell::new(),
             force_settings: OnceCell::new(),
-            terrain_mega_tiles: OnceCell::new(),
+            terrain: OnceCell::new(),
         })
     }
 
@@ -259,12 +259,12 @@ impl Chk {
         })
     }
 
-    pub fn terrain_mega_tiles(&self) -> Result<&TerrainMegaTiles, &TerrainMegaTilesError> {
-        self.terrain_mega_tiles
+    pub fn terrain(&self) -> Result<&TerrainTileIds, &TerrainError> {
+        self.terrain
             .get_or_init(|| {
-                read_terrain_mega_tiles(
+                read_terrain(
                     &read_chunk_data(&self.data, &self.chunks, ChunkType::MTXM)
-                        .ok_or(TerrainMegaTilesError::ChunkMissing)?,
+                        .ok_or(TerrainError::ChunkMissing)?,
                     self.width(),
                     self.height(),
                 )
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn lt_terrain() {
         let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
-        let terrain = assert_ok!(result.terrain_mega_tiles());
+        let terrain = assert_ok!(result.terrain());
         assert_eq!(terrain.tiles.len(), 128 * 128);
         assert_eq!(terrain[0][0], 0x16A0);
         assert_eq!(terrain[127][127], 0x1710);

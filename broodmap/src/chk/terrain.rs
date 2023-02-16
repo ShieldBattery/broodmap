@@ -1,8 +1,10 @@
 use std::ops::Index;
 use thiserror::Error;
 
-/// Describes the terrain of the map through MegaTile references. Corresponds to the MTXM chunk in a
-/// map file.
+/// Describes the terrain of the map through tile ID references. Corresponds to the MTXM chunk in a
+/// map file. Tile IDs can be converted to MegaTile IDs through a CV5 file for the tileset. The top
+/// 0x7FF bits of the tile ID are the tile group, and the bottom 0xF bits are the tile index within
+/// that group.
 ///
 /// The tiles can be indexed via either the `get` method, or using the `Index` trait if you know the
 /// coordinates are valid:
@@ -16,17 +18,18 @@ use thiserror::Error;
 ///
 /// See also: http://www.staredit.net/wiki/index.php?title=Terrain_Format
 #[derive(Debug, Clone)]
-pub struct TerrainMegaTiles {
+pub struct TerrainTileIds {
     /// The width of the map in MegaTiles.
     pub width: usize,
     /// The height of the map in MegaTiles.
     pub height: usize,
-    /// The tiles of the map, stored left-to-right, top-to-bottom. Each values is a reference to a
-    /// MegaTile. See: http://www.staredit.net/wiki/index.php?title=Terrain_Format
+    /// The tiles of the map, stored left-to-right, top-to-bottom. Each values is a tile ID, which
+    /// can be used to index a CV5 file for the tileset of the map.
+    /// See: http://www.staredit.net/wiki/index.php?title=Terrain_Format
     pub tiles: Vec<u16>,
 }
 
-impl TerrainMegaTiles {
+impl TerrainTileIds {
     // Retrieves a tile at the given coordinates, checking the bounds to ensure it's a valid
     // position. Returns [None] if the coordinates are out of bounds.
     pub fn get(&self, y: usize, x: usize) -> Option<u16> {
@@ -38,11 +41,11 @@ impl TerrainMegaTiles {
     }
 }
 
-/// A row of MegaTile references.
-type MegaTileRow = [u16];
+/// A row of Tile IDs.
+type TileIdRow = [u16];
 
-impl Index<usize> for TerrainMegaTiles {
-    type Output = MegaTileRow;
+impl Index<usize> for TerrainTileIds {
+    type Output = TileIdRow;
 
     /// Returns a row of tiles given a y coordinate. This operation is not checked against the
     /// bounds of the map, and may panic if given values that exceed it.
@@ -53,20 +56,20 @@ impl Index<usize> for TerrainMegaTiles {
 }
 
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
-pub enum TerrainMegaTilesError {
+pub enum TerrainError {
     #[error("Chunk missing")]
     ChunkMissing,
     #[error("Bad map dimensions: {0}x{1} exceeds 256x256")]
     BadDimensions(usize, usize),
 }
 
-pub fn read_terrain_mega_tiles(
+pub fn read_terrain(
     data: &[u8],
     width: usize,
     height: usize,
-) -> Result<TerrainMegaTiles, TerrainMegaTilesError> {
+) -> Result<TerrainTileIds, TerrainError> {
     if width > 256 || height > 256 {
-        return Err(TerrainMegaTilesError::BadDimensions(width, height));
+        return Err(TerrainError::BadDimensions(width, height));
     }
 
     let tile_count = width * height;
@@ -85,7 +88,7 @@ pub fn read_terrain_mega_tiles(
         tiles.resize(tile_count, 0);
     }
 
-    Ok(TerrainMegaTiles {
+    Ok(TerrainTileIds {
         width,
         height,
         tiles,
