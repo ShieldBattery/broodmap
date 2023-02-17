@@ -50,9 +50,6 @@ pub enum ChkError {
     InvalidDimensions(DimensionsError),
     #[error("Invalid format version: {0}")]
     InvalidFormatVersion(FormatVersionError),
-    /// A chunk was encountered that jumped past the beginning of the file.
-    #[error("Invalid jump chunk")]
-    InvalidJumpChunk,
     #[error("Invalid strings chunk: {0}")]
     InvalidStringsChunk(StringsChunkError),
     #[error("Invalid tileset: {0}")]
@@ -312,13 +309,15 @@ fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
         } else {
             // This is a negative value, i.e. a "jump chunk" that reuses some previous data for
             // a new chunk
-            if length.unsigned_abs() as usize > offset {
-                return Err(ChkError::InvalidJumpChunk);
-            }
 
             // Jump sections have no data, they purely modify the current read position
             by_offset.insert(offset - 8, 0);
-            offset -= length.unsigned_abs() as usize;
+
+            // Ensure that the jumped-to offset is within bounds (after the beginning of the file).
+            // SC:R seems to ignore jump chunks that exceed the bounds, so we do as well.
+            if length.unsigned_abs() as usize <= offset {
+                offset -= length.unsigned_abs() as usize;
+            }
         }
     }
 
@@ -856,5 +855,12 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    const SECRET_BOUND: &[u8] = include_bytes!("../../assets/Secret_Bound.chk");
+
+    #[test]
+    fn invalid_jump_chunk_regression() {
+        assert_ok!(Chk::from_bytes(SECRET_BOUND.into(), None));
     }
 }
