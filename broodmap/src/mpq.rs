@@ -1129,10 +1129,13 @@ mod tests {
     }
 
     const CORRUPTED_0: &[u8] = include_bytes!("../assets/corrupted-0.scx");
+    const CORRUPTED_1: &[u8] = include_bytes!("../assets/corrupted-1.scx");
 
-    #[test]
-    fn corrupted_map_doesnt_panic() {
-        let result = Mpq::from_bytes(CORRUPTED_0);
+    #[rstest]
+    #[case(CORRUPTED_0)]
+    #[case(CORRUPTED_1)]
+    fn corrupted_map_doesnt_panic(#[case] input: &[u8]) {
+        let result = Mpq::from_bytes(input);
         assert!(matches!(result, Err(MpqError::MalformedHeader)));
     }
 }
