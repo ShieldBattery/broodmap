@@ -451,6 +451,8 @@ pub enum MpqError {
     HeaderNotFound,
     #[error("file not found")]
     FileNotFound,
+    #[error("malformed header")]
+    MalformedHeader,
     #[error("file had malformed sector table")]
     MalformedSectorTable,
     #[error("unsupported compression type: {0:x}")]
@@ -490,6 +492,9 @@ impl<'a> Mpq<'a> {
 
         let mut hash_table = {
             let hash_table_offset = header.hash_table_offset();
+            if hash_table_offset >= data.len() {
+                return Err(MpqError::MalformedHeader);
+            }
             let hash_table_size = ((header.hash_table_size as usize) * MPQ_HASH_TABLE_ENTRY_SIZE)
                 .clamp(0, data.len() - hash_table_offset);
             let hash_data = &data[hash_table_offset..hash_table_offset + hash_table_size];
@@ -506,6 +511,9 @@ impl<'a> Mpq<'a> {
 
         let mut block_table = {
             let block_table_offset = header.block_table_offset();
+            if block_table_offset >= data.len() {
+                return Err(MpqError::MalformedHeader);
+            }
             let block_table_size = ((header.block_table_size as usize)
                 * MPQ_BLOCK_TABLE_ENTRY_SIZE)
                 .clamp(0, data.len() - block_table_offset);
@@ -1118,5 +1126,13 @@ mod tests {
         let mpq = assert_ok!(Mpq::from_bytes(DOUBLE_CHK_IN_HASH_TABLE));
         let chk = assert_ok!(mpq.read_file(CHK_PATH, None));
         assert_eq!(chk.as_slice(), DOUBLE_CHK_IN_HASH_TABLE_CHK);
+    }
+
+    const CORRUPTED_0: &[u8] = include_bytes!("../assets/corrupted-0.scx");
+
+    #[test]
+    fn corrupted_map_doesnt_panic() {
+        let result = Mpq::from_bytes(CORRUPTED_0);
+        assert!(matches!(result, Err(MpqError::MalformedHeader)));
     }
 }
