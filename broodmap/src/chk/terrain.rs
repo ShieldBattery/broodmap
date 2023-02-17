@@ -5,7 +5,7 @@ use thiserror::Error;
 /// ID refer to the tile group, and the bottom 0xF bits refer to the tile index within that group.
 /// This can be mapped to tile group flags and a mega-tile ID through a CV5 file.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct TileId(u16);
+pub struct TileId(pub u16);
 
 impl TileId {
     /// Returns whether or not this tile is marked as having creep on it.
@@ -22,6 +22,11 @@ impl TileId {
     /// a particular entry in a CV5 file.
     pub fn tile_index(&self) -> u16 {
         self.0 & 0xF
+    }
+
+    /// Returns the unified tile ID (with the creep flag removed).
+    pub fn id(&self) -> u16 {
+        self.0 & 0x7FFF
     }
 }
 
