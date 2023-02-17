@@ -1105,4 +1105,18 @@ mod tests {
         let chk = assert_ok!(mpq.read_file(CHK_PATH, Some(0x409)));
         assert_eq!(chk.as_slice(), DESERT_STRIKE_CHK);
     }
+
+    const DOUBLE_CHK_IN_HASH_TABLE: &[u8] = include_bytes!("../assets/Impossible_Scen._Future.scx");
+    const DOUBLE_CHK_IN_HASH_TABLE_CHK: &[u8] =
+        include_bytes!("../assets/Impossible_Scen._Future.chk");
+
+    #[test]
+    fn double_chk_in_hash_table_regression() {
+        // This file has 2 entries for the CHK file in its hash table, only one of which is in the
+        // "correct" slot. If our search logic doesn't cut off properly when encountering empty
+        // slots, it will pick the wrong one
+        let mpq = assert_ok!(Mpq::from_bytes(DOUBLE_CHK_IN_HASH_TABLE));
+        let chk = assert_ok!(mpq.read_file(CHK_PATH, None));
+        assert_eq!(chk.as_slice(), DOUBLE_CHK_IN_HASH_TABLE_CHK);
+    }
 }
