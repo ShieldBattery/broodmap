@@ -705,11 +705,17 @@ impl<'a> Mpq<'a> {
                 && cur.hash_a == hash_a
                 && cur.hash_b == hash_b
             {
-                if locale.is_some() && locale.unwrap() == cur.locale {
-                    // If we're searching for a specific locale and this matches, we can return this
-                    // directly
-                    return Some(cur);
-                } else if locale.is_none() {
+                if let Some(locale) = locale {
+                    if locale == cur.locale {
+                        // If we're searching for a specific locale and this matches, we can return
+                        // this directly
+                        return Some(cur);
+                    } else if cur.locale == 0 {
+                        // We will fall back to the neutral locale version of a file (the last one
+                        // seen) if we fail to find a file with the requested locale
+                        best = Some(cur);
+                    }
+                } else {
                     // If we're searching for a file in locale 0, the game will return the last file
                     // matching that path (regardless of its locale), so we set the current one as
                     // the best option and continue
@@ -1053,6 +1059,22 @@ mod tests {
     fn hash_table_lookup() {
         let mpq = assert_ok!(Mpq::from_bytes(LT));
         let entry = mpq.find_hash_table_entry(CHK_PATH, None);
+        assert_eq!(
+            entry,
+            Some(&MpqHashTableEntry {
+                hash_a: hash_str(CHK_PATH, MpqHashType::NameA),
+                hash_b: hash_str(CHK_PATH, MpqHashType::NameB),
+                locale: 0,
+                platform: 0,
+                block_index: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn hash_table_lookup_falls_back_to_neutral() {
+        let mpq = assert_ok!(Mpq::from_bytes(LT));
+        let entry = mpq.find_hash_table_entry(CHK_PATH, Some(0x0409));
         assert_eq!(
             entry,
             Some(&MpqHashTableEntry {

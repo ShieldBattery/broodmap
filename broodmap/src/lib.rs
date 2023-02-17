@@ -32,27 +32,11 @@ pub fn extract_chk_from_map(
     locale: Option<u16>,
     str_encoding: Option<StringEncoding>,
 ) -> Result<(Chk, Mpq<'_>), ChkExtractionError> {
-    let locale = match locale {
-        Some(0) => None,
-        l => l,
-    };
-
     let mpq = Mpq::from_bytes(map_bytes).map_err(ChkExtractionError::MpqError)?;
-    let chk_data = mpq.read_file(CHK_PATH, locale);
-    let chk_data = match chk_data {
-        Ok(chk_data) => chk_data,
-        Err(mpq::MpqError::FileNotFound) => {
-            if locale.is_none() {
-                return Err(ChkExtractionError::ChkNotFound);
-            };
-
-            mpq.read_file(CHK_PATH, None).map_err(|e| match e {
-                mpq::MpqError::FileNotFound => ChkExtractionError::ChkNotFound,
-                e => ChkExtractionError::MpqError(e),
-            })?
-        }
-        Err(e) => return Err(ChkExtractionError::MpqError(e)),
-    };
+    let chk_data = mpq.read_file(CHK_PATH, locale).map_err(|e| match e {
+        mpq::MpqError::FileNotFound => ChkExtractionError::ChkNotFound,
+        e => ChkExtractionError::MpqError(e),
+    })?;
 
     let chk = Chk::from_bytes(chk_data, str_encoding).map_err(ChkExtractionError::ChkError)?;
 
