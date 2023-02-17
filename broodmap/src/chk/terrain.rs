@@ -1,20 +1,38 @@
 use std::ops::Index;
 use thiserror::Error;
 
+/// A tile ID, which is a reference to a particular tile within a tileset. The top 0x7FF bits of the
+/// ID refer to the tile group, and the bottom 0xF bits refer to the tile index within that group.
+/// This can be mapped to tile group flags and a mega-tile ID through a CV5 file.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TileId(u16);
+
+impl TileId {
+    /// Returns whether or not this tile is marked as having creep on it.
+    pub fn has_creep(&self) -> bool {
+        self.0 & 0x8000 != 0
+    }
+
+    /// Returns the group ID of this tile, which can be used to index the entries of a CV5 file.
+    pub fn group_id(&self) -> u16 {
+        (self.0 >> 4) & 0x7FF
+    }
+
+    /// Returns the index of this tile within its group. This can be used to index the mega-tiles of
+    /// a particular entry in a CV5 file.
+    pub fn tile_index(&self) -> u16 {
+        self.0 & 0xF
+    }
+}
+
+impl From<u16> for TileId {
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
 /// Describes the terrain of the map through tile ID references. Corresponds to the MTXM chunk in a
-/// map file. Tile IDs can be converted to MegaTile IDs through a CV5 file for the tileset. The top
-/// 0x7FF bits of the tile ID are the tile group, and the bottom 0xF bits are the tile index within
-/// that group.
-///
-/// The tiles can be indexed via either the `get` method, or using the `Index` trait if you know the
-/// coordinates are valid:
-///
-/// ```rs
-/// let x = 0;
-/// let y = 5;
-/// let tile_1 = terrain.get(y, x);
-/// let tile_2 = terrain[y][x];
-/// ```
+/// map file.
 ///
 /// See also: http://www.staredit.net/wiki/index.php?title=Terrain_Format
 #[derive(Debug, Clone)]
@@ -26,13 +44,13 @@ pub struct TerrainTileIds {
     /// The tiles of the map, stored left-to-right, top-to-bottom. Each values is a tile ID, which
     /// can be used to index a CV5 file for the tileset of the map.
     /// See: http://www.staredit.net/wiki/index.php?title=Terrain_Format
-    pub tiles: Vec<u16>,
+    pub tiles: Vec<TileId>,
 }
 
 impl TerrainTileIds {
     // Retrieves a tile at the given coordinates, checking the bounds to ensure it's a valid
     // position. Returns [None] if the coordinates are out of bounds.
-    pub fn get(&self, y: usize, x: usize) -> Option<u16> {
+    pub fn get(&self, y: usize, x: usize) -> Option<TileId> {
         if x >= self.width || y >= self.height {
             return None;
         }
@@ -41,8 +59,7 @@ impl TerrainTileIds {
     }
 }
 
-/// A row of Tile IDs.
-type TileIdRow = [u16];
+type TileIdRow = [TileId];
 
 impl Index<usize> for TerrainTileIds {
     type Output = TileIdRow;
@@ -82,10 +99,10 @@ pub fn read_terrain(
 
     let mut tiles = data
         .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()).into())
         .collect::<Vec<_>>();
     if tiles.len() != tile_count {
-        tiles.resize(tile_count, 0);
+        tiles.resize(tile_count, TileId::default());
     }
 
     Ok(TerrainTileIds {

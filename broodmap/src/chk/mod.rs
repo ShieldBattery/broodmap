@@ -734,10 +734,10 @@ mod tests {
         let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
         let terrain = assert_ok!(result.terrain());
         assert_eq!(terrain.tiles.len(), 128 * 128);
-        assert_eq!(terrain[0][0], 0x16A0);
-        assert_eq!(terrain[127][127], 0x1710);
+        assert_eq!(terrain[0][0], 0x16A0.into());
+        assert_eq!(terrain[127][127], 0x1710.into());
 
-        assert_eq!(terrain.get(0, 0), Some(0x16A0));
+        assert_eq!(terrain.get(0, 0), Some(0x16A0.into()));
         assert_eq!(terrain.get(128, 0), None);
     }
 
