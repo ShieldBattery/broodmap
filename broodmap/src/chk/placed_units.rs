@@ -10,15 +10,6 @@ impl From<u32> for UnitInstanceId {
     }
 }
 
-// TODO(tec27): They're using bitflags-ish values for this but it kinda doesn't make any sense to
-// use them as flags? Check how SC:R is using them and figure out how it determines values from
-// conflicts. It also may not be using this value at all tbh
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum UnitLink {
-    Nydus,
-    Addon,
-}
-
 bitflags! {
     pub struct ValidUnitData: u16 {
         const OWNER = 0x01;
@@ -53,8 +44,6 @@ pub struct PlacedUnit {
     pub resource_amount: Option<u32>,
     pub hangar_count: Option<u16>,
     pub state: UnitState,
-
-    pub link_type: Option<UnitLink>,
     pub linked_id: Option<UnitInstanceId>,
 }
 
@@ -74,12 +63,7 @@ pub fn read_placed_units(data: &[u8]) -> Result<Vec<PlacedUnit>, PlacedUnitsErro
             let y = u16::from_le_bytes(chunk[6..8].try_into().unwrap());
             let unit_id = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
 
-            let link_type_value = u16::from_le_bytes(chunk[10..12].try_into().unwrap());
-            let link_type = match link_type_value {
-                512 => Some(UnitLink::Nydus),
-                1024 => Some(UnitLink::Addon),
-                _ => None,
-            };
+            // 10..12 is link type, unused by BW
 
             let valid_state = UnitState::from_bits_truncate(u16::from_le_bytes(
                 chunk[12..14].try_into().unwrap(),
@@ -144,7 +128,6 @@ pub fn read_placed_units(data: &[u8]) -> Result<Vec<PlacedUnit>, PlacedUnitsErro
                 resource_amount,
                 hangar_count,
                 state,
-                link_type,
                 linked_id,
             }
         })

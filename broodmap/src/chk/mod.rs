@@ -834,7 +834,6 @@ mod tests {
                 resource_amount: None,
                 hangar_count: None,
                 state: UnitState::empty(),
-                link_type: None,
                 linked_id: Some(UnitInstanceId(1)),
             }
         );
@@ -853,7 +852,6 @@ mod tests {
                 resource_amount: None,
                 hangar_count: None,
                 state: UnitState::INVINCIBLE,
-                link_type: None,
                 linked_id: None,
             }
         );
