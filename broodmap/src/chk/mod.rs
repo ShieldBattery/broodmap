@@ -13,6 +13,7 @@ use crate::chk::forces::{
     read_force_settings, ForceSettings, ForceSettingsError, RawForceSettings,
 };
 use crate::chk::format_version::{read_format_version, FormatVersion, FormatVersionError};
+use crate::chk::placed_units::{read_placed_units, PlacedUnit, PlacedUnitsError};
 use crate::chk::scenario_props::{
     read_scenario_props, RawScenarioProps, ScenarioProps, ScenarioPropsError,
 };
@@ -30,6 +31,7 @@ pub mod chunk_type;
 pub mod dimensions;
 pub mod forces;
 pub mod format_version;
+pub mod placed_units;
 pub mod scenario_props;
 pub mod sprites;
 pub mod strings;
@@ -83,6 +85,7 @@ pub struct Chk {
     force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
     terrain: OnceCell<Result<TerrainTileIds, TerrainError>>,
     sprites: OnceCell<Result<Vec<Sprite>, SpriteError>>,
+    placed_units: OnceCell<Result<Vec<PlacedUnit>, PlacedUnitsError>>,
 }
 
 impl Chk {
@@ -138,6 +141,7 @@ impl Chk {
             force_settings: OnceCell::new(),
             terrain: OnceCell::new(),
             sprites: OnceCell::new(),
+            placed_units: OnceCell::new(),
         })
     }
 
@@ -283,6 +287,17 @@ impl Chk {
             })
             .as_ref()
     }
+
+    pub fn placed_units(&self) -> Result<&Vec<PlacedUnit>, &PlacedUnitsError> {
+        self.placed_units
+            .get_or_init(|| {
+                read_placed_units(
+                    &read_chunk_data(&self.data, &self.chunks, ChunkType::UNIT)
+                        .ok_or(PlacedUnitsError::ChunkMissing)?,
+                )
+            })
+            .as_ref()
+    }
 }
 
 fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
@@ -389,6 +404,7 @@ fn read_chunk_data<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::chk::placed_units::{UnitInstanceId, UnitState};
     use crate::chk::sprites::SpriteFlags;
     use crate::chk::triggers::{
         NumericComparison, PlayerGroup, RawTriggerAction, TriggerCondition,
@@ -794,6 +810,51 @@ mod tests {
                 y: 7536,
                 owner: 8,
                 flags: SpriteFlags::DRAW_AS_SPRITE
+            }
+        );
+    }
+
+    #[test]
+    fn placed_units() {
+        let result = assert_ok!(Chk::from_bytes(SNIPER_SEED.into(), None));
+        let placed_units = assert_ok!(result.placed_units());
+        assert_eq!(placed_units.len(), 409);
+
+        assert_eq!(
+            placed_units[0],
+            PlacedUnit {
+                instance_id: UnitInstanceId(63693512),
+                x: 7616,
+                y: 7920,
+                unit_id: 214,
+                owner: Some(0),
+                hp_percent: Some(100),
+                shield_percent: None,
+                energy_percent: None,
+                resource_amount: None,
+                hangar_count: None,
+                state: UnitState::empty(),
+                link_type: None,
+                linked_id: Some(UnitInstanceId(1)),
+            }
+        );
+
+        assert_eq!(
+            placed_units[27],
+            PlacedUnit {
+                instance_id: UnitInstanceId(69203616),
+                x: 3360,
+                y: 3488,
+                unit_id: 156,
+                owner: Some(11),
+                hp_percent: Some(15),
+                shield_percent: Some(100),
+                energy_percent: None,
+                resource_amount: None,
+                hangar_count: None,
+                state: UnitState::INVINCIBLE,
+                link_type: None,
+                linked_id: None,
             }
         );
     }
