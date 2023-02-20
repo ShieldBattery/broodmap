@@ -16,6 +16,7 @@ use crate::chk::format_version::{read_format_version, FormatVersion, FormatVersi
 use crate::chk::scenario_props::{
     read_scenario_props, RawScenarioProps, ScenarioProps, ScenarioPropsError,
 };
+use crate::chk::sprites::{read_sprites, Sprite, SpriteError};
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
@@ -30,6 +31,7 @@ pub mod dimensions;
 pub mod forces;
 pub mod format_version;
 pub mod scenario_props;
+pub mod sprites;
 pub mod strings;
 pub mod terrain;
 pub mod tileset;
@@ -80,6 +82,7 @@ pub struct Chk {
     scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
     force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
     terrain: OnceCell<Result<TerrainTileIds, TerrainError>>,
+    sprites: OnceCell<Result<Vec<Sprite>, SpriteError>>,
 }
 
 impl Chk {
@@ -134,6 +137,7 @@ impl Chk {
             scenario_props: OnceCell::new(),
             force_settings: OnceCell::new(),
             terrain: OnceCell::new(),
+            sprites: OnceCell::new(),
         })
     }
 
@@ -268,6 +272,17 @@ impl Chk {
             })
             .as_ref()
     }
+
+    pub fn sprites(&self) -> Result<&Vec<Sprite>, &SpriteError> {
+        self.sprites
+            .get_or_init(|| {
+                read_sprites(
+                    &read_chunk_data(&self.data, &self.chunks, ChunkType::THG2)
+                        .ok_or(SpriteError::ChunkMissing)?,
+                )
+            })
+            .as_ref()
+    }
 }
 
 fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
@@ -374,6 +389,7 @@ fn read_chunk_data<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::chk::sprites::SpriteFlags;
     use crate::chk::triggers::{
         NumericComparison, PlayerGroup, RawTriggerAction, TriggerCondition,
     };
@@ -750,6 +766,36 @@ mod tests {
         assert_ne!(unit_settings.use_defaults, [true; 228]);
         assert_eq!(unit_settings.hp[0], 40 * 256);
         assert_eq!(unit_settings.name_id[0], 0x0162u16.into())
+    }
+
+    const SNIPER_SEED: &[u8] = include_bytes!("../../assets/Sniper_Seed_vA.chk");
+
+    #[test]
+    fn sprites() {
+        let result = assert_ok!(Chk::from_bytes(SNIPER_SEED.into(), None));
+        let sprites = assert_ok!(result.sprites());
+        assert_eq!(sprites.len(), 216);
+        assert_eq!(
+            sprites[0],
+            Sprite {
+                id: 318,
+                x: 5312,
+                y: 7760,
+                owner: 11,
+                flags: SpriteFlags::DRAW_AS_SPRITE
+            }
+        );
+
+        assert_eq!(
+            sprites[27],
+            Sprite {
+                id: 417,
+                x: 608,
+                y: 7536,
+                owner: 8,
+                flags: SpriteFlags::DRAW_AS_SPRITE
+            }
+        );
     }
 
     const KOR_1: &[u8] = include_bytes!("../../assets/kor_encoding/1.chk");
