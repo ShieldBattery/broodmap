@@ -490,6 +490,7 @@ impl TriggerCondition {
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ConditionFlags: u8 {
         /// Trigger is disabled, will not be run.
         const DISABLED = 0x02;
@@ -1243,6 +1244,7 @@ impl RawTriggerAction {
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ActionFlags: u8 {
         /// Ignore a wait/transmission once.
         const IGNORE_ONCE = 0x01;

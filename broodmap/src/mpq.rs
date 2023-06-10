@@ -319,6 +319,7 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
 const MPQ_BLOCK_TABLE_ENTRY_SIZE: usize = 16;
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct MpqBlockFlags: u32 {
         const IMPLODED = 0x0000_0100;
         const COMPRESSED = 0x0000_0200;

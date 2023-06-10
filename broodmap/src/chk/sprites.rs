@@ -2,6 +2,7 @@ use bitflags::bitflags;
 use thiserror::Error;
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SpriteFlags: u8 {
         /// If set, this is a pure sprite, otherwise this is a unit sprite.
         const DRAW_AS_SPRITE = 0x10;

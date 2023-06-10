@@ -11,6 +11,7 @@ impl From<u32> for UnitInstanceId {
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ValidUnitData: u16 {
         const OWNER = 0x01;
         const HP = 0x02;
@@ -22,6 +23,7 @@ bitflags! {
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct UnitState: u16 {
         const CLOAKED = 0x01;
         const BURROWED = 0x02;

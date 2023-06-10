@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use thiserror::Error;
 
 bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ForceFlags: u8 {
         const RANDOM_START_LOCATION = 0b0001;
         const ALLIED = 0b0010;
