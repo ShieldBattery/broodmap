@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::chk::briefing::{read_briefing, BriefingError, RawBriefingTrigger};
-use once_cell::sync::OnceCell;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -74,18 +73,18 @@ pub struct Chk {
     raw_strings: Arc<RawStringsChunk>,
     dimensions: MapDimensions,
     tileset: Tileset,
-    raw_scenario_props: OnceCell<Result<RawScenarioProps, ScenarioPropsError>>,
-    raw_force_settings: OnceCell<Result<RawForceSettings, ForceSettingsError>>,
-    raw_triggers: OnceCell<Result<Vec<RawTrigger>, TriggersError>>,
-    raw_briefing: OnceCell<Result<Vec<RawBriefingTrigger>, BriefingError>>,
-    raw_unit_settings: OnceCell<Result<RawUnitSettings, UnitSettingsError>>,
+    raw_scenario_props: OnceLock<Result<RawScenarioProps, ScenarioPropsError>>,
+    raw_force_settings: OnceLock<Result<RawForceSettings, ForceSettingsError>>,
+    raw_triggers: OnceLock<Result<Vec<RawTrigger>, TriggersError>>,
+    raw_briefing: OnceLock<Result<Vec<RawBriefingTrigger>, BriefingError>>,
+    raw_unit_settings: OnceLock<Result<RawUnitSettings, UnitSettingsError>>,
 
-    strings: OnceCell<StringsChunk>,
-    scenario_props: OnceCell<Result<ScenarioProps, ScenarioPropsError>>,
-    force_settings: OnceCell<Result<ForceSettings, ForceSettingsError>>,
-    terrain: OnceCell<Result<TerrainTileIds, TerrainError>>,
-    sprites: OnceCell<Result<Vec<Sprite>, SpriteError>>,
-    placed_units: OnceCell<Result<Vec<PlacedUnit>, PlacedUnitsError>>,
+    strings: OnceLock<StringsChunk>,
+    scenario_props: OnceLock<Result<ScenarioProps, ScenarioPropsError>>,
+    force_settings: OnceLock<Result<ForceSettings, ForceSettingsError>>,
+    terrain: OnceLock<Result<TerrainTileIds, TerrainError>>,
+    sprites: OnceLock<Result<Vec<Sprite>, SpriteError>>,
+    placed_units: OnceLock<Result<Vec<PlacedUnit>, PlacedUnitsError>>,
 }
 
 impl Chk {
@@ -130,18 +129,18 @@ impl Chk {
             raw_strings: Arc::new(raw_strings),
             dimensions,
             tileset,
-            raw_scenario_props: OnceCell::new(),
-            raw_force_settings: OnceCell::new(),
-            raw_triggers: OnceCell::new(),
-            raw_briefing: OnceCell::new(),
-            raw_unit_settings: OnceCell::new(),
+            raw_scenario_props: OnceLock::new(),
+            raw_force_settings: OnceLock::new(),
+            raw_triggers: OnceLock::new(),
+            raw_briefing: OnceLock::new(),
+            raw_unit_settings: OnceLock::new(),
 
-            strings: OnceCell::new(),
-            scenario_props: OnceCell::new(),
-            force_settings: OnceCell::new(),
-            terrain: OnceCell::new(),
-            sprites: OnceCell::new(),
-            placed_units: OnceCell::new(),
+            strings: OnceLock::new(),
+            scenario_props: OnceLock::new(),
+            force_settings: OnceLock::new(),
+            terrain: OnceLock::new(),
+            sprites: OnceLock::new(),
+            placed_units: OnceLock::new(),
         })
     }
 

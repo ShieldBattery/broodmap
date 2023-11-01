@@ -44,7 +44,6 @@ dependencies = [
  "encoding_rs",
  "explode",
  "nom",
- "once_cell",
  "rstest",
  "smallvec",
  "thiserror",
@@ -203,12 +202,6 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
-
-[[package]]
-name = "once_cell"
-version = "1.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
 
 [[package]]
 name = "pin-project-lite"
