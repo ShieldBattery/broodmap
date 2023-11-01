@@ -15,9 +15,9 @@ bitflags! {
 pub struct Sprite {
     /// The unit/sprite ID. Note that this is not guaranteed to refer to a valid unit.
     pub id: u16,
-    /// The x coordinate of the sprite.
+    /// The x coordinate of the sprite. This is a pixel value, assuming that each tile is 32x32.
     pub x: u16,
-    /// The y coordinate of the sprite.
+    /// The y coordinate of the sprite. This is a pixel value, assuming that each tile is 32x32.
     pub y: u16,
     pub owner: u8,
     pub flags: SpriteFlags,
