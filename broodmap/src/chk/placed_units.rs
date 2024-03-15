@@ -1,6 +1,8 @@
 use bitflags::bitflags;
 use thiserror::Error;
 
+const START_LOCATION_ID: u16 = 214;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UnitInstanceId(pub u32);
 
@@ -74,7 +76,12 @@ pub fn read_placed_units(data: &[u8]) -> Result<Vec<PlacedUnit>, PlacedUnitsErro
                 chunk[14..16].try_into().unwrap(),
             ));
 
-            let owner = if valid_data.contains(ValidUnitData::OWNER) {
+            // NOTE(tec27): On melee maps (and maybe others?) the start location is often marked as
+            // not having a valid owner, but start locations *must* have a valid owner, so we always
+            // utilize this field for them. The description of this value of ValidUnitData may be
+            // incorrect, further research is needed.
+            let owner = if valid_data.contains(ValidUnitData::OWNER) || unit_id == START_LOCATION_ID
+            {
                 Some(chunk[16])
             } else {
                 None

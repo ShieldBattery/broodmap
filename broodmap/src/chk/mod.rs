@@ -856,6 +856,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_locations_have_owners() {
+        let result = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
+        let placed_units = assert_ok!(result.placed_units());
+
+        let start_locations = placed_units
+            .iter()
+            .filter(|u| u.unit_id == 214)
+            .collect::<Vec<_>>();
+        assert_eq!(start_locations.len(), 4);
+        assert_eq!(start_locations[0].owner, Some(2));
+        assert_eq!(start_locations[1].owner, Some(3));
+        assert_eq!(start_locations[2].owner, Some(0));
+        assert_eq!(start_locations[3].owner, Some(1));
+    }
+
     const KOR_1: &[u8] = include_bytes!("../../assets/kor_encoding/1.chk");
     const KOR_2: &[u8] = include_bytes!("../../assets/kor_encoding/2.chk");
     const KOR_3: &[u8] = include_bytes!("../../assets/kor_encoding/3.chk");
