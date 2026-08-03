@@ -2,7 +2,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use crate::chk::briefing::{BriefingError, RawBriefingTrigger, read_briefing};
+use crate::chk::briefing::{
+    BriefingError, RawBriefingTrigger, read_briefing,
+    scan_used_string_ids as scan_used_briefing_string_ids,
+};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -22,8 +25,13 @@ use crate::chk::strings::{
 };
 use crate::chk::terrain::{TerrainError, TerrainTileIds, read_terrain};
 use crate::chk::tileset::{Tileset, TilesetError, read_tileset};
-use crate::chk::triggers::{RawTrigger, TriggersError, read_triggers};
+use crate::chk::triggers::{
+    RawTrigger, TriggersError, read_triggers, scan_used_string_ids as scan_used_trigger_string_ids,
+};
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
+use crate::limits::{
+    Resource, ResourceLimitError, ResourceLimits, allocation_error, ensure_within,
+};
 
 pub mod briefing;
 pub mod chunk_type;
@@ -49,6 +57,8 @@ pub struct ChkChunk {
 
 #[derive(Error, Debug)]
 pub enum ChkError {
+    #[error("Resource limit: {0}")]
+    ResourceLimit(#[from] ResourceLimitError),
     #[error("Invalid dimensions: {0}")]
     InvalidDimensions(DimensionsError),
     #[error("Invalid format version: {0}")]
@@ -63,11 +73,11 @@ pub enum ChkError {
 
 pub type ChunkMap = HashMap<ChunkTag, SmallVec<[ChkChunk; 1]>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Chk {
-    pub data: Vec<u8>,
-    pub desired_encoding: Option<StringEncoding>,
-    pub chunks: ChunkMap,
+    data: Vec<u8>,
+    desired_encoding: Option<StringEncoding>,
+    chunks: ChunkMap,
 
     format_version: FormatVersion,
     raw_strings: Arc<RawStringsChunk>,
@@ -97,7 +107,22 @@ impl Chk {
         data: Vec<u8>,
         str_encoding: Option<StringEncoding>,
     ) -> Result<Self, ChkError> {
-        let chunks = gather_chunk_map(&data)?;
+        Self::from_bytes_with_limits(data, str_encoding, &ResourceLimits::default())
+    }
+
+    /// Creates a [Chk] from the specified bytes in memory, applying resource limits while
+    /// gathering its chunks.
+    ///
+    /// If `str_encoding` is [None], the string encoding will be automatically detected from the
+    /// contents of the file. Note that this detection is not guaranteed to be correct (but neither
+    /// is BW's own detection).
+    pub fn from_bytes_with_limits(
+        data: Vec<u8>,
+        str_encoding: Option<StringEncoding>,
+        limits: &ResourceLimits,
+    ) -> Result<Self, ChkError> {
+        ensure_within(Resource::ChkBytes, data.len(), limits.max_chk_bytes)?;
+        let chunks = gather_chunk_map(&data, limits)?;
 
         let format_version = read_format_version(
             &read_chunk_data(&data, &chunks, ChunkType::VER)
@@ -144,21 +169,37 @@ impl Chk {
         })
     }
 
+    /// Returns the original CHK bytes.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Returns the encoding requested by the caller, or [`None`] when encoding is detected
+    /// automatically.
+    pub fn desired_encoding(&self) -> Option<StringEncoding> {
+        self.desired_encoding
+    }
+
+    /// Returns the validated chunk index gathered while constructing this CHK.
+    pub fn chunks(&self) -> &ChunkMap {
+        &self.chunks
+    }
+
     pub fn strings(&self) -> &StringsChunk {
         self.strings.get_or_init(|| {
             if let Some(encoding) = self.desired_encoding {
                 StringsChunk::with_known_encoding(self.raw_strings.clone(), encoding)
             } else {
-                let used_strings = [
-                    self.raw_scenario_props().used_string_ids(),
-                    self.raw_force_settings().used_string_ids(),
-                    self.raw_triggers_private().used_string_ids(),
-                    self.raw_briefing_private().used_string_ids(),
-                    self.raw_unit_settings().used_string_ids(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<HashSet<_>>();
+                let mut used_strings = HashSet::new();
+                used_strings.extend(self.raw_scenario_props().used_string_ids());
+                used_strings.extend(self.raw_force_settings().used_string_ids());
+                if let Some(data) = read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG) {
+                    used_strings.extend(scan_used_trigger_string_ids(&data));
+                }
+                if let Some(data) = read_chunk_data(&self.data, &self.chunks, ChunkType::MBRF) {
+                    used_strings.extend(scan_used_briefing_string_ids(&data));
+                }
+                used_strings.extend(self.raw_unit_settings().used_string_ids());
                 StringsChunk::with_auto_encoding(self.raw_strings.clone(), used_strings)
             }
         })
@@ -299,7 +340,7 @@ impl Chk {
     }
 }
 
-fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
+fn gather_chunk_map(data: &[u8], limits: &ResourceLimits) -> Result<ChunkMap, ChkError> {
     let mut sections = ChunkMap::new();
     // NOTE(tec27): Some maps use "jump" chunks to skip back and reuse parts of previous chunks
     // as new chunks. They could potentially jump back to a chunk we had already seen before, in
@@ -308,7 +349,17 @@ fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
     let mut by_offset: HashMap<usize, usize> = HashMap::new();
 
     let mut offset = 0;
+    let mut visited_chunks = 0usize;
     while data.len() - offset >= 8 {
+        visited_chunks = visited_chunks
+            .checked_add(1)
+            .ok_or(ResourceLimitError::Exceeded {
+                resource: Resource::ChkChunks,
+                observed: usize::MAX,
+                limit: limits.max_chk_chunks,
+            })?;
+        ensure_within(Resource::ChkChunks, visited_chunks, limits.max_chk_chunks)?;
+
         if let Some(&length) = by_offset.get(&offset) {
             // We've already processed this chunk (i.e. a jump chunk caused us to go back, now
             // we're hitting chunks we've already seen before). We can just skip this
@@ -328,11 +379,34 @@ fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
 
             if length >= min_size {
                 let length = length.min(max_size);
-                sections
-                    .entry(tag)
-                    .or_default()
-                    .push(ChkChunk { offset, length });
+                if !sections.contains_key(&tag) {
+                    sections
+                        .try_reserve(1)
+                        .map_err(|_| allocation_error(Resource::ChkChunks, 1))?;
+                }
+                let chunks = sections.entry(tag).or_default();
+                let chunk_count =
+                    chunks
+                        .len()
+                        .checked_add(1)
+                        .ok_or(ResourceLimitError::Exceeded {
+                            resource: Resource::ChkChunksPerTag,
+                            observed: usize::MAX,
+                            limit: limits.max_chk_chunks_per_tag,
+                        })?;
+                ensure_within(
+                    Resource::ChkChunksPerTag,
+                    chunk_count,
+                    limits.max_chk_chunks_per_tag,
+                )?;
+                chunks
+                    .try_reserve(1)
+                    .map_err(|_| allocation_error(Resource::ChkChunksPerTag, 1))?;
+                chunks.push(ChkChunk { offset, length });
             }
+            by_offset
+                .try_reserve(1)
+                .map_err(|_| allocation_error(Resource::ChkChunks, 1))?;
             by_offset.insert(offset - 8, length);
             offset += length;
         } else {
@@ -340,6 +414,9 @@ fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
             // a new chunk
 
             // Jump sections have no data, they purely modify the current read position
+            by_offset
+                .try_reserve(1)
+                .map_err(|_| allocation_error(Resource::ChkChunks, 1))?;
             by_offset.insert(offset - 8, 0);
 
             // Ensure that the jumped-to offset is within bounds (after the beginning of the file).
@@ -350,7 +427,45 @@ fn gather_chunk_map(data: &[u8]) -> Result<ChunkMap, ChkError> {
         }
     }
 
+    preflight_merged_chunk_sizes(&sections, limits)?;
+
     Ok(sections)
+}
+
+fn preflight_merged_chunk_sizes(
+    chunk_map: &ChunkMap,
+    limits: &ResourceLimits,
+) -> Result<(), ChkError> {
+    for (tag, chunks) in chunk_map {
+        let chunk_type: ChunkType = (*tag).into();
+        let merged_len = match chunk_type.multi_chunk_handling() {
+            MultiChunkHandling::FullOverwrite => chunks.last().map_or(0, |chunk| chunk.length),
+            MultiChunkHandling::PartialOverwrite => chunks
+                .iter()
+                .fold(0, |max_length, chunk| max_length.max(chunk.length)),
+            MultiChunkHandling::Append => {
+                let mut total = 0usize;
+                for chunk in chunks {
+                    total =
+                        total
+                            .checked_add(chunk.length)
+                            .ok_or(ResourceLimitError::Exceeded {
+                                resource: Resource::MergedChunkBytes,
+                                observed: usize::MAX,
+                                limit: limits.max_merged_chunk_bytes,
+                            })?;
+                }
+                total
+            }
+        };
+        ensure_within(
+            Resource::MergedChunkBytes,
+            merged_len,
+            limits.max_merged_chunk_bytes,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn read_chunk_data<'a>(
@@ -387,7 +502,11 @@ fn read_chunk_data<'a>(
                     Some(Cow::Owned(result))
                 }
                 MultiChunkHandling::Append => {
+                    let total_length = chunks
+                        .iter()
+                        .try_fold(0usize, |total, chunk| total.checked_add(chunk.length))?;
                     let mut result = Vec::new();
+                    result.try_reserve_exact(total_length).ok()?;
                     for chunk in chunks {
                         result.extend_from_slice(&data[chunk.offset..chunk.offset + chunk.length]);
                     }
@@ -419,6 +538,44 @@ mod tests {
     }
 
     const LT_CHK: &[u8] = include_bytes!("../../assets/lt.chk");
+    const SECRET_BOUND_CHK: &[u8] = include_bytes!("../../assets/Secret_Bound.chk");
+
+    #[test]
+    fn raw_string_scanners_match_typed_trigger_parsers() {
+        for chk_bytes in [LT_CHK, SECRET_BOUND_CHK] {
+            let chk = assert_ok!(Chk::from_bytes(chk_bytes.into(), None));
+
+            let trigger_data = read_chunk_data(&chk.data, &chk.chunks, ChunkType::TRIG)
+                .expect("fixture has a trigger chunk");
+            let scanned_trigger_ids =
+                scan_used_trigger_string_ids(&trigger_data).collect::<Vec<_>>();
+            let parsed_trigger_ids = assert_ok!(read_triggers(&trigger_data))
+                .used_string_ids()
+                .collect::<Vec<_>>();
+            assert_eq!(scanned_trigger_ids, parsed_trigger_ids);
+
+            let briefing_data = read_chunk_data(&chk.data, &chk.chunks, ChunkType::MBRF)
+                .expect("fixture has a briefing chunk");
+            let scanned_briefing_ids =
+                scan_used_briefing_string_ids(&briefing_data).collect::<Vec<_>>();
+            let parsed_briefing_ids = assert_ok!(read_briefing(&briefing_data))
+                .used_string_ids()
+                .collect::<Vec<_>>();
+            assert_eq!(scanned_briefing_ids, parsed_briefing_ids);
+        }
+    }
+
+    #[test]
+    fn auto_encoding_detection_does_not_initialize_trigger_caches() {
+        let chk = assert_ok!(Chk::from_bytes(SECRET_BOUND_CHK.into(), None));
+
+        assert!(!chk.raw_triggers.get().is_some());
+        assert!(!chk.raw_briefing.get().is_some());
+        assert_ok!(chk.scenario_props());
+        assert!(chk.strings.get().is_some());
+        assert!(!chk.raw_triggers.get().is_some());
+        assert!(!chk.raw_briefing.get().is_some());
+    }
 
     #[test]
     fn sections_normal() {
@@ -979,5 +1136,110 @@ mod tests {
     #[test]
     fn invalid_jump_chunk_regression() {
         assert_ok!(Chk::from_bytes(SECRET_BOUND.into(), None));
+    }
+
+    fn chunk(tag: ChunkTag, contents: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(8 + contents.len());
+        result.extend_from_slice(&tag);
+        result.extend_from_slice(&(contents.len() as i32).to_le_bytes());
+        result.extend_from_slice(contents);
+        result
+    }
+
+    #[test]
+    fn resource_limit_rejects_oversized_chk_before_scanning() {
+        let limits = ResourceLimits {
+            max_chk_bytes: 7,
+            ..ResourceLimits::trusted()
+        };
+
+        let error = Chk::from_bytes_with_limits(vec![0; 8], None, &limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ChkError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::ChkBytes,
+                observed: 8,
+                limit: 7,
+            })
+        ));
+    }
+
+    #[test]
+    fn resource_limit_counts_jump_chunk_visits() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"JUMP");
+        data.extend_from_slice(&(-8i32).to_le_bytes());
+        let limits = ResourceLimits {
+            max_chk_chunks: 1,
+            ..ResourceLimits::trusted()
+        };
+
+        let error = gather_chunk_map(&data, &limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ChkError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::ChkChunks,
+                observed: 2,
+                limit: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn resource_limit_rejects_too_many_chunks_for_one_tag() {
+        let data = [
+            chunk(*b"UNIT", &[]),
+            chunk(*b"UNIT", &[]),
+            chunk(*b"UNIT", &[]),
+        ]
+        .concat();
+        let limits = ResourceLimits {
+            max_chk_chunks_per_tag: 2,
+            ..ResourceLimits::trusted()
+        };
+
+        let error = gather_chunk_map(&data, &limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ChkError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::ChkChunksPerTag,
+                observed: 3,
+                limit: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn resource_limit_rejects_oversized_appended_chunk_data() {
+        let data = [chunk(*b"UNIT", b"abc"), chunk(*b"UNIT", b"def")].concat();
+        let limits = ResourceLimits {
+            max_merged_chunk_bytes: 5,
+            ..ResourceLimits::trusted()
+        };
+
+        let error = gather_chunk_map(&data, &limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ChkError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MergedChunkBytes,
+                observed: 6,
+                limit: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn resource_limit_accepts_appended_chunk_data_at_limit() {
+        let data = [chunk(*b"UNIT", b"abc"), chunk(*b"UNIT", b"def")].concat();
+        let limits = ResourceLimits {
+            max_merged_chunk_bytes: 6,
+            ..ResourceLimits::trusted()
+        };
+
+        let chunks = assert_ok!(gather_chunk_map(&data, &limits));
+        assert_eq!(
+            read_chunk_data(&data, &chunks, ChunkType::UNIT).as_deref(),
+            Some(&b"abcdef"[..])
+        );
     }
 }

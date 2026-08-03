@@ -39,7 +39,7 @@ impl From<u16> for TileId {
 /// Describes the terrain of the map through tile ID references. Corresponds to the MTXM chunk in a
 /// map file.
 ///
-/// See also: http://www.staredit.net/wiki/index.php?title=Terrain_Format
+/// See also: <http://www.staredit.net/wiki/index.php?title=Terrain_Format>
 #[derive(Debug, Clone)]
 pub struct TerrainTileIds {
     /// The width of the map in MegaTiles.
@@ -48,7 +48,7 @@ pub struct TerrainTileIds {
     pub height: usize,
     /// The tiles of the map, stored left-to-right, top-to-bottom. Each values is a tile ID, which
     /// can be used to index a CV5 file for the tileset of the map.
-    /// See: http://www.staredit.net/wiki/index.php?title=Terrain_Format
+    /// See: <http://www.staredit.net/wiki/index.php?title=Terrain_Format>
     pub tiles: Vec<TileId>,
 }
 

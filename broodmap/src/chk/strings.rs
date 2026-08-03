@@ -21,7 +21,7 @@ impl From<u32> for StringId {
 /// A CHK structure that contains string IDs that need to be decoded from the strings chunk. This
 /// allows you to specify a general way to decode the whole struct.
 pub trait ChkDecode<T> {
-    /// Decodes this CHK structure into a [T] using the strings from `strings_chunk`.
+    /// Decodes this CHK structure into a `T` using the strings from `strings_chunk`.
     fn decode_strings(&self, strings_chunk: &StringsChunk) -> T;
 }
 
@@ -107,28 +107,15 @@ impl StringsChunkData {
     /// section, so indexes that exceed the chunk's stated maximum length but still reside in the
     /// string data will return a value.
     pub fn get_dim(&self, index: usize) -> Option<usize> {
+        let dim_size = self.dim_size();
+        let offset = index.checked_mul(dim_size)?;
+        let bytes = self.data.get(offset..offset.checked_add(dim_size)?)?;
         match self.kind {
             StringsChunkKind::Legacy => {
-                let offset = index * 2;
-                if offset > self.data.len() - 2 {
-                    None
-                } else {
-                    Some(
-                        u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap())
-                            as usize,
-                    )
-                }
+                Some(u16::from_le_bytes(bytes.try_into().unwrap()) as usize)
             }
             StringsChunkKind::Extended => {
-                let offset = index * 4;
-                if offset > self.data.len() - 4 {
-                    None
-                } else {
-                    Some(
-                        u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap())
-                            as usize,
-                    )
-                }
+                Some(u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
             }
         }
     }
@@ -191,6 +178,40 @@ impl RawStringsChunk {
         }
 
         Some(self.data.read_str_bytes(offset))
+    }
+
+    /// Returns the raw bytes for a set of string IDs while scanning the backing string data at
+    /// most once. This matters for encoding detection: protected input can point many different
+    /// IDs into the same long unterminated byte range, which would otherwise cause quadratic
+    /// repeated terminator searches.
+    fn raw_bytes_for_ids(&self, string_ids: impl IntoIterator<Item = StringId>) -> Vec<&[u8]> {
+        let mut offsets = string_ids
+            .into_iter()
+            .filter_map(|id| {
+                let index = id.0;
+                if index == 0 || index >= self.max_len {
+                    return None;
+                }
+                let offset = self.data.get_dim_unchecked(index);
+                (offset < self.data.bytes_len()).then_some(offset)
+            })
+            .collect::<Vec<_>>();
+        offsets.sort_unstable_by(|a, b| b.cmp(a));
+
+        let data = &self.data.data;
+        let mut scan_pos = data.len();
+        let mut next_terminator = data.len();
+        let mut result = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            while scan_pos > offset {
+                scan_pos -= 1;
+                if data[scan_pos] == 0 {
+                    next_terminator = scan_pos;
+                }
+            }
+            result.push(&data[offset..next_terminator]);
+        }
+        result
     }
 }
 
@@ -259,16 +280,12 @@ impl StringsChunk {
         let mut weight_korean = 0;
         let mut weight_other = 0;
         let mut weight_utf8 = 0;
-        for id in used_string_ids {
-            let Some(bytes) = strings_chunk.get_raw_bytes(id) else {
-                continue;
-            };
-
-            let non_ascii_1252 = bytes
-                .iter()
-                .filter(|&b| *b >= 0x80)
-                .collect::<HashSet<_>>()
-                .len();
+        for bytes in strings_chunk.raw_bytes_for_ids(used_string_ids) {
+            let mut non_ascii_seen = [false; 128];
+            for &byte in bytes.iter().filter(|&&byte| byte >= 0x80) {
+                non_ascii_seen[(byte - 0x80) as usize] = true;
+            }
+            let non_ascii_1252 = non_ascii_seen.into_iter().filter(|seen| *seen).count();
 
             let is_valid_utf8 = std::str::from_utf8(bytes).is_ok();
 
@@ -368,5 +385,43 @@ impl StringsChunk {
         self.inner
             .get_raw_bytes(index)
             .and_then(|bytes| Self::decode_bytes(bytes, self.encoding).map(|(s, _)| s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_string_chunks_return_an_error_instead_of_panicking() {
+        assert!(matches!(
+            RawStringsChunk::from_bytes(Some(Cow::Borrowed(&[])), None),
+            Err(StringsChunkError::DataTooShort)
+        ));
+        assert!(matches!(
+            RawStringsChunk::from_bytes(None, Some(Cow::Borrowed(&[]))),
+            Err(StringsChunkError::DataTooShort)
+        ));
+    }
+
+    #[test]
+    fn batched_raw_string_reads_match_terminator_semantics() {
+        let mut data = vec![0; 18];
+        data[2..4].copy_from_slice(&10u16.to_le_bytes());
+        data[4..6].copy_from_slice(&11u16.to_le_bytes());
+        data[6..8].copy_from_slice(&15u16.to_le_bytes());
+        data[8..10].copy_from_slice(&99u16.to_le_bytes());
+        data[10..18].copy_from_slice(b"abc\0?xyz");
+        let strings = RawStringsChunk {
+            data: StringsChunkData::legacy(data),
+            max_len: 5,
+        };
+
+        let result =
+            strings.raw_bytes_for_ids([StringId(1), StringId(2), StringId(3), StringId(4)]);
+        assert_eq!(
+            result,
+            [b"xyz".as_slice(), b"bc".as_slice(), b"abc".as_slice()]
+        );
     }
 }

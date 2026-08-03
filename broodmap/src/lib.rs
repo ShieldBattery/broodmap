@@ -1,8 +1,10 @@
 pub mod chk;
+pub mod limits;
 pub mod mpq;
 
 pub use chk::Chk;
 pub use chk::strings::StringEncoding;
+pub use limits::{Resource, ResourceLimitError, ResourceLimits};
 pub use mpq::Mpq;
 use thiserror::Error;
 
@@ -32,13 +34,25 @@ pub fn extract_chk_from_map(
     locale: Option<u16>,
     str_encoding: Option<StringEncoding>,
 ) -> Result<(Chk, Mpq<'_>), ChkExtractionError> {
-    let mpq = Mpq::from_bytes(map_bytes).map_err(ChkExtractionError::MpqError)?;
+    extract_chk_from_map_with_limits(map_bytes, locale, str_encoding, &ResourceLimits::default())
+}
+
+/// Extracts and parses a CHK using explicit resource limits.
+pub fn extract_chk_from_map_with_limits<'a>(
+    map_bytes: &'a [u8],
+    locale: Option<u16>,
+    str_encoding: Option<StringEncoding>,
+    limits: &ResourceLimits,
+) -> Result<(Chk, Mpq<'a>), ChkExtractionError> {
+    let mpq =
+        Mpq::from_bytes_with_limits(map_bytes, limits).map_err(ChkExtractionError::MpqError)?;
     let chk_data = mpq.read_file(CHK_PATH, locale).map_err(|e| match e {
         mpq::MpqError::FileNotFound => ChkExtractionError::ChkNotFound,
         e => ChkExtractionError::MpqError(e),
     })?;
 
-    let chk = Chk::from_bytes(chk_data, str_encoding).map_err(ChkExtractionError::ChkError)?;
+    let chk = Chk::from_bytes_with_limits(chk_data, str_encoding, limits)
+        .map_err(ChkExtractionError::ChkError)?;
 
     Ok((chk, mpq))
 }

@@ -28,7 +28,7 @@ pub struct RawForce {
 pub struct RawForceSettings {
     /// The configuration for each force in the scenario.
     pub forces: [RawForce; 4],
-    /// The assignment of players to forces (indexed by player ID, value is the index in [forces]).
+    /// The assignment of players to forces (indexed by player ID, value is the index in `forces`).
     /// Players can be outside of 1 of the 4 forces, however they will not appear in the game lobby.
     pub assigned_forces: [u8; 8],
 }
@@ -47,7 +47,7 @@ pub struct Force {
 pub struct ForceSettings {
     /// The configuration for each force in the scenario.
     pub forces: [Force; 4],
-    /// The assignment of players to forces (indexed by player ID, value is the index in [forces]).
+    /// The assignment of players to forces (indexed by player ID, value is the index in `forces`).
     /// Players can be outside of 1 of the 4 forces, however they will not appear in the game lobby.
     pub assigned_forces: [u8; 8],
 }

@@ -4,7 +4,7 @@ use crate::chk::triggers::{
 };
 use nom::bytes::complete::take;
 use nom::combinator::map;
-use nom::multi::{count, many0};
+use nom::multi::many0;
 use nom::number::complete::{le_u8, le_u16, le_u32};
 use nom::{IResult, Parser};
 use std::time::Duration;
@@ -170,30 +170,41 @@ fn briefing_action_data(input: &[u8]) -> IResult<&[u8], Option<RawBriefingAction
 pub struct RawBriefingTrigger {
     pub conditions: Vec<TriggerConditionData>,
     pub actions: Vec<RawBriefingActionData>,
-    /// Which players this trigger executes for. This can be indexed by the values of [PlayerGroup].
+    /// Which players this trigger executes for. This can be indexed by the values of
+    /// [`PlayerGroup`](crate::chk::triggers::PlayerGroup).
     pub enabled_for: [bool; 27],
 }
 
 fn raw_briefing_trigger(input: &[u8]) -> IResult<&[u8], RawBriefingTrigger> {
-    let (input, conditions) = count(trigger_condition_data, 16).parse(input)?;
-    let (input, actions) = count(briefing_action_data, 64).parse(input)?;
+    let mut input = input;
+    let mut conditions = Vec::new();
+    for _ in 0..16 {
+        let (rest, condition) = trigger_condition_data(input)?;
+        input = rest;
+        if let Some(condition) = condition {
+            conditions.push(condition);
+        }
+    }
+
+    let mut actions = Vec::new();
+    for _ in 0..64 {
+        let (rest, action) = briefing_action_data(input)?;
+        input = rest;
+        if let Some(action) = action {
+            actions.push(action);
+        }
+    }
+
     let (input, _execution_flags) = le_u32(input)?;
-    let (input, enabled_for) = map(take(27usize), |enabled_for: &[u8]| {
-        enabled_for
-            .iter()
-            .map(|&b| b != 0)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap()
-    })
-    .parse(input)?;
+    let (input, enabled_for_bytes) = take(27usize).parse(input)?;
+    let enabled_for = std::array::from_fn(|index| enabled_for_bytes[index] != 0);
     let (input, _action_index) = le_u8(input)?;
 
     Ok((
         input,
         RawBriefingTrigger {
-            conditions: conditions.into_iter().flatten().collect(),
-            actions: actions.into_iter().flatten().collect(),
+            conditions,
+            actions,
             enabled_for,
         },
     ))
@@ -205,14 +216,48 @@ impl UsedChkStrings for Vec<RawBriefingTrigger> {
             trigger
                 .actions
                 .iter()
-                .flat_map(|action| match action.action {
-                    RawBriefingAction::DisplayTextMessage { text, .. } => Some(text),
-                    RawBriefingAction::MissionObjectives { text } => Some(text),
-                    RawBriefingAction::Transmission { text, .. } => Some(text),
-                    _ => None,
-                })
+                .filter_map(|action| briefing_action_string_id(action.action))
         }))
     }
+}
+
+fn briefing_action_string_id(action: RawBriefingAction) -> Option<StringId> {
+    match action {
+        RawBriefingAction::DisplayTextMessage { text, .. }
+        | RawBriefingAction::MissionObjectives { text }
+        | RawBriefingAction::Transmission { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+fn scan_action_string_id(action: &[u8]) -> Option<StringId> {
+    debug_assert_eq!(action.len(), 32);
+    let valid_string_action = match action[26] {
+        3 | 4 => true,
+        8 => NumberOperation::try_from(action[27]).is_ok(),
+        _ => false,
+    };
+
+    valid_string_action
+        .then(|| StringId::from(u32::from_le_bytes(action[4..8].try_into().unwrap())))
+}
+
+/// Finds the string IDs used by complete briefing trigger records without constructing briefing
+/// trigger objects.
+///
+/// The action-specific validity checks mirror [`briefing_action_data`], so malformed actions are
+/// excluded in the same way as [`read_briefing`].
+pub(crate) fn scan_used_string_ids(data: &[u8]) -> impl Iterator<Item = StringId> + '_ {
+    const TRIGGER_SIZE: usize = 2400;
+    const CONDITIONS_SIZE: usize = 16 * 20;
+    const ACTION_SIZE: usize = 32;
+    const ACTIONS_SIZE: usize = 64 * ACTION_SIZE;
+
+    data.chunks_exact(TRIGGER_SIZE).flat_map(|trigger| {
+        trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
+            .chunks_exact(ACTION_SIZE)
+            .filter_map(scan_action_string_id)
+    })
 }
 
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
@@ -230,4 +275,27 @@ pub fn read_briefing(data: &[u8]) -> Result<Vec<RawBriefingTrigger>, BriefingErr
         })?;
 
     Ok(triggers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_string_scanner_matches_typed_action_parser() {
+        for action_type in u8::MIN..=u8::MAX {
+            for operation in [0, 7, 8, 9, u8::MAX] {
+                let mut action = [0u8; 32];
+                action[4..8].copy_from_slice(&1234u32.to_le_bytes());
+                action[26] = action_type;
+                action[27] = operation;
+
+                let typed = briefing_action_data(&action)
+                    .unwrap()
+                    .1
+                    .and_then(|action| briefing_action_string_id(action.action));
+                assert_eq!(scan_action_string_id(&action), typed);
+            }
+        }
+    }
 }

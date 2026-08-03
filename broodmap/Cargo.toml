@@ -15,4 +15,9 @@ thiserror = "2.0"
 
 [dev-dependencies]
 assert_ok = "1.0"
+divan = "0.1.21"
 rstest = "0.26"
+
+[[bench]]
+name = "parse"
+harness = false

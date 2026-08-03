@@ -2,7 +2,7 @@ use crate::chk::strings::{StringId, UsedChkStrings};
 use bitflags::bitflags;
 use nom::bytes::complete::take;
 use nom::combinator::map;
-use nom::multi::{count, many0};
+use nom::multi::many0;
 use nom::number::complete::{le_u8, le_u16, le_u32};
 use nom::{IResult, Parser};
 use std::time::Duration;
@@ -1328,25 +1328,35 @@ pub struct RawTrigger {
 }
 
 fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
-    let (input, conditions) = count(trigger_condition_data, 16).parse(input)?;
-    let (input, actions) = count(trigger_action_data, 64).parse(input)?;
+    let mut input = input;
+    let mut conditions = Vec::new();
+    for _ in 0..16 {
+        let (rest, condition) = trigger_condition_data(input)?;
+        input = rest;
+        if let Some(condition) = condition {
+            conditions.push(condition);
+        }
+    }
+
+    let mut actions = Vec::new();
+    for _ in 0..64 {
+        let (rest, action) = trigger_action_data(input)?;
+        input = rest;
+        if let Some(action) = action {
+            actions.push(action);
+        }
+    }
+
     let (input, _execution_flags) = le_u32(input)?;
-    let (input, enabled_for) = map(take(27usize), |enabled_for: &[u8]| {
-        enabled_for
-            .iter()
-            .map(|&b| b != 0)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap()
-    })
-    .parse(input)?;
+    let (input, enabled_for_bytes) = take(27usize).parse(input)?;
+    let enabled_for = std::array::from_fn(|index| enabled_for_bytes[index] != 0);
     let (input, _action_index) = le_u8(input)?;
 
     Ok((
         input,
         RawTrigger {
-            conditions: conditions.into_iter().flatten().collect(),
-            actions: actions.into_iter().flatten().collect(),
+            conditions,
+            actions,
             enabled_for,
         },
     ))
@@ -1358,24 +1368,62 @@ impl UsedChkStrings for Vec<RawTrigger> {
             trigger
                 .actions
                 .iter()
-                .flat_map(|action| match action.action {
-                    RawTriggerAction::Transmission { text, .. } => Some(text),
-                    RawTriggerAction::DisplayTextMessage { text, .. } => Some(text),
-                    RawTriggerAction::SetMissionObjectives { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardControl { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardControlAtLocation { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardResources { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardKills { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardScore { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardGoalControl { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardGoalControlAtLocation { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardGoalResources { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardGoalKills { text, .. } => Some(text),
-                    RawTriggerAction::LeaderboardGoalScore { text, .. } => Some(text),
-                    _ => None,
-                })
+                .filter_map(|action| trigger_action_string_id(action.action))
         }))
     }
+}
+
+fn trigger_action_string_id(action: RawTriggerAction) -> Option<StringId> {
+    match action {
+        RawTriggerAction::Transmission { text, .. }
+        | RawTriggerAction::DisplayTextMessage { text, .. }
+        | RawTriggerAction::SetMissionObjectives { text, .. }
+        | RawTriggerAction::LeaderboardControl { text, .. }
+        | RawTriggerAction::LeaderboardControlAtLocation { text, .. }
+        | RawTriggerAction::LeaderboardResources { text, .. }
+        | RawTriggerAction::LeaderboardKills { text, .. }
+        | RawTriggerAction::LeaderboardScore { text, .. }
+        | RawTriggerAction::LeaderboardGoalControl { text, .. }
+        | RawTriggerAction::LeaderboardGoalControlAtLocation { text, .. }
+        | RawTriggerAction::LeaderboardGoalResources { text, .. }
+        | RawTriggerAction::LeaderboardGoalKills { text, .. }
+        | RawTriggerAction::LeaderboardGoalScore { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+fn scan_action_string_id(action: &[u8]) -> Option<StringId> {
+    debug_assert_eq!(action.len(), 32);
+    let action_type = action[26];
+    let operation = action[27];
+    let unit_or_type = u16::from_le_bytes(action[24..26].try_into().unwrap());
+    let valid_string_action = match action_type {
+        7 => NumberOperation::try_from(operation).is_ok(),
+        9 | 12 | 17 | 18 | 20 | 33 | 34 | 36 => true,
+        19 | 35 => ResourceKind::try_from(unit_or_type).is_ok(),
+        21 | 37 => ScoreKind::try_from(unit_or_type).is_ok(),
+        _ => false,
+    };
+
+    valid_string_action
+        .then(|| StringId::from(u32::from_le_bytes(action[4..8].try_into().unwrap())))
+}
+
+/// Finds the string IDs used by complete trigger records without constructing trigger objects.
+///
+/// The action-specific validity checks mirror [`trigger_action_data`], so malformed actions are
+/// excluded in the same way as [`read_triggers`].
+pub(crate) fn scan_used_string_ids(data: &[u8]) -> impl Iterator<Item = StringId> + '_ {
+    const TRIGGER_SIZE: usize = 2400;
+    const CONDITIONS_SIZE: usize = 16 * 20;
+    const ACTION_SIZE: usize = 32;
+    const ACTIONS_SIZE: usize = 64 * ACTION_SIZE;
+
+    data.chunks_exact(TRIGGER_SIZE).flat_map(|trigger| {
+        trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
+            .chunks_exact(ACTION_SIZE)
+            .filter_map(scan_action_string_id)
+    })
 }
 
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
@@ -1391,4 +1439,30 @@ pub fn read_triggers(data: &[u8]) -> Result<Vec<RawTrigger>, TriggersError> {
     })?;
 
     Ok(triggers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_string_scanner_matches_typed_action_parser() {
+        for action_type in u8::MIN..=u8::MAX {
+            for operation in [0, 7, 8, 9, u8::MAX] {
+                for unit_or_type in [0, 1, 2, 3, 7, 8, u16::MAX] {
+                    let mut action = [0u8; 32];
+                    action[4..8].copy_from_slice(&1234u32.to_le_bytes());
+                    action[24..26].copy_from_slice(&unit_or_type.to_le_bytes());
+                    action[26] = action_type;
+                    action[27] = operation;
+
+                    let typed = trigger_action_data(&action)
+                        .unwrap()
+                        .1
+                        .and_then(|action| trigger_action_string_id(action.action));
+                    assert_eq!(scan_action_string_id(&action), typed);
+                }
+            }
+        }
+    }
 }

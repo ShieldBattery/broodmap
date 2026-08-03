@@ -3,11 +3,14 @@
 //! the game's behavior as closely as possible (including bugs, which are often exploited by
 //! so-called "map protectors" to prevent 3rd party editors from opening map files).
 
+use crate::limits::{
+    Resource, ResourceLimitError, ResourceLimits, allocation_error, ensure_within,
+};
 use bitflags::bitflags;
 use nom::combinator::{map, verify};
-use nom::multi::{count, many_till, many0};
 use nom::{IResult, Parser};
 use std::borrow::Cow;
+use std::io::Read;
 
 use thiserror::Error;
 
@@ -68,13 +71,28 @@ fn mpq_header_size(input: &[u8]) -> IResult<&[u8], u32> {
 }
 
 fn mpq_header_offset(input: &[u8]) -> IResult<&[u8], u32> {
-    use nom::bytes::streaming::{tag, take};
+    let mut offset = 0usize;
+    loop {
+        if input.len().saturating_sub(offset) < 8 {
+            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+        }
 
-    map(
-        many_till(take(512usize), (tag(&b"MPQ\x1A"[..]), mpq_header_size)),
-        |(takes, (_magic, _header_size))| (takes.len() * 512) as u32,
-    )
-    .parse(input)
+        let candidate = &input[offset..];
+        if candidate.starts_with(b"MPQ\x1A") && mpq_header_size(&candidate[4..]).is_ok() {
+            let offset = u32::try_from(offset).map_err(|_| {
+                nom::Err::Failure(nom::error::Error::new(
+                    candidate,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            return Ok((&candidate[8..], offset));
+        }
+
+        if input.len().saturating_sub(offset) < 512 {
+            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+        }
+        offset += 512;
+    }
 }
 
 fn mpq_table_pos(min_pos: i32) -> impl Fn(&[u8]) -> IResult<&[u8], i32> {
@@ -283,16 +301,21 @@ pub struct MpqHashTableEntry {
 ///
 /// Note that BW's parser allows the hash table to be shorter than expected at the end of the file
 /// (so this does as well).
-fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
-    use nom::number::complete::le_u32;
-
+fn mpq_hash_table(input: &[u8], max_entries: usize) -> Result<Vec<MpqHashTableEntry>, MpqError> {
+    let entry_count = input.len() / MPQ_HASH_TABLE_ENTRY_SIZE;
+    ensure_within(Resource::MpqHashTableEntries, entry_count, max_entries)?;
     let mut decrypter = Decrypter::from_str("(hash table)");
-    let r = many0(map(count(le_u32, 4), |entries: Vec<u32>| {
-        assert_eq!(entries.len(), 4);
-        let hash_a = decrypter.decrypt_u32(entries[0]);
-        let hash_b = decrypter.decrypt_u32(entries[1]);
-        let locale_platform = decrypter.decrypt_u32(entries[2]);
-        let block_index = decrypter.decrypt_u32(entries[3]);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(entry_count)
+        .map_err(|_| allocation_error(Resource::MpqHashTableEntries, entry_count))?;
+    for entry in input.chunks_exact(MPQ_HASH_TABLE_ENTRY_SIZE) {
+        let hash_a = decrypter.decrypt_u32(u32::from_le_bytes(entry[0..4].try_into().unwrap()));
+        let hash_b = decrypter.decrypt_u32(u32::from_le_bytes(entry[4..8].try_into().unwrap()));
+        let locale_platform =
+            decrypter.decrypt_u32(u32::from_le_bytes(entry[8..12].try_into().unwrap()));
+        let block_index =
+            decrypter.decrypt_u32(u32::from_le_bytes(entry[12..16].try_into().unwrap()));
 
         let block_index = if block_index != BLOCK_INDEX_EMPTY && block_index != BLOCK_INDEX_DELETED
         {
@@ -303,18 +326,16 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
             block_index
         };
 
-        MpqHashTableEntry {
+        result.push(MpqHashTableEntry {
             hash_a,
             hash_b,
             locale: (locale_platform & 0x0000_FFFF) as u16,
             platform: (locale_platform >> 16) as u16,
             block_index,
-        }
-    }))
-    .parse(input);
+        });
+    }
 
-    #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
-    r
+    Ok(result)
 }
 
 /// The size of each MPQ hash table entry in the file, in bytes.
@@ -353,7 +374,7 @@ impl MpqBlockTableEntry {
         if self.offset < -(mpq_header.offset as i32) {
             None
         } else if self.offset >= 0 {
-            Some((self.offset as usize) + (mpq_header.offset as usize))
+            (self.offset as usize).checked_add(mpq_header.offset as usize)
         } else {
             Some((mpq_header.offset - self.offset.unsigned_abs()) as usize)
         }
@@ -385,24 +406,28 @@ impl MpqBlockTableEntry {
 ///
 /// Note that BW's parser allows the block table to be shorter than expected at the end of the file
 /// (so this does as well).
-fn mpq_block_table(input: &[u8]) -> IResult<&[u8], Vec<MpqBlockTableEntry>> {
-    use nom::number::complete::le_u32;
-
+fn mpq_block_table(input: &[u8], max_entries: usize) -> Result<Vec<MpqBlockTableEntry>, MpqError> {
+    let entry_count = input.len() / MPQ_BLOCK_TABLE_ENTRY_SIZE;
+    ensure_within(Resource::MpqBlockTableEntries, entry_count, max_entries)?;
     let mut decrypter = Decrypter::from_str("(block table)");
-    let r = many0(map(count(le_u32, 4), |entries: Vec<u32>| {
-        assert_eq!(entries.len(), 4);
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(entry_count)
+        .map_err(|_| allocation_error(Resource::MpqBlockTableEntries, entry_count))?;
+    for entry in input.chunks_exact(MPQ_BLOCK_TABLE_ENTRY_SIZE) {
+        result.push(MpqBlockTableEntry {
+            offset: decrypter.decrypt_u32(u32::from_le_bytes(entry[0..4].try_into().unwrap()))
+                as i32,
+            compressed_size: decrypter
+                .decrypt_u32(u32::from_le_bytes(entry[4..8].try_into().unwrap())),
+            size: decrypter.decrypt_u32(u32::from_le_bytes(entry[8..12].try_into().unwrap())),
+            flags: MpqBlockFlags::from_bits_truncate(
+                decrypter.decrypt_u32(u32::from_le_bytes(entry[12..16].try_into().unwrap())),
+            ),
+        });
+    }
 
-        MpqBlockTableEntry {
-            offset: decrypter.decrypt_u32(entries[0]) as i32,
-            compressed_size: decrypter.decrypt_u32(entries[1]),
-            size: decrypter.decrypt_u32(entries[2]),
-            flags: MpqBlockFlags::from_bits_truncate(decrypter.decrypt_u32(entries[3])),
-        }
-    }))
-    .parse(input);
-
-    #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
-    r
+    Ok(result)
 }
 
 /// Parse the contents of an MPQ sector table for a particular file, decrypting it if needed.
@@ -410,24 +435,26 @@ fn mpq_sector_table(
     input: &[u8],
     num_sectors: usize,
     encryption_key: Option<u32>,
-) -> IResult<&[u8], Vec<i32>> {
-    use nom::number::complete::le_u32;
-
+) -> Result<Vec<i32>, MpqError> {
+    let byte_len = num_sectors
+        .checked_mul(4)
+        .ok_or(MpqError::MalformedSectorTable)?;
+    if input.len() < byte_len {
+        return Err(MpqError::MalformedSectorTable);
+    }
     let mut decrypter = encryption_key.map(Decrypter::from_key_value);
-    let r = map(count(le_u32, num_sectors), |entries: Vec<u32>| {
-        if let Some(ref mut d) = decrypter {
-            entries
-                .iter()
-                .map(|val| d.decrypt_u32(*val) as i32)
-                .collect()
-        } else {
-            entries.iter().map(|val| *val as i32).collect()
-        }
-    })
-    .parse(input);
-
-    #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
-    r
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(num_sectors)
+        .map_err(|_| allocation_error(Resource::MpqFileSectors, num_sectors))?;
+    for bytes in input[..byte_len].chunks_exact(4) {
+        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+        result.push(match decrypter {
+            Some(ref mut decrypter) => decrypter.decrypt_u32(value) as i32,
+            None => value as i32,
+        });
+    }
+    Ok(result)
 }
 
 // TODO(tec27): Support more compression algorithms, this is not a complete list of what BW supports
@@ -435,19 +462,91 @@ const COMPRESSION_IMPLODE: u8 = 0x08;
 
 /// Decompresses a file sector using the algorithm it specifies. Sectors specify an algorithm with
 /// the first byte of their data.
-fn decompress_sector(data: &[u8]) -> Result<Vec<u8>, MpqError> {
+fn decompress_sector_into(
+    data: &[u8],
+    max_output: usize,
+    max_append: usize,
+    output: &mut Vec<u8>,
+) -> Result<usize, MpqError> {
     if data.len() <= 1 {
-        panic!("tried to decompress empty sector");
+        return Err(MpqError::MalformedSectorTable);
     }
 
     match data[0] {
-        COMPRESSION_IMPLODE => explode_data(&data[1..]),
+        COMPRESSION_IMPLODE => explode_into(&data[1..], max_output, max_append, output),
         a => Err(MpqError::UnsupportedCompressionType(a)),
     }
 }
 
-fn explode_data(data: &[u8]) -> Result<Vec<u8>, MpqError> {
-    explode::explode(data).map_err(MpqError::ExplodeError)
+fn explode_into(
+    data: &[u8],
+    max_output: usize,
+    max_append: usize,
+    output: &mut Vec<u8>,
+) -> Result<usize, MpqError> {
+    let mut reader = explode::ExplodeReader::new(data);
+    let mut buffer = [0u8; 4096];
+    let mut decompressed_len = 0usize;
+    let mut appended_len = 0usize;
+
+    loop {
+        let read = reader.read(&mut buffer).map_err(map_explode_reader_error)?;
+        if read == 0 {
+            return Ok(decompressed_len);
+        }
+
+        decompressed_len =
+            decompressed_len
+                .checked_add(read)
+                .ok_or(ResourceLimitError::Exceeded {
+                    resource: Resource::MpqSectorOutput,
+                    observed: usize::MAX,
+                    limit: max_output,
+                })?;
+        ensure_within(Resource::MpqSectorOutput, decompressed_len, max_output)?;
+
+        let append_len = read.min(max_append.saturating_sub(appended_len));
+        output
+            .try_reserve(append_len)
+            .map_err(|_| allocation_error(Resource::MpqFileBytes, append_len))?;
+        output.extend_from_slice(&buffer[..append_len]);
+        appended_len += append_len;
+    }
+}
+
+#[cfg(test)]
+fn explode_data(data: &[u8], max_output: usize) -> Result<Vec<u8>, MpqError> {
+    let mut result = Vec::new();
+    explode_into(data, max_output, max_output, &mut result)?;
+    Ok(result)
+}
+
+#[cfg(test)]
+fn decompress_sector(data: &[u8], max_output: usize) -> Result<Vec<u8>, MpqError> {
+    let mut result = Vec::new();
+    decompress_sector_into(data, max_output, max_output, &mut result)?;
+    Ok(result)
+}
+
+fn map_explode_reader_error(error: std::io::Error) -> MpqError {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<explode::Error>())
+    {
+        let kind = error.kind();
+        match error
+            .into_inner()
+            .and_then(|inner| inner.downcast::<explode::Error>().ok())
+        {
+            Some(error) => MpqError::ExplodeError(*error),
+            None => MpqError::ExplodeIoError(std::io::Error::new(
+                kind,
+                "explode reader error changed type",
+            )),
+        }
+    } else {
+        MpqError::ExplodeIoError(error)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -456,6 +555,8 @@ pub enum MpqError {
     HeaderNotFound,
     #[error("file not found")]
     FileNotFound,
+    #[error("MPQ paths cannot contain characters outside the single-byte range")]
+    InvalidPath,
     #[error("malformed header")]
     MalformedHeader,
     #[error("file had malformed sector table")]
@@ -464,6 +565,10 @@ pub enum MpqError {
     UnsupportedCompressionType(u8),
     #[error("problem decompressing with explode: {0}")]
     ExplodeError(explode::Error),
+    #[error("I/O error while decompressing with explode: {0}")]
+    ExplodeIoError(std::io::Error),
+    #[error(transparent)]
+    ResourceLimit(#[from] ResourceLimitError),
     #[error("parser error")]
     ParserError(nom::error::ErrorKind),
 }
@@ -472,14 +577,15 @@ pub enum MpqError {
 #[derive(Debug)]
 pub struct Mpq<'a> {
     /// The file data of this MPQ.
-    pub data: &'a [u8],
+    data: &'a [u8],
     /// The header of the MPQ, containing metadata about its structure.
-    pub header: MpqHeader,
+    header: MpqHeader,
     /// A hash table containing information about the files present in this MPQ archive, allowing
     /// a file's position in the [block_table] to be located.
-    pub hash_table: Vec<MpqHashTableEntry>,
+    hash_table: Vec<MpqHashTableEntry>,
     /// A table for file metadata, containing 1 entry for each file present in this MPQ archive.
-    pub block_table: Vec<MpqBlockTableEntry>,
+    block_table: Vec<MpqBlockTableEntry>,
+    limits: ResourceLimits,
 }
 
 impl<'a> Mpq<'a> {
@@ -487,6 +593,15 @@ impl<'a> Mpq<'a> {
     /// method will eagerly parse the MPQ metadata, which will be used to fulfill later requests for
     /// specific files.
     pub fn from_bytes(data: &'a [u8]) -> Result<Self, MpqError> {
+        Self::from_bytes_with_limits(data, &ResourceLimits::default())
+    }
+
+    /// Initializes an MPQ from in-memory data using explicit resource limits.
+    pub fn from_bytes_with_limits(
+        data: &'a [u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, MpqError> {
+        ensure_within(Resource::MapBytes, data.len(), limits.max_map_bytes)?;
         let header = match mpq_header(data) {
             Ok((_, header)) => Ok(header),
             Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
@@ -500,18 +615,16 @@ impl<'a> Mpq<'a> {
             if hash_table_offset >= data.len() {
                 return Err(MpqError::MalformedHeader);
             }
-            let hash_table_size = ((header.hash_table_size as usize) * MPQ_HASH_TABLE_ENTRY_SIZE)
-                .clamp(0, data.len() - hash_table_offset);
+            let hash_table_size = (header.hash_table_size as usize)
+                .saturating_mul(MPQ_HASH_TABLE_ENTRY_SIZE)
+                .min(data.len() - hash_table_offset);
+            ensure_within(
+                Resource::MpqHashTableEntries,
+                hash_table_size / MPQ_HASH_TABLE_ENTRY_SIZE,
+                limits.max_mpq_table_entries,
+            )?;
             let hash_data = &data[hash_table_offset..hash_table_offset + hash_table_size];
-            match mpq_hash_table(hash_data) {
-                Ok((_, hash_table)) => Ok(hash_table),
-                Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Incomplete(_)) => {
-                    // We're using complete parsers here so this should never happen
-                    unreachable!()
-                }
-            }
+            mpq_hash_table(hash_data, limits.max_mpq_table_entries)
         }?;
 
         let mut block_table = {
@@ -519,19 +632,16 @@ impl<'a> Mpq<'a> {
             if block_table_offset >= data.len() {
                 return Err(MpqError::MalformedHeader);
             }
-            let block_table_size = ((header.block_table_size as usize)
-                * MPQ_BLOCK_TABLE_ENTRY_SIZE)
-                .clamp(0, data.len() - block_table_offset);
+            let block_table_size = (header.block_table_size as usize)
+                .saturating_mul(MPQ_BLOCK_TABLE_ENTRY_SIZE)
+                .min(data.len() - block_table_offset);
+            ensure_within(
+                Resource::MpqBlockTableEntries,
+                block_table_size / MPQ_BLOCK_TABLE_ENTRY_SIZE,
+                limits.max_mpq_table_entries,
+            )?;
             let block_data = &data[block_table_offset..block_table_offset + block_table_size];
-            match mpq_block_table(block_data) {
-                Ok((_, block_table)) => Ok(block_table),
-                Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Incomplete(_)) => {
-                    // We're using complete parsers here so this should never happen
-                    unreachable!()
-                }
-            }
+            mpq_block_table(block_data, limits.max_mpq_table_entries)
         }?;
 
         // Shrink the hash and block table to remove invalid entries at the end. This saves some
@@ -578,10 +688,42 @@ impl<'a> Mpq<'a> {
             header,
             hash_table,
             block_table,
+            limits: *limits,
         })
     }
 
+    /// Returns the complete archive bytes.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Returns the validated archive header.
+    pub fn header(&self) -> &MpqHeader {
+        &self.header
+    }
+
+    /// Returns the parsed hash table.
+    pub fn hash_table(&self) -> &[MpqHashTableEntry] {
+        &self.hash_table
+    }
+
+    /// Returns the parsed block table.
+    pub fn block_table(&self) -> &[MpqBlockTableEntry] {
+        &self.block_table
+    }
+
+    /// Returns the resource policy retained by this archive for lazy file extraction.
+    pub fn limits(&self) -> ResourceLimits {
+        self.limits
+    }
+
     pub fn read_file(&self, path: &str, locale: Option<u16>) -> Result<Vec<u8>, MpqError> {
+        if path
+            .chars()
+            .any(|character| u32::from(character) > u8::MAX.into())
+        {
+            return Err(MpqError::InvalidPath);
+        }
         let best = self
             .find_hash_table_entry(path, locale)
             .ok_or(MpqError::FileNotFound)?;
@@ -595,6 +737,11 @@ impl<'a> Mpq<'a> {
         {
             return Err(MpqError::FileNotFound);
         }
+        ensure_within(
+            Resource::MpqFileBytes,
+            block.size as usize,
+            self.limits.max_mpq_file_bytes,
+        )?;
 
         let offset = block
             .absolute_offset(&self.header)
@@ -608,7 +755,10 @@ impl<'a> Mpq<'a> {
         let sector_size = self.header.sector_size();
 
         let mut bytes_left = block.size as usize;
-        let mut result = vec![];
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(bytes_left)
+            .map_err(|_| allocation_error(Resource::MpqFileBytes, bytes_left))?;
 
         // NOTE(tec27): BW is okay with file data being truncated by the end of the file, so we
         // reproduce that handling
@@ -621,6 +771,11 @@ impl<'a> Mpq<'a> {
             // The sector table was validated as non-decreasing, but the difference between two
             // entries can still exceed i32::MAX, so it has to be computed as an i64
             let cur_sector_size = (next_sector_offset as i64 - sector_offset as i64) as usize;
+            ensure_within(
+                Resource::MpqFileBytes,
+                cur_sector_size,
+                self.limits.max_mpq_file_bytes,
+            )?;
             // Convert to an absolute offset in the data
             let start = if sector_offset >= 0 {
                 offset.saturating_add(sector_offset as usize)
@@ -642,37 +797,55 @@ impl<'a> Mpq<'a> {
 
             let end = start.saturating_add(cur_sector_size).min(self.data.len());
             let mut sector = Cow::from(&self.data[start..end]);
+            // MPQ compressors normally expand every sector to the archive's full sector size,
+            // including the final sector; the final output is truncated to the file's declared
+            // length below. Keep that compatibility while still applying the file-wide ceiling.
+            let expected_output = sector_size.min(self.limits.max_mpq_file_bytes);
 
             if let Some(key) = encryption_key {
                 let mut d = Decrypter::from_key_value(key.wrapping_add(i as u32));
                 sector = Cow::from(d.decrypt_bytes(sector.as_ref()));
             }
-            if sector_compressed {
-                if sector.is_empty() {
-                    return Err(MpqError::MalformedSectorTable);
-                }
-                sector = Cow::from(decompress_sector(sector.as_ref())?);
-            }
-            if sector_imploded {
-                sector = Cow::from(explode_data(sector.as_ref())?);
-            }
-
-            // Some protectors will add extra data to the end of the file that extends past its
-            // stated length. We truncate the last sector to the correct size in that case.
-            let slice_len = sector.len().min(bytes_left);
-
-            result.extend_from_slice(&sector[..slice_len]);
+            let sector_output_len = if sector_compressed {
+                decompress_sector_into(sector.as_ref(), expected_output, bytes_left, &mut result)?
+            } else if sector_imploded {
+                explode_into(sector.as_ref(), expected_output, bytes_left, &mut result)?
+            } else {
+                // Some protectors add extra data past the file's stated length. Truncate it while
+                // appending to the final buffer.
+                let slice_len = sector.len().min(bytes_left);
+                result.extend_from_slice(&sector[..slice_len]);
+                sector.len()
+            };
 
             // BW expects that every decompression will result in sectorSize bytes of data (except,
             // possibly, for the very last sector). This is never verified, however, which means map
             // protection schemes can compress less data. When reading it back out, BW will always
             // give sectorSize bytes anyway, so we need to pad the buffer in those cases.
             let is_last_sector = i == sector_table.len() - 2;
-            if !is_last_sector && sector.len() < sector_size {
-                result.resize(result.len() + (sector_size - sector.len()), 0);
+            if !is_last_sector && sector_output_len < sector_size {
+                let padding = sector_size - sector_output_len;
+                let new_len =
+                    result
+                        .len()
+                        .checked_add(padding)
+                        .ok_or(ResourceLimitError::Exceeded {
+                            resource: Resource::MpqFileBytes,
+                            observed: usize::MAX,
+                            limit: self.limits.max_mpq_file_bytes,
+                        })?;
+                ensure_within(
+                    Resource::MpqFileBytes,
+                    new_len,
+                    self.limits.max_mpq_file_bytes,
+                )?;
+                result
+                    .try_reserve(padding)
+                    .map_err(|_| allocation_error(Resource::MpqFileBytes, padding))?;
+                result.resize(new_len, 0);
                 bytes_left -= sector_size.min(bytes_left);
             } else {
-                bytes_left -= sector.len().min(bytes_left);
+                bytes_left -= sector_output_len.min(bytes_left);
             }
         }
 
@@ -763,6 +936,11 @@ impl<'a> Mpq<'a> {
 
         let sector_size = self.header.sector_size();
         let num_sectors = (block.size as usize).div_ceil(sector_size);
+        ensure_within(
+            Resource::MpqFileSectors,
+            num_sectors,
+            self.limits.max_mpq_file_sectors,
+        )?;
         // NOTE(tec27): BW's implementation doesn't support the "SINGLE_UNIT" flag, so there are
         // less reasons to not have a sector table
         let has_sector_table = block
@@ -772,30 +950,27 @@ impl<'a> Mpq<'a> {
         // There is one extra entry in the table, used purely for measuring the size of the
         // last section. Section N's size is calculated as:
         // offset(section n+1) - offset(section n)
-        let num_sectors = num_sectors + 1;
+        let num_sectors = num_sectors
+            .checked_add(1)
+            .ok_or(MpqError::MalformedSectorTable)?;
 
         if has_sector_table {
             let absolute_offset = block
                 .absolute_offset(&self.header)
                 .unwrap_or(self.data.len());
-            if absolute_offset + num_sectors * 4 >= self.data.len() {
+            let table_bytes = num_sectors
+                .checked_mul(4)
+                .ok_or(MpqError::MalformedSectorTable)?;
+            if absolute_offset
+                .checked_add(table_bytes)
+                .is_none_or(|end| end >= self.data.len())
+            {
                 // The sector table extends past the end of the file
                 return Err(MpqError::MalformedSectorTable);
             }
 
-            let sector_table = match mpq_sector_table(
-                &self.data[absolute_offset..],
-                num_sectors,
-                encryption_key,
-            ) {
-                Ok((_, table)) => Ok(table),
-                Err(nom::Err::Error(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Failure(e)) => Err(MpqError::ParserError(e.code)),
-                Err(nom::Err::Incomplete(_)) => {
-                    // We're using complete parsers here so this should never happen
-                    unreachable!()
-                }
-            }?;
+            let sector_table =
+                mpq_sector_table(&self.data[absolute_offset..], num_sectors, encryption_key)?;
 
             // Validate the table to ensure the sectors always move forward
             if sector_table.windows(2).any(|w| w[0] > w[1]) {
@@ -944,11 +1119,14 @@ mod tests {
 
     #[test]
     fn hash_table() {
-        let result = mpq_hash_table(&LT[69637..69637 + (1024 * 16)]);
+        let result = mpq_hash_table(
+            &LT[69637..69637 + (1024 * 16)],
+            ResourceLimits::trusted().max_mpq_table_entries,
+        );
 
         assert!(result.is_ok());
 
-        let (_, result) = result.unwrap();
+        let result = result.unwrap();
         assert_eq!(result.len(), 1024);
 
         let nonempty = result
@@ -1021,11 +1199,14 @@ mod tests {
 
     #[test]
     fn block_table() {
-        let result = mpq_block_table(&LT[86021..86021 + (4 * 16)]);
+        let result = mpq_block_table(
+            &LT[86021..86021 + (4 * 16)],
+            ResourceLimits::trusted().max_mpq_table_entries,
+        );
 
         assert!(result.is_ok());
 
-        let (_, result) = result.unwrap();
+        let result = result.unwrap();
         assert_eq!(
             result,
             vec![
@@ -1199,6 +1380,100 @@ mod tests {
         assert!(matches!(
             mpq.read_file(CHK_PATH, None),
             Err(MpqError::FileNotFound)
+        ));
+    }
+
+    #[test]
+    fn wide_character_file_path_is_rejected_instead_of_panicking() {
+        let mpq = assert_ok!(Mpq::from_bytes(LT));
+        assert!(matches!(
+            mpq.read_file("staredit\\café.chk", None),
+            Err(MpqError::FileNotFound)
+        ));
+        assert!(matches!(
+            mpq.read_file("staredit\\シナリオ.chk", None),
+            Err(MpqError::InvalidPath)
+        ));
+    }
+
+    #[test]
+    fn map_size_limit_is_checked_before_parsing() {
+        let limits = ResourceLimits {
+            max_map_bytes: LT.len() - 1,
+            ..ResourceLimits::default()
+        };
+        let result = Mpq::from_bytes_with_limits(LT, &limits);
+        assert!(matches!(
+            result,
+            Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MapBytes,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn declared_file_size_is_checked_before_sector_allocation() {
+        let data = [0u8; 1];
+        let limits = ResourceLimits {
+            max_mpq_file_bytes: 1024,
+            ..ResourceLimits::default()
+        };
+        let mpq = Mpq {
+            data: &data,
+            header: MpqHeader {
+                offset: 0,
+                sector_size_shift: 0,
+                hash_table_pos: 0,
+                block_table_pos: 0,
+                hash_table_size: 1,
+                block_table_size: 1,
+            },
+            hash_table: vec![MpqHashTableEntry {
+                hash_a: hash_str(CHK_PATH, MpqHashType::NameA),
+                hash_b: hash_str(CHK_PATH, MpqHashType::NameB),
+                locale: 0,
+                platform: 0,
+                block_index: 0,
+            }],
+            block_table: vec![MpqBlockTableEntry {
+                offset: 0,
+                compressed_size: 1,
+                size: 1025,
+                flags: MpqBlockFlags::EXISTS,
+            }],
+            limits,
+        };
+
+        assert!(matches!(
+            mpq.read_file(CHK_PATH, None),
+            Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MpqFileBytes,
+                observed: 1025,
+                limit: 1024,
+            }))
+        ));
+    }
+
+    #[test]
+    fn implode_output_is_bounded_while_streaming() {
+        // This tiny stream expands to "AIAIAIAIAIAIA".
+        let compressed = [0x00, 0x04, 0x82, 0x24, 0x25, 0x8f, 0x80, 0x7f];
+        assert!(matches!(
+            explode_data(&compressed, 4),
+            Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MpqSectorOutput,
+                limit: 4,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn compression_marker_without_payload_is_an_error() {
+        assert!(matches!(
+            decompress_sector(&[COMPRESSION_IMPLODE], 4096),
+            Err(MpqError::MalformedSectorTable)
         ));
     }
 }
