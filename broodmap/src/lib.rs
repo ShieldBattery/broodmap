@@ -1,8 +1,8 @@
 pub mod chk;
 pub mod mpq;
 
-pub use chk::strings::StringEncoding;
 pub use chk::Chk;
+pub use chk::strings::StringEncoding;
 pub use mpq::Mpq;
 use thiserror::Error;
 

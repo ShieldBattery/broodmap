@@ -1,13 +1,12 @@
 use crate::chk::strings::{StringId, UsedChkStrings};
 use crate::chk::triggers::{
-    trigger_condition_data, ActionFlags, NumberOperation, TriggerConditionData,
+    ActionFlags, NumberOperation, TriggerConditionData, trigger_condition_data,
 };
 use nom::bytes::complete::take;
 use nom::combinator::map;
 use nom::multi::{count, many0};
-use nom::number::complete::{le_u16, le_u32, le_u8};
-use nom::sequence::tuple;
-use nom::IResult;
+use nom::number::complete::{le_u8, le_u16, le_u32};
+use nom::{IResult, Parser};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -117,7 +116,7 @@ pub struct RawBriefingActionData {
 
 fn briefing_action_data(input: &[u8]) -> IResult<&[u8], Option<RawBriefingActionData>> {
     map(
-        tuple((
+        (
             take(4usize),
             le_u32,
             le_u32,
@@ -129,7 +128,7 @@ fn briefing_action_data(input: &[u8]) -> IResult<&[u8], Option<RawBriefingAction
             le_u8,
             le_u8,
             take(3usize),
-        )),
+        ),
         |(
             _location,
             text,
@@ -159,7 +158,8 @@ fn briefing_action_data(input: &[u8]) -> IResult<&[u8], Option<RawBriefingAction
                 flags: ActionFlags::from_bits_truncate(flags),
             })
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // TODO(tec27): Figure out if we need to keep the "execution flags" part of the struct after
@@ -175,8 +175,8 @@ pub struct RawBriefingTrigger {
 }
 
 fn raw_briefing_trigger(input: &[u8]) -> IResult<&[u8], RawBriefingTrigger> {
-    let (input, conditions) = count(trigger_condition_data, 16)(input)?;
-    let (input, actions) = count(briefing_action_data, 64)(input)?;
+    let (input, conditions) = count(trigger_condition_data, 16).parse(input)?;
+    let (input, actions) = count(briefing_action_data, 64).parse(input)?;
     let (input, _execution_flags) = le_u32(input)?;
     let (input, enabled_for) = map(take(27usize), |enabled_for: &[u8]| {
         enabled_for
@@ -185,7 +185,8 @@ fn raw_briefing_trigger(input: &[u8]) -> IResult<&[u8], RawBriefingTrigger> {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap()
-    })(input)?;
+    })
+    .parse(input)?;
     let (input, _action_index) = le_u8(input)?;
 
     Ok((
@@ -221,10 +222,12 @@ pub enum BriefingError {
 }
 
 pub fn read_briefing(data: &[u8]) -> Result<Vec<RawBriefingTrigger>, BriefingError> {
-    let (_, triggers) = many0(raw_briefing_trigger)(data).map_err(|e| match e {
-        nom::Err::Error(e) | nom::Err::Failure(e) => BriefingError::ParseError(e.code),
-        nom::Err::Incomplete(_) => unreachable!(),
-    })?;
+    let (_, triggers) = many0(raw_briefing_trigger)
+        .parse(data)
+        .map_err(|e| match e {
+            nom::Err::Error(e) | nom::Err::Failure(e) => BriefingError::ParseError(e.code),
+            nom::Err::Incomplete(_) => unreachable!(),
+        })?;
 
     Ok(triggers)
 }

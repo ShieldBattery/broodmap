@@ -3,9 +3,8 @@ use bitflags::bitflags;
 use nom::bytes::complete::take;
 use nom::combinator::map;
 use nom::multi::{count, many0};
-use nom::number::complete::{le_u16, le_u32, le_u8};
-use nom::sequence::tuple;
-use nom::IResult;
+use nom::number::complete::{le_u8, le_u16, le_u32};
+use nom::{IResult, Parser};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -509,7 +508,7 @@ pub struct TriggerConditionData {
 
 pub(crate) fn trigger_condition_data(input: &[u8]) -> IResult<&[u8], Option<TriggerConditionData>> {
     map(
-        tuple((
+        (
             le_u32,
             le_u32,
             le_u32,
@@ -519,7 +518,7 @@ pub(crate) fn trigger_condition_data(input: &[u8]) -> IResult<&[u8], Option<Trig
             le_u8,
             le_u8,
             take(2usize),
-        )),
+        ),
         |(
             location_or_bitmask,
             player_group,
@@ -547,7 +546,8 @@ pub(crate) fn trigger_condition_data(input: &[u8]) -> IResult<&[u8], Option<Trig
                 flags: ConditionFlags::from_bits_truncate(flags),
             })
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // NOTE(tec27): SEN Wiki refers to this as "Number Modifiers"
@@ -1265,7 +1265,7 @@ pub struct RawTriggerActionData {
 
 fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionData>> {
     map(
-        tuple((
+        (
             le_u32,
             le_u32,
             le_u32,
@@ -1278,7 +1278,7 @@ fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionDa
             le_u8,
             le_u8,
             take(2usize),
-        )),
+        ),
         |(
             location_or_bitmask,
             text,
@@ -1311,7 +1311,8 @@ fn trigger_action_data(input: &[u8]) -> IResult<&[u8], Option<RawTriggerActionDa
                 flags: ActionFlags::from_bits_truncate(flags),
             })
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 // TODO(tec27): Figure out if we need to keep the "execution flags" part of the struct after
@@ -1327,8 +1328,8 @@ pub struct RawTrigger {
 }
 
 fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
-    let (input, conditions) = count(trigger_condition_data, 16)(input)?;
-    let (input, actions) = count(trigger_action_data, 64)(input)?;
+    let (input, conditions) = count(trigger_condition_data, 16).parse(input)?;
+    let (input, actions) = count(trigger_action_data, 64).parse(input)?;
     let (input, _execution_flags) = le_u32(input)?;
     let (input, enabled_for) = map(take(27usize), |enabled_for: &[u8]| {
         enabled_for
@@ -1337,7 +1338,8 @@ fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap()
-    })(input)?;
+    })
+    .parse(input)?;
     let (input, _action_index) = le_u8(input)?;
 
     Ok((
@@ -1383,7 +1385,7 @@ pub enum TriggersError {
 }
 
 pub fn read_triggers(data: &[u8]) -> Result<Vec<RawTrigger>, TriggersError> {
-    let (_, triggers) = many0(raw_trigger)(data).map_err(|e| match e {
+    let (_, triggers) = many0(raw_trigger).parse(data).map_err(|e| match e {
         nom::Err::Error(e) | nom::Err::Failure(e) => TriggersError::ParseError(e.code),
         nom::Err::Incomplete(_) => unreachable!(),
     })?;

@@ -344,7 +344,10 @@ impl StringsChunk {
         Self::with_known_encoding(strings_chunk, encoding)
     }
 
-    fn decode_bytes(bytes: &[u8], encoding: StringEncoding) -> Option<(Cow<str>, StringEncoding)> {
+    fn decode_bytes(
+        bytes: &[u8],
+        encoding: StringEncoding,
+    ) -> Option<(Cow<'_, str>, StringEncoding)> {
         match encoding {
             StringEncoding::Utf8 => Some((String::from_utf8_lossy(bytes), encoding)),
             StringEncoding::Utf8WithFallback(fallback) => std::str::from_utf8(bytes)
@@ -361,7 +364,7 @@ impl StringsChunk {
         }
     }
 
-    pub fn get(&self, index: StringId) -> Option<Cow<str>> {
+    pub fn get(&self, index: StringId) -> Option<Cow<'_, str>> {
         self.inner
             .get_raw_bytes(index)
             .and_then(|bytes| Self::decode_bytes(bytes, self.encoding).map(|(s, _)| s))

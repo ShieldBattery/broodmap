@@ -2,27 +2,27 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use crate::chk::briefing::{read_briefing, BriefingError, RawBriefingTrigger};
+use crate::chk::briefing::{BriefingError, RawBriefingTrigger, read_briefing};
 use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::chk::chunk_type::{ChunkTag, ChunkType, MultiChunkHandling};
-use crate::chk::dimensions::{read_dimensions, DimensionsError, MapDimensions};
+use crate::chk::dimensions::{DimensionsError, MapDimensions, read_dimensions};
 use crate::chk::forces::{
-    read_force_settings, ForceSettings, ForceSettingsError, RawForceSettings,
+    ForceSettings, ForceSettingsError, RawForceSettings, read_force_settings,
 };
-use crate::chk::format_version::{read_format_version, FormatVersion, FormatVersionError};
-use crate::chk::placed_units::{read_placed_units, PlacedUnit, PlacedUnitsError};
+use crate::chk::format_version::{FormatVersion, FormatVersionError, read_format_version};
+use crate::chk::placed_units::{PlacedUnit, PlacedUnitsError, read_placed_units};
 use crate::chk::scenario_props::{
-    read_scenario_props, RawScenarioProps, ScenarioProps, ScenarioPropsError,
+    RawScenarioProps, ScenarioProps, ScenarioPropsError, read_scenario_props,
 };
-use crate::chk::sprites::{read_sprites, Sprite, SpriteError};
+use crate::chk::sprites::{Sprite, SpriteError, read_sprites};
 use crate::chk::strings::{
     ChkDecode, RawStringsChunk, StringEncoding, StringsChunk, StringsChunkError, UsedChkStrings,
 };
-use crate::chk::terrain::{read_terrain, TerrainError, TerrainTileIds};
-use crate::chk::tileset::{read_tileset, Tileset, TilesetError};
-use crate::chk::triggers::{read_triggers, RawTrigger, TriggersError};
+use crate::chk::terrain::{TerrainError, TerrainTileIds, read_terrain};
+use crate::chk::tileset::{Tileset, TilesetError, read_tileset};
+use crate::chk::triggers::{RawTrigger, TriggersError, read_triggers};
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
 
 pub mod briefing;
@@ -360,10 +360,7 @@ fn read_chunk_data<'a>(
 ) -> Option<Cow<'a, [u8]>> {
     let chunks = chunk_map
         .get::<ChunkTag>(&chunk_type.into())
-        .map(|v| v.as_slice());
-    let Some(chunks) = chunks else {
-        return None;
-    };
+        .map(|v| v.as_slice())?;
 
     match chunks.len() {
         0 => None,

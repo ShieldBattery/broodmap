@@ -1,18 +1,18 @@
 [package]
 name = "broodmap"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.70"
+rust-version = "1.95"
 
 [dependencies]
-bitflags = "2.4"
+bitflags = "2.13"
 encoding_rs = "0.8"
 explode = "0.1"
-nom = "7.1"
-smallvec = "1.11"
-thiserror = "1.0"
+nom = "8.0"
+smallvec = "1.15"
+thiserror = "2.0"
 
 [dev-dependencies]
 assert_ok = "1.0"
-rstest = "0.18"
+rstest = "0.26"

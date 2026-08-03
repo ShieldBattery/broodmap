@@ -3,7 +3,7 @@ use nom::bytes::complete::take;
 use nom::combinator::map;
 use nom::multi::count;
 use nom::number::complete::{le_u16, le_u32};
-use nom::IResult;
+use nom::{IResult, Parser};
 use std::borrow::Cow;
 use thiserror::Error;
 
@@ -26,8 +26,8 @@ pub enum WeaponSettings {
 }
 
 fn original_weapon_settings(input: &[u8]) -> IResult<&[u8], WeaponSettings> {
-    let (input, base_damage) = count(le_u16, 100usize)(input)?;
-    let (input, upgrade_bonus) = count(le_u16, 100usize)(input)?;
+    let (input, base_damage) = count(le_u16, 100usize).parse(input)?;
+    let (input, upgrade_bonus) = count(le_u16, 100usize).parse(input)?;
     Ok((
         input,
         WeaponSettings::Original {
@@ -38,8 +38,8 @@ fn original_weapon_settings(input: &[u8]) -> IResult<&[u8], WeaponSettings> {
 }
 
 fn expanded_weapon_settings(input: &[u8]) -> IResult<&[u8], WeaponSettings> {
-    let (input, base_damage) = count(le_u16, 130usize)(input)?;
-    let (input, upgrade_bonus) = count(le_u16, 130usize)(input)?;
+    let (input, base_damage) = count(le_u16, 130usize).parse(input)?;
+    let (input, upgrade_bonus) = count(le_u16, 130usize).parse(input)?;
     Ok((
         input,
         WeaponSettings::Expanded {
@@ -80,36 +80,37 @@ fn use_defaults(input: &[u8]) -> IResult<&[u8], [bool; 228]> {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap()
-    })(input)
+    })
+    .parse(input)
 }
 
 fn hp(input: &[u8]) -> IResult<&[u8], [u32; 228]> {
-    let (input, hp_values) = count(le_u32, 228usize)(input)?;
+    let (input, hp_values) = count(le_u32, 228usize).parse(input)?;
     Ok((input, hp_values.try_into().unwrap()))
 }
 
 fn shield(input: &[u8]) -> IResult<&[u8], [u16; 228]> {
-    let (input, shield_values) = count(le_u16, 228usize)(input)?;
+    let (input, shield_values) = count(le_u16, 228usize).parse(input)?;
     Ok((input, shield_values.try_into().unwrap()))
 }
 
 fn armor(input: &[u8]) -> IResult<&[u8], [u8; 228]> {
-    let (input, armor_values) = take(228usize)(input)?;
+    let (input, armor_values) = take(228usize).parse(input)?;
     Ok((input, armor_values.try_into().unwrap()))
 }
 
 fn build_time(input: &[u8]) -> IResult<&[u8], [u16; 228]> {
-    let (input, build_time_values) = count(le_u16, 228usize)(input)?;
+    let (input, build_time_values) = count(le_u16, 228usize).parse(input)?;
     Ok((input, build_time_values.try_into().unwrap()))
 }
 
 fn mineral_cost(input: &[u8]) -> IResult<&[u8], [u16; 228]> {
-    let (input, mineral_cost_values) = count(le_u16, 228usize)(input)?;
+    let (input, mineral_cost_values) = count(le_u16, 228usize).parse(input)?;
     Ok((input, mineral_cost_values.try_into().unwrap()))
 }
 
 fn gas_cost(input: &[u8]) -> IResult<&[u8], [u16; 228]> {
-    let (input, gas_cost_values) = count(le_u16, 228usize)(input)?;
+    let (input, gas_cost_values) = count(le_u16, 228usize).parse(input)?;
     Ok((input, gas_cost_values.try_into().unwrap()))
 }
 
@@ -121,7 +122,8 @@ fn name_id(input: &[u8]) -> IResult<&[u8], [StringId; 228]> {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap()
-    })(input)
+    })
+    .parse(input)
 }
 
 fn raw_unit_settings(input: &[u8], is_expanded: bool) -> IResult<&[u8], RawUnitSettings> {
@@ -183,7 +185,7 @@ impl RawUnitSettings {
                         base_damage: [0; 130],
                         upgrade_bonus: [0; 130],
                     },
-                })
+                });
             }
             (_, Some(ref expansion_bytes)) => raw_unit_settings(expansion_bytes, true),
             (Some(ref legacy_bytes), None) => raw_unit_settings(legacy_bytes, false),
@@ -200,11 +202,7 @@ impl RawUnitSettings {
 impl UsedChkStrings for RawUnitSettings {
     fn used_string_ids(&self) -> Box<dyn Iterator<Item = StringId> + '_> {
         Box::new(self.name_id.iter().enumerate().filter_map(|(i, &id)| {
-            if self.use_defaults[i] {
-                None
-            } else {
-                Some(id)
-            }
+            if self.use_defaults[i] { None } else { Some(id) }
         }))
     }
 }

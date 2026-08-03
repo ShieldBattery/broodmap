@@ -5,9 +5,8 @@
 
 use bitflags::bitflags;
 use nom::combinator::{map, verify};
-use nom::multi::{count, many0, many_till};
-use nom::sequence::tuple;
-use nom::IResult;
+use nom::multi::{count, many_till, many0};
+use nom::{IResult, Parser};
 use std::borrow::Cow;
 
 use thiserror::Error;
@@ -65,16 +64,17 @@ fn mpq_header_size(input: &[u8]) -> IResult<&[u8], u32> {
     // NOTE(tec27): BW's implementation just cares that this is at least 32 bytes, it will never
     // read more than that. If this value is less than 32 bytes, it will continue searching for the
     // MPQ header later in the file.
-    verify(le_u32, |size: &u32| *size >= 32)(input)
+    verify(le_u32, |size: &u32| *size >= 32).parse(input)
 }
 
 fn mpq_header_offset(input: &[u8]) -> IResult<&[u8], u32> {
     use nom::bytes::streaming::{tag, take};
 
     map(
-        many_till(take(512usize), tuple((tag(b"MPQ\x1A"), mpq_header_size))),
+        many_till(take(512usize), (tag(&b"MPQ\x1A"[..]), mpq_header_size)),
         |(takes, (_magic, _header_size))| (takes.len() * 512) as u32,
-    )(input)
+    )
+    .parse(input)
 }
 
 fn mpq_table_pos(min_pos: i32) -> impl Fn(&[u8]) -> IResult<&[u8], i32> {
@@ -82,7 +82,7 @@ fn mpq_table_pos(min_pos: i32) -> impl Fn(&[u8]) -> IResult<&[u8], i32> {
 
     // This checks to ensure that the table is placed at the start of the file or after (but can't
     // validate that it is before the end of the file, since we may not know what that is yet)
-    move |input| verify(le_i32, |pos: &i32| *pos >= min_pos)(input)
+    move |input| verify(le_i32, |pos: &i32| *pos >= min_pos).parse(input)
 }
 
 /// Find and parse an [MpqHeader] from the given input. This is a streaming parser, and may return
@@ -93,16 +93,16 @@ fn mpq_header(input: &[u8]) -> IResult<&[u8], MpqHeader> {
 
     let (input, offset) = mpq_header_offset(input)?;
     // NOTE(tec27): BW's code ignores format version and archive size entirely
-    let (input, (_archive_size, _format_version)) = tuple((take(4usize), take(2usize)))(input)?;
+    let (input, (_archive_size, _format_version)) = (take(4usize), take(2usize)).parse(input)?;
 
     map(
-        tuple((
+        (
             le_u16,
             mpq_table_pos(-(offset as i32)),
             mpq_table_pos(-(offset as i32)),
             le_u32,
             le_u32,
-        )),
+        ),
         move |(sector_size, hash_table_pos, block_table_pos, hash_table_size, block_table_size)| {
             let mut sector_size = sector_size & 0xFF;
             // Certain maps (see smallest.scm) set very high sector sizes that overflow the bounds
@@ -126,7 +126,8 @@ fn mpq_header(input: &[u8]) -> IResult<&[u8], MpqHeader> {
                 block_table_size,
             }
         },
-    )(input)
+    )
+    .parse(input)
 }
 
 const fn generate_crypt_table() -> [u32; 1280] {
@@ -196,7 +197,7 @@ impl Decrypter {
 
     fn decrypt_bytes(&mut self, data: &[u8]) -> Vec<u8> {
         // We always decrypt by u32s, any extra bytes are output without any extra decoding
-        let (data, remainder): (&[u8], &[u8]) = if data.len() % 4 == 0 {
+        let (data, remainder): (&[u8], &[u8]) = if data.len().is_multiple_of(4) {
             (data, &[])
         } else {
             let extra = data.len() % 4;
@@ -272,7 +273,7 @@ pub struct MpqHashTableEntry {
     /// The platform the file is used for. 0 indicates the default platform. No other values are
     /// current known.
     pub platform: u16,
-    ///
+    /// The index of this entry's corresponding [MpqBlockTableEntry] in the block table.
     pub block_index: u32,
 }
 
@@ -309,7 +310,8 @@ fn mpq_hash_table(input: &[u8]) -> IResult<&[u8], Vec<MpqHashTableEntry>> {
             platform: (locale_platform >> 16) as u16,
             block_index,
         }
-    }))(input);
+    }))
+    .parse(input);
 
     #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
     r
@@ -396,7 +398,8 @@ fn mpq_block_table(input: &[u8]) -> IResult<&[u8], Vec<MpqBlockTableEntry>> {
             size: decrypter.decrypt_u32(entries[2]),
             flags: MpqBlockFlags::from_bits_truncate(decrypter.decrypt_u32(entries[3])),
         }
-    }))(input);
+    }))
+    .parse(input);
 
     #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
     r
@@ -420,7 +423,8 @@ fn mpq_sector_table(
         } else {
             entries.iter().map(|val| *val as i32).collect()
         }
-    })(input);
+    })
+    .parse(input);
 
     #[allow(clippy::let_and_return)] // Necessary so decrypter lives long enough
     r
@@ -930,7 +934,7 @@ mod tests {
     fn hash_table() {
         let result = mpq_hash_table(&LT[69637..69637 + (1024 * 16)]);
 
-        assert!(matches!(result, Ok(_)));
+        assert!(result.is_ok());
 
         let (_, result) = result.unwrap();
         assert_eq!(result.len(), 1024);
@@ -1007,7 +1011,7 @@ mod tests {
     fn block_table() {
         let result = mpq_block_table(&LT[86021..86021 + (4 * 16)]);
 
-        assert!(matches!(result, Ok(_)));
+        assert!(result.is_ok());
 
         let (_, result) = result.unwrap();
         assert_eq!(

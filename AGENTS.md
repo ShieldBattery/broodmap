@@ -48,7 +48,7 @@ broodmap/               Core library
 
 ## Code conventions
 
-- Rust 2021 edition, MSRV 1.70
+- Rust 2024 edition, MSRV 1.95
 - `thiserror` for error types
 - `bitflags!` for flag fields (UnitState, ForceFlags, SpriteFlags, etc.)
 - `SmallVec` for chunk storage (most chunks appear once)
