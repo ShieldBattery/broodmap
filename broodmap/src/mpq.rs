@@ -618,10 +618,12 @@ impl<'a> Mpq<'a> {
             }
 
             let (sector_offset, next_sector_offset) = (w[0], w[1]);
-            let cur_sector_size = (next_sector_offset - sector_offset) as usize;
+            // The sector table was validated as non-decreasing, but the difference between two
+            // entries can still exceed i32::MAX, so it has to be computed as an i64
+            let cur_sector_size = (next_sector_offset as i64 - sector_offset as i64) as usize;
             // Convert to an absolute offset in the data
             let start = if sector_offset >= 0 {
-                offset + (sector_offset as usize)
+                offset.saturating_add(sector_offset as usize)
             } else if sector_offset >= -(offset as i32) {
                 offset - sector_offset.unsigned_abs() as usize
             } else {
@@ -629,13 +631,16 @@ impl<'a> Mpq<'a> {
                 // with this happening, so just return what we have
                 return Err(MpqError::MalformedSectorTable);
             };
+            // Sectors can also claim to start past the end of the file; BW tolerates truncated
+            // file data, so treat everything past the end as empty
+            let start = start.min(self.data.len());
 
             let use_compression = cur_sector_size < sector_size && cur_sector_size < bytes_left;
             let sector_compressed =
                 block.flags.contains(MpqBlockFlags::COMPRESSED) && use_compression;
             let sector_imploded = block.flags.contains(MpqBlockFlags::IMPLODED) && use_compression;
 
-            let end = (start + cur_sector_size).clamp(start, self.data.len());
+            let end = start.saturating_add(cur_sector_size).min(self.data.len());
             let mut sector = Cow::from(&self.data[start..end]);
 
             if let Some(key) = encryption_key {
@@ -680,6 +685,13 @@ impl<'a> Mpq<'a> {
             Some(0) => None,
             l => l,
         };
+
+        // A malformed/truncated file can produce an empty hash table, in which case no file can
+        // ever be found (this also means a non-empty table has hash_table_size >= 1, keeping the
+        // mask below safe from underflow)
+        if self.hash_table.is_empty() {
+            return None;
+        }
 
         let mut table_offset = hash_str(path, MpqHashType::TableOffset) as usize;
         table_offset &= self.header.hash_table_size as usize - 1;
@@ -750,7 +762,7 @@ impl<'a> Mpq<'a> {
         let encryption_key = encryption_key.map(|k| k.wrapping_sub(1));
 
         let sector_size = self.header.sector_size();
-        let num_sectors = (block.size as usize - 1) / sector_size + 1;
+        let num_sectors = (block.size as usize).div_ceil(sector_size);
         // NOTE(tec27): BW's implementation doesn't support the "SINGLE_UNIT" flag, so there are
         // less reasons to not have a sector table
         let has_sector_table = block
@@ -1164,5 +1176,29 @@ mod tests {
     fn corrupted_map_doesnt_panic(#[case] input: &[u8]) {
         let result = Mpq::from_bytes(input);
         assert!(matches!(result, Err(MpqError::MalformedHeader)));
+    }
+
+    #[test]
+    fn zero_size_hash_table_doesnt_panic() {
+        // A header can claim a zero-size hash table, producing an empty table after parsing.
+        // Looking up any file in it must return FileNotFound rather than panicking (found by
+        // fuzzing: the table offset mask underflowed)
+        let mut data = vec![];
+        data.extend_from_slice(b"MPQ\x1A");
+        data.extend_from_slice(&32u32.to_le_bytes()); // header size
+        data.extend_from_slice(&[0u8; 4]); // archive size (ignored)
+        data.extend_from_slice(&[0u8; 2]); // format version (ignored)
+        data.extend_from_slice(&3u16.to_le_bytes()); // sector size shift
+        data.extend_from_slice(&32i32.to_le_bytes()); // hash table pos
+        data.extend_from_slice(&32i32.to_le_bytes()); // block table pos
+        data.extend_from_slice(&0u32.to_le_bytes()); // hash table size
+        data.extend_from_slice(&0u32.to_le_bytes()); // block table size
+        data.extend_from_slice(&[0u8; 8]); // padding to keep the table offsets in bounds
+
+        let mpq = assert_ok!(Mpq::from_bytes(&data));
+        assert!(matches!(
+            mpq.read_file(CHK_PATH, None),
+            Err(MpqError::FileNotFound)
+        ));
     }
 }
