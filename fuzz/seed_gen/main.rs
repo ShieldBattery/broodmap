@@ -80,7 +80,7 @@ fn main() {
 
         match extract_chk_from_map(&bytes, None, None) {
             Ok((chk, _mpq)) => {
-                let chk_bytes = &chk.data;
+                let chk_bytes = chk.data();
                 if chk_bytes.len() as u64 > MAX_SEED_SIZE {
                     println!(
                         "skipping {name} for chk_parse: extracted CHK is {} bytes, exceeds {} byte cap",
@@ -92,7 +92,7 @@ fn main() {
 
                 // Sanity check: the bytes we're about to write should parse cleanly with the
                 // real CHK parser.
-                if let Err(e) = Chk::from_bytes(chk_bytes.clone(), None) {
+                if let Err(e) = Chk::from_bytes(chk_bytes.to_vec(), None) {
                     panic!("extracted CHK for {name} failed to re-parse: {e}");
                 }
 
