@@ -393,7 +393,7 @@ impl MpqBlockTableEntry {
         let (_, filename) = path.rsplit_once('\\').unwrap_or(("", path));
         let key = hash_str(filename, MpqHashType::FileKey);
         if self.flags.contains(MpqBlockFlags::ADJUSTED_KEY) {
-            Some((key + (self.offset as u32)) ^ (self.size))
+            Some(key.wrapping_add(self.offset as u32) ^ self.size)
         } else {
             Some(key)
         }
