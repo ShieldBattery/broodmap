@@ -1,0 +1,73 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Short run on every push/PR: catches regressions quickly without slowing
+  # down the merge loop.
+  fuzz-smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [chk_parse, mpq_parse, full_pipeline]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      # Plain cargo install: cargo-fuzz has no prebuilt binaries for
+      # install-action, and rust-cache restores ~/.cargo/bin so this is a
+      # no-op on warm caches.
+      - run: cargo install cargo-fuzz --locked
+      - run: >
+          cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          -- -max_total_time=20 -max_len=65536
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+  # Weekly (and manually triggerable) deeper run.
+  fuzz-long:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [chk_parse, mpq_parse, full_pipeline]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      # Plain cargo install: cargo-fuzz has no prebuilt binaries for
+      # install-action, and rust-cache restores ~/.cargo/bin so this is a
+      # no-op on warm caches.
+      - run: cargo install cargo-fuzz --locked
+      - run: >
+          cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          -- -max_total_time=300 -max_len=65536
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

@@ -1,0 +1,50 @@
+[package]
+name = "broodmap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.broodmap]
+path = "../broodmap"
+
+[[bin]]
+name = "chk_parse"
+path = "fuzz_targets/chk_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mpq_parse"
+path = "fuzz_targets/mpq_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "full_pipeline"
+path = "fuzz_targets/full_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed_gen"
+path = "seed_gen/main.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Detached from the parent workspace: this is its own workspace root so
+# `cargo fuzz` doesn't try to unify dependency resolution with broodmap's
+# own Cargo.lock.
+[workspace]

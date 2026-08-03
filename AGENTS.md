@@ -13,6 +13,19 @@ cargo fmt --all -- --check     # Check formatting
 
 The CLI (`broodmap-cli`) is currently a placeholder.
 
+## Fuzzing
+
+`fuzz/` is a cargo-fuzz crate (its own workspace, nightly-only — doesn't affect the library's MSRV) with targets `chk_parse`, `mpq_parse`, and `full_pipeline`. Because parsing is lazy, targets must call every lazy `Chk` accessor, not just construct the `Chk`.
+
+```bash
+cargo +nightly fuzz run chk_parse fuzz/corpus/chk_parse fuzz/seeds/chk_parse -- -max_len=65536
+cargo run --bin seed_gen   # from fuzz/; regenerates committed seeds from broodmap/assets
+```
+
+CI runs a 20s smoke fuzz per target on push/PR and a 5-minute run weekly (`fuzz.yml`). When triaging findings, remember the invariant is "no panics/OOM" — permissively accepting garbage input is intentional, BW-compatible behavior, not a bug.
+
+On Windows, linking fuzz targets needs an MSVC toolset that ships the clang ASan runtime (`clang_rt.asan*`); if the link fails with those libs missing, point `LIB`/`PATH` at a VS toolset version that includes them (the default Build Tools install may not).
+
 ## Project structure
 
 ```
