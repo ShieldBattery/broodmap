@@ -6,3 +6,6 @@ rust-version = "1.95"
 
 [dependencies]
 broodmap = { version = "0.1.0", path = "../broodmap" }
+broodmap-render = { version = "0.1.0", path = "../broodmap-render", features = ["casc", "png"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

@@ -1,0 +1,26 @@
+[package]
+name = "broodmap-render"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+description = "Render StarCraft: Brood War map previews using Remastered assets"
+
+[features]
+default = ["fs"]
+# DirSource: read extracted assets from a plain directory via std::fs
+fs = []
+# CascSource: read assets from a SC:R install or Blizzard's CDN via broodcasc
+casc = ["dep:broodcasc"]
+# PNG encoding of rendered images
+png = ["dep:png"]
+
+[dependencies]
+broodmap = { version = "0.1.0", path = "../broodmap" }
+broodmap-formats = { version = "0.1.0", path = "../broodmap-formats" }
+thiserror = "2.0"
+broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0", optional = true }
+png = { version = "0.18", optional = true }
+
+[dev-dependencies]
+assert_ok = "1.0"
