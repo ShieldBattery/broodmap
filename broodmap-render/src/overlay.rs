@@ -32,7 +32,9 @@ use broodmap::chk::player_colors::{PlayerColors, resolve_color};
 use broodmap::chk::sprites::{Sprite, SpriteFlags};
 use broodmap::chk::terrain::TerrainTileIds;
 use broodmap::chk::tileset::Tileset;
-use broodmap_formats::{Anim, AnimFrame, AnimLayer, DdsFormat, parse_dds};
+use broodmap_formats::{
+    Anim, AnimFrame, AnimLayer, DdsFormat, MainSdAnim, parse_dds, parse_teamcolor_mask,
+};
 
 use crate::bc::{decode_bc1, decode_bc3};
 use crate::error::RenderError;
@@ -92,8 +94,11 @@ const RANDOM_DIRECTION: u8 = 32;
 #[derive(Debug, Clone)]
 pub struct Preview {
     pub image: RgbaImage,
-    /// Non-fatal notes (e.g. "unit art was skipped because the Original style isn't supported
-    /// yet"). Empty on a fully successful render.
+    /// Non-fatal notes about things the render skipped (e.g. "map has no readable terrain" — see
+    /// [`render_chk_preview`]'s empty-image fallback). Empty on a fully successful render; unlike
+    /// a missing `.dat`/`.rel` table (a hard error, since every art style now needs them to
+    /// resolve unit/sprite art), a missing individual `.anim`/`mainSD.anim` drawable is simply
+    /// dropped silently rather than reported here (see the module docs).
     pub warnings: Vec<String>,
 }
 
@@ -134,7 +139,7 @@ pub fn render_preview_with_warnings(
     options: &RenderOptions,
 ) -> Result<Preview, RenderError> {
     let mut image = render_terrain(terrain, tileset, source, options)?;
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     if image.width == 0 || image.height == 0 {
         return Ok(Preview { image, warnings });
@@ -143,26 +148,17 @@ pub fn render_preview_with_warnings(
     let (_, _, ppt) = resolve_tier(options, terrain.width as u32, terrain.height as u32);
     let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
 
-    // The `.dat`/`.rel` tables are a hard dependency of the unit layer, but only a nice-to-have
-    // for start-location blocks (they supply the box size), so an Original-style render loads
-    // them best-effort and falls back rather than failing. A map with no units and no sprites at
-    // all can't resolve anything through them either way, so a terrain-only source (no `.dat`
-    // tables present) must still render successfully — nothing here would ever read them.
+    // The `.dat`/`.rel` tables are a hard dependency of the unit layer (every art style,
+    // Original included, now that it draws from `mainSD.anim`): a map with units/sprites but no
+    // tables is a genuine error. A map with no units and no sprites at all can't resolve
+    // anything through them either way, so a terrain-only source (no `.dat` tables present) must
+    // still render successfully — nothing here would ever read them.
     let needs_game_data = !units.is_empty() || !sprites.is_empty();
-    let data = if !needs_game_data {
-        None
-    } else if options.unit_art_available() {
-        Some(GameData::load(source)?)
-    } else {
-        warnings.push(
-            "unit and sprite art skipped: the Original (SD) art style needs mainSD.anim, which \
-             is not implemented yet"
-                .to_string(),
-        );
-        GameData::load(source).ok()
-    };
+    let data = needs_game_data
+        .then(|| GameData::load(source))
+        .transpose()?;
 
-    if let Some(data) = data.as_ref().filter(|_| options.unit_art_available()) {
+    if let Some(data) = data.as_ref() {
         let (tier, pack) = resolve_unit_tier(options, ppt);
         let drawables = collect_drawables(units, sprites, data, options, tileset);
         draw_overlay(
@@ -272,13 +268,15 @@ pub fn required_preview_graphics_for_chk(
     )
 }
 
-/// The `.anim` assets a preview render will request for its unit/sprite layer, deduplicated and
-/// in a stable order.
+/// The `.anim`/`mainSD.anim` assets a preview render will request for its unit/sprite layer,
+/// deduplicated and in a stable order.
 ///
 /// This is round 2 of the two-round prefetch API: it needs the [`GameData`] tables fetched in
 /// round 1 ([`crate::required_preview_assets`]) to resolve units and sprites to image IDs. The
 /// same filtering the renderer applies is applied here, so assets for units that `options`
-/// filters out are never requested.
+/// filters out are never requested. For an SD (`ArtStyle::Original`) unit layer, every image
+/// dedupes through [`crate::gamedata::anim_request`] to the single
+/// [`AssetRequest::MainSdAnim`] request, since all SD art lives in one bundled file.
 ///
 /// `map_w`/`map_h` (in tiles) are needed to derive the same effective resolution — and therefore
 /// the same asset tier — the render itself will pick.
@@ -290,10 +288,6 @@ pub fn required_preview_graphics(
     map_h: u32,
     options: &RenderOptions,
 ) -> Vec<AssetRequest> {
-    if !options.unit_art_available() {
-        return Vec::new();
-    }
-
     let (_, _, ppt) = resolve_tier(options, map_w, map_h);
     let (tier, pack) = resolve_unit_tier(options, ppt);
 
@@ -785,12 +779,34 @@ fn draw_overlay(
     let mut cache_bytes: usize = 0;
     let mut placements: Vec<Option<Placement>> = (0..drawables.len()).map(|_| None).collect();
 
+    // SD art is one bundled ~38 MB file, unlike HD/HD2's one-file-per-image layout, so it's
+    // fetched and parsed once here rather than once per distinct image inside the loop below.
+    let sd_bundle_bytes = (tier == AssetTier::Sd)
+        .then(|| source.read(&AssetRequest::MainSdAnim).ok())
+        .flatten();
+    let sd_bundle = sd_bundle_bytes
+        .as_ref()
+        .and_then(|bytes| MainSdAnim::parse(bytes.as_ref()).ok());
+
     for (art_image_id, indices) in by_image {
-        let Ok(bytes) = source.read(&anim_request(art_image_id, tier, pack)) else {
-            continue;
-        };
-        let Ok(anim) = Anim::parse(bytes.as_ref()) else {
-            continue;
+        let per_image_bytes;
+        let anim = if tier == AssetTier::Sd {
+            let Some(bundle) = sd_bundle.as_ref() else {
+                continue;
+            };
+            let Ok(anim) = bundle.entry(art_image_id) else {
+                continue;
+            };
+            anim
+        } else {
+            let Ok(bytes) = source.read(&anim_request(art_image_id, tier, pack)) else {
+                continue;
+            };
+            per_image_bytes = bytes;
+            let Ok(anim) = Anim::parse(per_image_bytes.as_ref()) else {
+                continue;
+            };
+            anim
         };
         let Some(diffuse) = anim.layer("diffuse").and_then(decode_layer) else {
             continue;
@@ -947,7 +963,40 @@ fn frame_origin(pos_logical: i32, offset_units: i32, canvas_units: u16, zoom: f3
 /// there's no real art this crate needs today that a PNG payload would unlock. `parse_dds`
 /// simply fails its magic check on a PNG blob, which this treats the same as any other
 /// undecodable layer — add real decoding here if/when a real asset actually needs it.
+///
+/// SD's `teamcolor` layer is a third case, checked first: it's not a DDS payload at all, but a
+/// raw `width * height` mask (see [`parse_teamcolor_mask`]), expanded here into grayscale RGBA
+/// (`(m, m, m, 255)`) so [`team_color_mask`] can read it back out of the red channel exactly like
+/// an HD/HD2 BC1 mask layer. SD diffuse layers, by contrast, are ordinary embedded DDS and fall
+/// through to the DDS path below unmodified.
 fn decode_layer(layer: &AnimLayer<'_>) -> Option<DecodedLayer> {
+    if let Some(mask) = parse_teamcolor_mask(layer.data, layer.width, layer.height) {
+        let width = (layer.width as u32).min(MAX_ANIM_TEXTURE_DIM);
+        let height = (layer.height as u32).min(MAX_ANIM_TEXTURE_DIM);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // Sampled with the TRUE row stride (`layer.width`), not the capped `width`, so a
+        // dimension-capped decode still reads the right texels instead of an incorrectly
+        // reflowed image.
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let m = mask[y * layer.width as usize + x];
+                let o = (y * width as usize + x) * 4;
+                rgba[o] = m;
+                rgba[o + 1] = m;
+                rgba[o + 2] = m;
+                rgba[o + 3] = 255;
+            }
+        }
+        return Some(DecodedLayer {
+            rgba,
+            width,
+            height,
+        });
+    }
+
     let dds = parse_dds(layer.data).ok()?;
     let width = dds.width.min(MAX_ANIM_TEXTURE_DIM);
     let height = dds.height.min(MAX_ANIM_TEXTURE_DIM);
@@ -2135,6 +2184,85 @@ mod tests {
         data
     }
 
+    /// A minimal, single-real-entry `mainSD.anim` bundle (see `broodmap_formats::mainsd`'s module
+    /// docs for the byte layout): image id 0 is the file's one entry (`num_entries == 1`, no
+    /// reference entries), carrying a `diffuse` layer and, if `teamcolor` is `Some((bytes, width,
+    /// height))`, a `teamcolor` layer too, plus one frame. All offsets absolute. `frame`'s fields
+    /// are raw SD-texel-space values (as this format authors them) -- `MainSdAnim::entry`
+    /// normalizes them into the same 4K-unit space `anim_bytes`'s HD frames already use, so a
+    /// caller reasons about the two uniformly downstream.
+    fn mainsd_bytes(
+        diffuse: &[u8],
+        teamcolor: Option<(&[u8], u16, u16)>,
+        frame: AnimFrame,
+    ) -> Vec<u8> {
+        const ENTRY_OFFSET_TABLE_START: usize = 0x14C;
+        let num_layers: u16 = if teamcolor.is_some() { 2 } else { 1 };
+
+        // Header (12 B) + 10x32 B name region + a 1-slot (4 B) entry offset table.
+        let mut data = vec![0u8; ENTRY_OFFSET_TABLE_START + 4];
+        data[0..4].copy_from_slice(b"ANIM");
+        data[4] = 1; // scale
+        data[5] = 1; // ty: SD multi-entry container
+        data[6..8].copy_from_slice(&0u16.to_le_bytes()); // unknown
+        data[8..10].copy_from_slice(&num_layers.to_le_bytes());
+        data[10..12].copy_from_slice(&1u16.to_le_bytes()); // num_entries
+        data[0x0C..0x0C + 7].copy_from_slice(b"diffuse");
+        if teamcolor.is_some() {
+            data[0x0C + 32..0x0C + 32 + 9].copy_from_slice(b"teamcolor");
+        }
+
+        let entry_offset = data.len();
+        data[ENTRY_OFFSET_TABLE_START..ENTRY_OFFSET_TABLE_START + 4]
+            .copy_from_slice(&(entry_offset as u32).to_le_bytes());
+
+        let entry_header_pos = data.len();
+        data.extend_from_slice(&[0u8; 12]);
+
+        let layer_records_pos = data.len();
+        data.extend(std::iter::repeat_n(0u8, num_layers as usize * 12));
+
+        let frame_arr_offset = data.len();
+        data.extend_from_slice(&frame.texture_x.to_le_bytes());
+        data.extend_from_slice(&frame.texture_y.to_le_bytes());
+        data.extend_from_slice(&frame.offset_x.to_le_bytes());
+        data.extend_from_slice(&frame.offset_y.to_le_bytes());
+        data.extend_from_slice(&frame.width.to_le_bytes());
+        data.extend_from_slice(&frame.height.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // unknown
+
+        let diffuse_off = data.len();
+        data.extend_from_slice(diffuse);
+        let l0 = layer_records_pos;
+        data[l0..l0 + 4].copy_from_slice(&(diffuse_off as u32).to_le_bytes());
+        data[l0 + 4..l0 + 8].copy_from_slice(&(diffuse.len() as u32).to_le_bytes());
+        // The diffuse layer's declared width/height (l0+8..l0+12) are unused by the DDS decode
+        // path (its own DDS header carries the real dimensions), so they're left zeroed.
+
+        if let Some((bytes, width, height)) = teamcolor {
+            let tc_off = data.len();
+            data.extend_from_slice(bytes);
+            let l1 = layer_records_pos + 12;
+            data[l1..l1 + 4].copy_from_slice(&(tc_off as u32).to_le_bytes());
+            data[l1 + 4..l1 + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            // Unlike diffuse, the teamcolor mask isn't self-describing (no DDS header), so its
+            // declared width/height here are exactly what `parse_teamcolor_mask` slices by.
+            data[l1 + 8..l1 + 10].copy_from_slice(&width.to_le_bytes());
+            data[l1 + 10..l1 + 12].copy_from_slice(&height.to_le_bytes());
+        }
+
+        // Entry header: frame_count, ref_id sentinel (real entry), canvas (0, 0), frame array
+        // offset.
+        let h = entry_header_pos;
+        data[h..h + 2].copy_from_slice(&1u16.to_le_bytes());
+        data[h + 2..h + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        data[h + 4..h + 6].copy_from_slice(&0u16.to_le_bytes());
+        data[h + 6..h + 8].copy_from_slice(&0u16.to_le_bytes());
+        data[h + 8..h + 12].copy_from_slice(&(frame_arr_offset as u32).to_le_bytes());
+
+        data
+    }
+
     /// A one-group CV5 plus a one-frame `.dds.vr4` of a solid color.
     fn terrain_assets(color565: u16) -> (Vec<u8>, Vec<u8>) {
         let mut cv5 = Vec::with_capacity(52);
@@ -2256,6 +2384,124 @@ mod tests {
         assert_eq!(pixel(67, 68), blue, "one pixel below the sprite");
     }
 
+    /// An `ArtStyle::Original` render draws unit art out of a synthetic `mainSD.anim` bundle, the
+    /// same way [`end_to_end_placement_lands_on_the_expected_output_pixels`] proves it for HD2.
+    /// SD's frame table lives in its own texel space (see `broodmap_formats::mainsd`'s module
+    /// docs), but `MainSdAnim::entry`'s x4 normalization plus `frame_texel_rect`'s matching
+    /// divisor lands on exactly the same output footprint here (8 SD texels at `texel_scale ==
+    /// 1`) as HD2's 16 texels at `texel_scale == 2` -- so this reuses the very same expected
+    /// pixel coordinates.
+    #[test]
+    fn sd_render_draws_unit_art_from_the_bundled_mainsd_anim() {
+        let terrain = square_terrain(4);
+        let opts = RenderOptions {
+            art_style: ArtStyle::Original,
+            max_dimension: Some(128), // 4 tiles => 32 px/tile => zoom 1, SD's native size
+            ..Default::default()
+        };
+        let (tier, _, ppt) = resolve_tier(&opts, 4, 4);
+        assert_eq!(tier, AssetTier::Sd);
+        assert_eq!(ppt, 32, "this test relies on a 1:1 logical-to-output zoom");
+
+        let frame = AnimFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 0,
+            offset_y: 0,
+            width: 8,
+            height: 8,
+        };
+        let bundle = mainsd_bytes(&solid_bc1_dds(8, 8, 0xF800), None, frame);
+
+        let mut source = preview_source(AssetTier::Sd, 0x001F, synthetic_parts(5, 0, 0, 0, None));
+        source.insert(AssetRequest::MainSdAnim, bundle);
+
+        let units = [unit(5, Some(11), 64, 64)];
+        let image = render_preview(
+            &terrain,
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &source,
+            &opts,
+        )
+        .unwrap();
+
+        assert_eq!((image.width, image.height), (128, 128));
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let o = (y as usize * 128 + x as usize) * 4;
+            image.data[o..o + 4].try_into().unwrap()
+        };
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        // The 8x8 sprite is centred on (64, 64), covering x and y 60..=67.
+        assert_eq!(pixel(60, 60), red, "top-left corner of the sprite");
+        assert_eq!(pixel(64, 64), red);
+        assert_eq!(pixel(67, 67), red, "bottom-right corner of the sprite");
+        assert_eq!(pixel(59, 60), blue, "one pixel left of the sprite");
+        assert_eq!(pixel(60, 59), blue, "one pixel above the sprite");
+        assert_eq!(pixel(68, 67), blue, "one pixel right of the sprite");
+        assert_eq!(pixel(67, 68), blue, "one pixel below the sprite");
+    }
+
+    /// The SD `teamcolor` layer's non-DDS "BMP " mask (see [`parse_teamcolor_mask`]) actually
+    /// drives [`apply_team_color`] end to end: a fully white diffuse under a fully-masked
+    /// teamcolor layer must come out as the owner's exact color (mirroring
+    /// [`team_color_multiplies_only_where_the_mask_says_so`]'s "white * red == red" case, just
+    /// through the whole render pipeline instead of the function in isolation).
+    #[test]
+    fn sd_teamcolor_mask_tints_unit_art_with_the_owner_color() {
+        let terrain = square_terrain(4);
+        let opts = RenderOptions {
+            art_style: ArtStyle::Original,
+            max_dimension: Some(128),
+            // Player 0 is a real player slot; the default Melee filter would otherwise drop it
+            // (this test wants it drawn, not exercise melee filtering).
+            unit_filter: UnitFilter::AsPlaced,
+            ..Default::default()
+        };
+
+        let frame = AnimFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 0,
+            offset_y: 0,
+            width: 8,
+            height: 8,
+        };
+        let diffuse = solid_bc1_dds(8, 8, 0xFFFF); // solid white
+        let teamcolor = {
+            let mut payload = b"BMP ".to_vec();
+            payload.extend(std::iter::repeat_n(255u8, 8 * 8)); // fully masked
+            payload
+        };
+        let bundle = mainsd_bytes(&diffuse, Some((&teamcolor, 8, 8)), frame);
+
+        let mut source = preview_source(AssetTier::Sd, 0x001F, synthetic_parts(5, 0, 0, 0, None));
+        source.insert(AssetRequest::MainSdAnim, bundle);
+
+        let units = [unit(5, Some(0), 64, 64)];
+        let image = render_preview(
+            &terrain,
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &source,
+            &opts,
+        )
+        .unwrap();
+
+        let o = (64usize * 128 + 64) * 4;
+        assert_eq!(
+            &image.data[o..o + 4],
+            &[244, 4, 4, 255],
+            "fully-masked white diffuse should come out as player 0's exact color"
+        );
+    }
+
     #[test]
     fn missing_anim_skips_the_drawable_instead_of_failing() {
         let terrain = square_terrain(4);
@@ -2284,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_dats_error_only_when_the_unit_layer_needs_them() {
+    fn missing_dats_error_for_every_style_when_the_unit_layer_needs_them() {
         let terrain = square_terrain(4);
         let (cv5, dds_vr4) = terrain_assets(0x001F);
         let (_, sd_vr4) = terrain_assets(0x001F);
@@ -2325,28 +2571,28 @@ mod tests {
             "the unit layer can't proceed without the .dat tables"
         );
 
-        // The Original style skips unit art entirely, so the missing tables are only a warning
-        // and the start-location box falls back to its documented default.
+        // Original units now draw from `mainSD.anim`, resolved through the exact same `.dat`
+        // chain as any other style, so they're just as hard a dependency here. A start-location
+        // placement is itself a placed unit (non-empty `units`), so `needs_game_data` is true
+        // and the missing tables surface as the same load error, not a warning.
         let original = RenderOptions {
             art_style: ArtStyle::Original,
             max_dimension: Some(128),
             ..Default::default()
         };
-        let preview = render_preview_with_warnings(
-            &terrain,
-            Tileset::Jungle,
-            &[unit(UNIT_ID_START_LOCATION, Some(0), 64, 64)],
-            &[],
-            &PlayerColors::default(),
-            &source,
-            &original,
-        )
-        .unwrap();
-        assert_eq!(preview.warnings.len(), 1);
-        assert!(preview.warnings[0].contains("mainSD.anim"));
-        // The start-location block still drew, in player 0's red.
-        let o = (64usize * 128 + 64) * 4;
-        assert_eq!(&preview.image.data[o..o + 4], &[244, 4, 4, 255]);
+        assert!(
+            render_preview(
+                &terrain,
+                Tileset::Jungle,
+                &[unit(UNIT_ID_START_LOCATION, Some(0), 64, 64)],
+                &[],
+                &PlayerColors::default(),
+                &source,
+                &original,
+            )
+            .is_err(),
+            "Original units also need the .dat tables now that mainSD.anim is wired up"
+        );
     }
 
     #[test]
@@ -2652,16 +2898,25 @@ mod tests {
             1
         );
 
-        // An Original unit layer requests no art at all (mainSD.anim isn't supported yet).
+        // An Original unit layer dedupes every image (0, 176, and the start location's 588
+        // alike) down to the single bundled `mainSD.anim` request.
         let original = RenderOptions {
             unit_style: Some(ArtStyle::Original),
             ..opts
         };
-        assert!(required_preview_graphics(&units, &[], &data, 64, 64, &original).is_empty());
+        assert_eq!(
+            required_preview_graphics(&units, &[], &data, 64, 64, &original),
+            vec![AssetRequest::MainSdAnim]
+        );
     }
 
+    /// The `.dat`/`.rel` tables are now an unconditional part of round 1: every art style
+    /// (Original included, now that it draws from `mainSD.anim`) needs them to resolve
+    /// unit/sprite art, and even with `start_locations` set to [`StartLocations::Hidden`] or
+    /// [`StartLocations::Sprite`] (no `ColorBlock` token to size), the tables are still pulled in
+    /// on the chance the map places any units/sprites at all.
     #[test]
-    fn required_preview_assets_includes_the_tables_unless_nothing_could_use_them() {
+    fn required_preview_assets_always_includes_the_tables() {
         let opts = RenderOptions {
             art_style: ArtStyle::Remastered,
             max_dimension: Some(1024),
@@ -2671,25 +2926,25 @@ mod tests {
         assert_eq!(assets.len(), 7, "2 terrain + 4 dats + images.rel");
         assert!(assets.contains(&AssetRequest::ImagesRel));
 
-        // Original units with start locations hidden/sprite-drawn: nothing in the render could
-        // possibly touch the tables (no unit art, no ColorBlock token to size), so round 1 is
-        // terrain-only.
+        // Previously-omitted case: Original units with start locations hidden/sprite-drawn (no
+        // ColorBlock token to size). The tables are still included now — an SD unit layer needs
+        // them exactly like every other style.
         for no_color_block in [StartLocations::Hidden, StartLocations::Sprite] {
-            let original_no_tables = RenderOptions {
+            let original = RenderOptions {
                 unit_style: Some(ArtStyle::Original),
                 start_locations: no_color_block,
                 ..opts.clone()
             };
             assert_eq!(
-                crate::required_preview_assets(Tileset::Jungle, 64, 64, &original_no_tables),
-                crate::required_terrain_assets(Tileset::Jungle, 64, 64, &original_no_tables),
+                crate::required_preview_assets(Tileset::Jungle, 64, 64, &original).len(),
+                7,
                 "{no_color_block:?}"
             );
         }
 
-        // Original units but the *default* ColorBlock start locations: the tables are still
-        // needed, just to size the token from units.dat's placebox, even with no unit art at
-        // all.
+        // Original units with the *default* ColorBlock start locations: also included, for the
+        // same reason as before (sizing the token from units.dat's placebox) plus the new one
+        // (resolving unit/sprite art).
         let original_colorblock = RenderOptions {
             unit_style: Some(ArtStyle::Original),
             ..opts
@@ -2697,7 +2952,6 @@ mod tests {
         assert_eq!(
             crate::required_preview_assets(Tileset::Jungle, 64, 64, &original_colorblock).len(),
             7,
-            "ColorBlock alone must still pull in the tables"
         );
     }
 

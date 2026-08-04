@@ -54,8 +54,8 @@ pub struct RenderOptions {
     /// Render the unit/sprite layer in a different style than the terrain (e.g. Cartooned
     /// terrain with Remastered units). `None` (the default) uses `art_style` for both.
     ///
-    /// [`ArtStyle::Original`] units need `mainSD.anim`, which isn't implemented yet: unit and
-    /// sprite art is skipped (not an error) when this resolves to `Original`.
+    /// [`ArtStyle::Original`] units are fully supported: they're drawn from `mainSD.anim`, SC:R's
+    /// bundled SD art container.
     pub unit_style: Option<ArtStyle>,
     /// Target maximum output dimension in pixels. `None` renders at the native resolution of
     /// the chosen tier (`map dimension in tiles * tier.tile_px()`), subject to
@@ -117,13 +117,6 @@ impl RenderOptions {
     /// [`Self::art_style`].
     pub fn effective_unit_style(&self) -> ArtStyle {
         self.unit_style.unwrap_or(self.art_style)
-    }
-
-    /// Whether any unit/sprite `.anim` art will be drawn at all. `false` when the unit layer
-    /// resolves to [`ArtStyle::Original`] (SD art needs `mainSD.anim`, a later phase), in which
-    /// case the preview renders terrain plus start-location color blocks only.
-    pub(crate) fn unit_art_available(&self) -> bool {
-        self.effective_unit_style() != ArtStyle::Original
     }
 }
 
@@ -221,19 +214,14 @@ pub(crate) fn resolve_unit_tier(options: &RenderOptions, px_per_tile: u32) -> (A
 /// required to resolve placed units and THG2 sprites to image IDs.
 ///
 /// This is the first half of the two-round prefetch API (see `docs/render-design.md`, "Prefetch
-/// support"): which `.anim` files a map needs can only be known *after* these tables are loaded
-/// and the CHK's units are resolved through them, which is what
+/// support"): which `.anim`/`mainSD.anim` art a map needs can only be known *after* these tables
+/// are loaded and the CHK's units are resolved through them, which is what
 /// [`crate::required_preview_graphics`] does.
 ///
-/// The tables are included whenever *anything* the render does might read them: either the unit
-/// layer needs them to resolve unit/sprite art (`RenderOptions::unit_art_available`), or
-/// `start_locations` is [`StartLocations::ColorBlock`] — even with unit art unavailable
-/// ([`ArtStyle::Original`]), the render still best-effort-loads `units.dat` to size the
-/// color-block token from its placebox (falling back to a documented constant if that load
-/// fails, so this is never a hard requirement, just an undeclared read if omitted from round 1).
-/// They're omitted only when neither is true — i.e. [`ArtStyle::Original`] units with
-/// `start_locations` set to [`StartLocations::Sprite`] or [`StartLocations::Hidden`], where
-/// nothing in the render could possibly touch them.
+/// The tables are always included: every unit layer (Original included, now that it draws from
+/// `mainSD.anim`) needs them to resolve unit/sprite art, and even a render with no units/sprites
+/// at all still uses `units.dat` to size the [`StartLocations::ColorBlock`] token from its
+/// placebox when that's the active start-location mode — which is the default.
 pub fn required_preview_assets(
     tileset: Tileset,
     map_w: u32,
@@ -241,15 +229,13 @@ pub fn required_preview_assets(
     options: &RenderOptions,
 ) -> Vec<AssetRequest> {
     let mut assets = required_terrain_assets(tileset, map_w, map_h, options);
-    if options.unit_art_available() || options.start_locations == StartLocations::ColorBlock {
-        assets.extend([
-            AssetRequest::Dat(DatKind::Units),
-            AssetRequest::Dat(DatKind::Flingy),
-            AssetRequest::Dat(DatKind::Sprites),
-            AssetRequest::Dat(DatKind::Images),
-            AssetRequest::ImagesRel,
-        ]);
-    }
+    assets.extend([
+        AssetRequest::Dat(DatKind::Units),
+        AssetRequest::Dat(DatKind::Flingy),
+        AssetRequest::Dat(DatKind::Sprites),
+        AssetRequest::Dat(DatKind::Images),
+        AssetRequest::ImagesRel,
+    ]);
     assets
 }
 

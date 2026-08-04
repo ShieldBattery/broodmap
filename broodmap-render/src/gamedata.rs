@@ -55,13 +55,21 @@ const SPECIAL_ABILITY_FLAG_BUILDING: u32 = 0x0000_0001;
 /// to gate the shadow-image heuristic.
 const RENDER_STYLE_SHADOW: u8 = 10;
 
-/// Builds the [`AssetRequest::Anim`] for an image, applying the Carbot start-location quirk.
+/// Builds the [`AssetRequest`] for an image's art at a given tier/pack, applying the Carbot
+/// start-location quirk.
+///
+/// [`AssetTier::Sd`] always resolves to [`AssetRequest::MainSdAnim`] — the single bundled
+/// `SD/mainSD.anim` container every SD image's art lives in — regardless of `image_id`/`pack`
+/// (checked before the Carbot fallback below, which only concerns HD-family paths).
 ///
 /// The Cartooned art pack ships no `main_588.anim`, so the game falls back to the standard
 /// pack's start-location graphic there; requesting the Carbot path would just 404. Applying the
 /// fallback here (at request-construction time) keeps prefetch lists and render-time reads in
 /// agreement.
 pub(crate) fn anim_request(image_id: u16, tier: AssetTier, pack: ArtPack) -> AssetRequest {
+    if tier == AssetTier::Sd {
+        return AssetRequest::MainSdAnim;
+    }
     let pack = if image_id == IMAGE_ID_START_LOCATION {
         ArtPack::Standard
     } else {

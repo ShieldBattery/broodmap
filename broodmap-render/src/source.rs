@@ -57,13 +57,21 @@ pub enum AssetRequest {
     /// A single image's `.anim` art container at a given tier/pack.
     ///
     /// [`AssetTier::Sd`] doesn't have per-image files at all: all SD art lives in one bundled
-    /// `SD/mainSD.anim`, so every SD request maps to that same path (and `image_id`/`pack` are
-    /// only meaningful for indexing *into* it, which is a later phase).
+    /// `SD/mainSD.anim`, so the renderer never issues an SD request through this variant — it
+    /// uses [`AssetRequest::MainSdAnim`] instead. The `Sd` -> `"SD/mainSD.anim"` path mapping
+    /// stays on [`Self::casc_path`] for compatibility (a caller matching on `tier` alone still
+    /// gets the right path).
     Anim {
         image_id: u16,
         tier: AssetTier,
         pack: ArtPack,
     },
+    /// The single bundled SD art container (`SD/mainSD.anim`): every image's SD art lives in
+    /// this one file, looked up by image id (see [`broodmap_formats::MainSdAnim::entry`]). Unlike
+    /// [`AssetRequest::Anim`], there's no per-image or per-pack variation to key on — SD has no
+    /// art packs, and the image id only indexes *into* this one file rather than selecting a
+    /// path.
+    MainSdAnim,
 }
 
 impl std::hash::Hash for AssetRequest {
@@ -95,6 +103,9 @@ impl std::hash::Hash for AssetRequest {
                 image_id.hash(state);
                 tier.hash(state);
                 pack.hash(state);
+            }
+            AssetRequest::MainSdAnim => {
+                5u8.hash(state);
             }
         }
     }
@@ -137,6 +148,7 @@ impl AssetRequest {
                     image_id
                 ),
             },
+            AssetRequest::MainSdAnim => "SD/mainSD.anim".to_string(),
         }
     }
 }
@@ -385,9 +397,12 @@ mod tests {
             anim(955, AssetTier::Hd2, ArtPack::Carbot),
             "HD2/anim/Carbot/main_955.anim"
         );
-        // SD art is one bundled file, regardless of image ID or pack.
+        // SD art is one bundled file, regardless of image ID or pack. The renderer requests it
+        // via `AssetRequest::MainSdAnim` rather than `Anim { tier: Sd, .. }`, but the `Anim`
+        // path mapping is kept for compatibility.
         assert_eq!(anim(5, AssetTier::Sd, ArtPack::Standard), "SD/mainSD.anim");
         assert_eq!(anim(900, AssetTier::Sd, ArtPack::Carbot), "SD/mainSD.anim");
+        assert_eq!(AssetRequest::MainSdAnim.casc_path(), "SD/mainSD.anim");
 
         assert_eq!(
             AssetRequest::Dat(DatKind::Units).casc_path(),
@@ -443,6 +458,7 @@ mod tests {
                 tier: AssetTier::Hd2,
                 pack: ArtPack::Carbot,
             },
+            AssetRequest::MainSdAnim,
         ];
 
         let set: HashSet<&AssetRequest> = requests.iter().collect();

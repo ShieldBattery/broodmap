@@ -98,9 +98,9 @@ unit/sprite side of Original, `mainSD.anim`, remains phase 3).
 
 Units/sprites: placed unit / THG2 sprite ID -> units.dat -> flingy.dat -> sprites.dat ->
 images.dat -> image ID -> `.rel` redirection -> anim. HD/HD2: one `.anim` per image ID. SD: a
-single bundled `mainSD.anim` with per-entry offsets and shared atlas textures — a different
-container, same building blocks; this is new work (neobrood explicitly doesn't support it) and
-its own parser module. Player color uses the anim `teamcolor` mask layer composited with a
+single bundled `mainSD.anim` with a per-image entry directory — a different container, same
+building blocks (parsed by `broodmap-formats/src/mainsd.rs`, phase 3; neobrood explicitly
+doesn't support it). Player color uses the anim `teamcolor` mask layer composited with a
 player color, replacing classic palette remapping.
 
 Phase-2 facts pinned from neobrood + a real install (full specs live in the
@@ -117,9 +117,24 @@ Phase-2 facts pinned from neobrood + a real install (full specs live in the
 - .anim container: 12 B header (magic ANIM, u8 scale, u8 type 1=SD/2=HD, layer/entry counts),
   fixed-size name table to 0x14C, frame-table header (count, ref_id, canvas w/h, table
   offset), per-layer 12 B texture records (absolute offset/size + dims, offset 0 = absent,
-  payloads are embedded DDS/PNG — sniff), per-frame 12 B records. All frame coords are in
-  fixed "4K" units (1 logical px = 4 units); embedded texels = 4K units / (4 / scale). Layers
-  share one frame table. `ref_id != 0xFFFF` = inline reference (rare; unsupported for now).
+  payloads are embedded DDS/PNG — sniff), per-frame 12 B records. HD/HD2 frame coords are in
+  fixed "4K" units (1 logical px = 4 units); embedded texels = 4K units / (4 / scale) — HD and
+  HD2 literally share one byte-identical frame table authored in HD texels. Layers share one
+  frame table. `ref_id != 0xFFFF` = inline reference (unsupported in the HD parser; the SD
+  container is where references actually occur).
+- `mainSD.anim` (phase 3, pinned empirically — full spec in `broodmap-formats/src/mainsd.rs`):
+  same header/name region, but 0x14C holds a per-image entry offset directory (999 u32s, one
+  per images.dat row) instead of a frame-table header. Real entries (868) carry HD-shaped
+  layer records + frames; reference entries (131) are 12 bytes total — no layer records, no
+  frames, everything from the (one-hop, verified chain-free) target. The refs duplicate
+  `images.rel`'s 0x200 redirects exactly (131/131 agreement), so the rel-then-lookup flow
+  needs no SD special case. Diffuse payloads are plain DDS (DXT1/DXT5); `teamcolor` is NOT
+  DDS but a `"BMP "`-magic raw binary stencil (w*h bytes, each 0/255). Crucially the SD frame
+  table is separately authored in the file's own SD texel space (divisor 1, not 4K units —
+  verified via DXT content bounding boxes and atlas coverage); the parser normalizes entries
+  x4 into canonical 4K units so consumers treat them exactly like any other `Anim`. Canvas is
+  0x0 for all 999 entries — the `effective_canvas` per-frame fallback (below) is the rule for
+  SD, not the exception.
 - Teamcolor compositing, pinned empirically in phase 2 (no reference implementation exists):
   the mask is the teamcolor layer's RED/grayscale channel, not alpha — all 155 teamcolor
   layers in the HD2 corpus are BC1 (no meaningful alpha; every diffuse layer is BC3). Blend is
@@ -191,6 +206,18 @@ verification lives on as `GameData::tests::shadow_plus_one_convention_holds_broa
 `GameData::tests::geyser_shadow_resolves_to_the_real_plus_two_image` (both gated on
 `BROODMAP_TEST_SCR_DIR`, like the rest of the real-install suite).
 
+*Possible upgrade discovered during the phase-3 `mainSD.anim` reversing (not yet implemented):*
+`images.rel`'s `rel_type == 8` records turn out to map every shadow image to its parent unit
+image — the set of type-8 records is exactly the set of `render_style == 10` images (230 = 230,
+verified on a real install), and the parent-to-shadow deltas they encode run past `+1` (172x +1,
+27x +2, 9x +3, plus +4/+10/+14 stragglers). Inverting that table would give an exact,
+data-driven parent -> shadow mapping with no heuristic at all: it would cover the buildings and
+turret-bearing units the `+1` convention misses, and retire both the `render_style` gate and the
+geyser's hardcoded `+2` (whose rel record — image 346, `rel_type 8`, `ref_image 344` — already
+encodes precisely what the special case hardcodes). Worth doing as its own change: it touches
+the calibrated shadow path, so it needs the usual visual verification pass, and a decision about
+parents with multiple shadow records.
+
 Art style is the only user-facing quality knob: `ArtStyle { Original, Remastered, Cartooned }`.
 The SD art is genuinely different art from the HD art (HD2 is the same art as HD at half
 resolution), and Cartooned (the "StarCraft: Cartooned" / Carbot pack, CASC paths with a
@@ -218,7 +245,8 @@ pub enum AssetRequest {
   Dat(DatKind),                 // units, sprites, flingy, images
   ImagesTbl,
   ImagesRel,
-  Anim(u16, AssetTier),         // image ID; SD maps to the single mainSD.anim
+  Anim(u16, AssetTier),         // image ID (HD/HD2 per-image files)
+  MainSdAnim,                   // the single bundled SD art container
   // ...
 }
 
@@ -310,8 +338,9 @@ previews keep them).
   all drawing normalizes through draw-time scaling: each tier's art has a fixed scale
   multiplier (SD 1x, HD2 2x, HD 4x; 1 tile = 32 logical px), so a layer's frames — and its
   anim frame offsets, which are authored in the same tier pixels — scale by
-  `output_zoom / layer_scale`. `Original` units require `mainSD.anim` and stay unavailable
-  until phase 3.
+  `output_zoom / layer_scale`. `Original` units draw from `mainSD.anim` (phase 3): the
+  renderer fetches/parses the bundle once per render (`AssetRequest::MainSdAnim`) and looks
+  entries up per image, instead of one `.anim` fetch per image.
 - `max_output_pixels` (default 64Mi px = 256 MiB RGBA): a hard output-buffer budget. The
   resolution is clamped down (before tier selection, so budget-shrunk renders also fetch the
   cheaper tier) rather than errored, so rendering always succeeds within bounded memory.
@@ -458,7 +487,12 @@ render plan computes up front; the executor walks it bandwise).
 - Exact CASC layouts to confirm in phase 1: tier path prefixes, HD anim filename scheme. (VX4/
   VX4EX/VR4/WPE parsers are needed after all — but only by the dev-time minimap table
   generator, not at render time.)
-- SD `mainSD.anim` container details — reverse from community docs + real data in phase 3.
+- ~~SD `mainSD.anim` container details~~ — resolved: reversed from real data (Animosity's
+  parser as a cross-reference) and verified across all 999 entries / 22,735 frames; full spec
+  and the empirical evidence live in `broodmap-formats/src/mainsd.rs`'s module docs, and the
+  headline facts (entry directory, 12-byte reference entries, `"BMP "` teamcolor stencils,
+  SD-texel — not 4K-unit — frame coordinates) are summarized in the phase-2/3 facts list
+  above.
 - ~~Downscaling quality~~ — resolved: see the "Terrain downscaling" section for the shipped
   pipeline (native-resolution strip compositing, linear-light Catmull-Rom resampling), the
   measurements behind the kernel choice, and the record of the texture-breakup experiment that

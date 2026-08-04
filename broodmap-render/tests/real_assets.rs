@@ -10,8 +10,9 @@
 #![cfg(feature = "casc")]
 
 use broodmap::extract_chk_from_map;
+use broodmap_formats::MainSdAnim;
 use broodmap_render::{
-    ArtStyle, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
+    ArtStyle, AssetRequest, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
     render_chk_preview, render_terrain, required_preview_assets, required_preview_assets_for_chk,
     required_preview_graphics, required_preview_graphics_for_chk, required_terrain_assets,
 };
@@ -312,8 +313,8 @@ fn chk_prefetch_wrappers_match_the_manual_calls_and_exist_in_real_install() {
     }
 }
 
-/// Mixing styles across layers must actually change the pixels, and the `Original` unit layer
-/// must degrade to a warning rather than an error.
+/// Mixing styles across layers must actually change the pixels, and `Original` units now render
+/// for real (drawn from `mainSD.anim`) rather than degrading to a warning.
 #[test]
 fn unit_style_can_differ_from_the_terrain_style() {
     let Some(source) = scr_source() else {
@@ -341,13 +342,73 @@ fn unit_style_can_differ_from_the_terrain_style() {
         "Remastered units over Cartooned terrain must look different from all-Cartooned"
     );
 
-    // `Original` units aren't implemented yet: warn and skip the art, don't fail.
+    // `Original` units are fully supported now: they render (from `mainSD.anim`), no warning.
     let original_units = RenderOptions {
         unit_style: Some(ArtStyle::Original),
         ..cartooned
     };
-    let preview =
-        render_chk_preview(&chk, &source, &original_units).expect("original-unit preview");
-    assert_eq!(preview.warnings.len(), 1, "{:?}", preview.warnings);
-    assert!(preview.warnings[0].contains("mainSD.anim"));
+    let original = render_chk_preview(&chk, &source, &original_units).expect("SD-unit preview");
+    assert!(original.warnings.is_empty(), "{:?}", original.warnings);
+    assert_ne!(
+        pure.image.data, original.image.data,
+        "SD units over Cartooned terrain must actually draw different art"
+    );
+}
+
+/// A full `ArtStyle::Original` render must actually composite SD unit/sprite art (drawn from
+/// `mainSD.anim`) over the terrain, not just render terrain -- and it must do so without
+/// warnings, now that the `.dat`/`.rel` tables are a hard (and, for a real install, always
+/// satisfiable) dependency for every style.
+///
+/// Also probes `mainSD.anim` directly through the public API as a cheap, high-value regression
+/// anchor: image 344 (the vespene geyser's main art) should have one frame per tileset (8), and
+/// image 345 (its same-GRP `+1` variant -- see `GameData::shadow_image_pre_redirect`'s docs)
+/// should resolve via the container's own inline reference entry, mirroring `images.rel`'s
+/// redirect for the same pair (verified 131/131 agreement against real data -- see
+/// `broodmap_formats::mainsd`'s module docs).
+#[test]
+fn original_style_renders_sd_units() {
+    let Some(source) = scr_source() else {
+        eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+        return;
+    };
+
+    let map_bytes = lost_temple_bytes();
+    let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None).expect("lt.scm should parse");
+    let terrain = chk.terrain().expect("lt.scm should have terrain");
+
+    let options = RenderOptions {
+        art_style: ArtStyle::Original,
+        max_dimension: Some(512),
+        ..Default::default()
+    };
+
+    let preview = render_chk_preview(&chk, &source, &options).expect("SD preview render");
+    assert!(preview.warnings.is_empty(), "{:?}", preview.warnings);
+
+    let terrain_only =
+        render_terrain(terrain, chk.tileset(), &source, &options).expect("SD terrain render");
+    assert_eq!(
+        (terrain_only.width, terrain_only.height),
+        (preview.image.width, preview.image.height)
+    );
+    assert_ne!(
+        terrain_only.data, preview.image.data,
+        "SD unit/sprite art must actually be composited over the terrain"
+    );
+
+    let bundle_bytes = source
+        .read(&AssetRequest::MainSdAnim)
+        .expect("mainSD.anim should be readable from a real install");
+    let bundle = MainSdAnim::parse(&bundle_bytes).expect("mainSD.anim should parse");
+    let geyser_main = bundle.entry(344).expect("image 344 should resolve");
+    assert_eq!(
+        geyser_main.frame_count(),
+        8,
+        "the geyser has one art frame per tileset"
+    );
+    assert!(
+        bundle.entry(345).is_ok(),
+        "image 345 (the geyser's +1 variant) should resolve via the container's own reference"
+    );
 }
