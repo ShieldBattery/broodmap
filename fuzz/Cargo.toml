@@ -13,6 +13,13 @@ libfuzzer-sys = "0.4"
 [dependencies.broodmap]
 path = "../broodmap"
 
+[dependencies.broodmap-formats]
+path = "../broodmap-formats"
+
+[dependencies.broodmap-render]
+path = "../broodmap-render"
+default-features = false
+
 [[bin]]
 name = "chk_parse"
 path = "fuzz_targets/chk_parse.rs"
@@ -30,6 +37,20 @@ bench = false
 [[bin]]
 name = "full_pipeline"
 path = "fuzz_targets/full_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "formats_parse"
+path = "fuzz_targets/formats_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_terrain"
+path = "fuzz_targets/render_terrain.rs"
 test = false
 doc = false
 bench = false
