@@ -4,4 +4,5 @@ resolver = "3"
 members = [
     "broodmap",
     "broodmap-cli",
+    "broodmap-formats",
 ]

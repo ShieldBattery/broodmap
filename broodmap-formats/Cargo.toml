@@ -1,0 +1,14 @@
+[package]
+name = "broodmap-formats"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+description = "Parsers for StarCraft: Remastered asset file formats (CV5, VF4, dds.vr4, DDS, ...)"
+
+[dependencies]
+bitflags = "2.13"
+thiserror = "2.0"
+
+[dev-dependencies]
+assert_ok = "1.0"
