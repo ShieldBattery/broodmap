@@ -1,16 +1,19 @@
 //! Parser for SC:R's HD `.anim` container format (zero-copy).
 //!
 //! Only the HD single-entry layout (`ty == 2`, `num_entries == 1`, no inline reference) is
-//! supported; SD's single-file layout and inline-reference entries are structurally different and
-//! return [`AnimError::Unsupported`] for now.
+//! supported; SD's multi-entry `mainSD.anim` container is structurally different (a table of many
+//! entries, some of them inline references) and is handled separately by [`crate::mainsd`] — see
+//! that module for its parser (`MainSdAnim`) and its own coordinate-space notes.
 //!
 //! # Coordinate space
 //!
 //! All frame-table coordinates and the header's canvas width/height are in fixed **"4K" units**,
-//! where 1 logical BW pixel = 4 units, *regardless of this file's tier*. The embedded layer
-//! textures, however, are at this file's own `scale` (texels per... see below), so converting a
-//! frame's 4K-unit rect into texel coordinates of the embedded textures requires dividing by
-//! `4 / scale`:
+//! where 1 logical BW pixel = 4 units, *regardless of this file's tier* — this claim is about
+//! HD/HD2 `.anim` files specifically. (`mainSD.anim`'s frame tables are authored in SD's own texel
+//! space instead; see [`crate::mainsd`] for why and how it normalizes back into this same 4K-unit
+//! space.) The embedded layer textures, however, are at this file's own `scale` (texels per...
+//! see below), so converting a frame's 4K-unit rect into texel coordinates of the embedded
+//! textures requires dividing by `4 / scale`:
 //!
 //! - `scale == 4` (HD): divisor 1 (1:1, no scaling)
 //! - `scale == 2` (HD2): divisor 2
@@ -24,13 +27,14 @@
 use thiserror::Error;
 
 /// Byte size of the fixed file header (magic, scale, ty, unknown, num_layers, num_entries).
-const HEADER_SIZE: usize = 12;
-/// Absolute offset where the (fixed-size) layer-name region begins.
-const LAYER_NAME_REGION_START: usize = 0x0C;
+pub(crate) const HEADER_SIZE: usize = 12;
+/// Absolute offset where the (fixed-size) layer-name region begins. Shared with `mainSD.anim`,
+/// whose layer-name region is byte-identical (see [`crate::mainsd`]).
+pub(crate) const LAYER_NAME_REGION_START: usize = 0x0C;
 /// Byte size of each layer-name slot (a NUL-padded name).
-const LAYER_NAME_SLOT_SIZE: usize = 32;
+pub(crate) const LAYER_NAME_SLOT_SIZE: usize = 32;
 /// Number of layer-name slots physically present in the file, regardless of `num_layers`.
-const LAYER_NAME_SLOTS: usize = 10;
+pub(crate) const LAYER_NAME_SLOTS: usize = 10;
 /// Absolute offset where the frame-table header begins. Fixed regardless of `num_layers` — the
 /// layer-name region always occupies exactly this much space.
 const FRAME_TABLE_HEADER_OFFSET: usize = 0x14C;
@@ -38,11 +42,13 @@ const FRAME_TABLE_HEADER_OFFSET: usize = 0x14C;
 const FRAME_TABLE_HEADER_SIZE: usize = 12;
 /// Absolute offset where the per-layer texture records begin.
 const LAYER_RECORDS_OFFSET: usize = 0x158;
-/// Byte size of a single layer texture record (offset, size, width, height).
-const LAYER_RECORD_SIZE: usize = 12;
+/// Byte size of a single layer texture record (offset, size, width, height). Shared with
+/// `mainSD.anim`'s per-entry layer records, which use the identical 12-byte layout.
+pub(crate) const LAYER_RECORD_SIZE: usize = 12;
 /// Byte size of a single frame-table entry (texture_x, texture_y, offset_x, offset_y, width,
-/// height, unknown).
-const FRAME_RECORD_SIZE: usize = 16;
+/// height, unknown). Shared with `mainSD.anim`'s frame records, which use the identical 16-byte
+/// layout (only the coordinate-space interpretation differs — see [`crate::mainsd`]).
+pub(crate) const FRAME_RECORD_SIZE: usize = 16;
 
 /// Sane upper bound on `num_layers`. Untrusted input; real files have a small handful of layers
 /// (diffuse, teamcolor, ...). Layers beyond this are simply not parsed, rather than driving an
@@ -51,12 +57,13 @@ const MAX_LAYERS: usize = 0x200;
 /// Upper bound on how many frame slots we'll preallocate based on the file's declared
 /// `frame_count`. The count is untrusted input; more frames than this simply grow the `Vec`
 /// normally as they're parsed (bounds-checked against the input regardless).
-const MAX_PREALLOC_FRAMES: usize = 8192;
+pub(crate) const MAX_PREALLOC_FRAMES: usize = 8192;
 
 /// Container type byte. Only HD is supported.
 const TYPE_HD: u8 = 2;
-/// Sentinel `ref_id` meaning "this is a real frame table, not an inline reference".
-const NO_REF_ID: u16 = 0xFFFF;
+/// Sentinel `ref_id` meaning "this is a real frame table, not an inline reference". Shared with
+/// `mainSD.anim`'s entry headers, which use the identical sentinel (see [`crate::mainsd`]).
+pub(crate) const NO_REF_ID: u16 = 0xFFFF;
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]
 pub enum AnimError {
@@ -66,6 +73,127 @@ pub enum AnimError {
     BadMagic,
     #[error("Unsupported ANIM container: {0}")]
     Unsupported(&'static str),
+    #[error("invalid mainSD.anim entry: {0}")]
+    InvalidEntry(&'static str),
+}
+
+/// Parses the fixed 10-slot layer-name region (see the module docs), returning
+/// `num_layers.min(MAX_LAYERS)` names — the first `num_layers.min(LAYER_NAME_SLOTS)` read from
+/// their NUL-padded slots, the rest (if `num_layers` exceeds the physical slot count) synthesized
+/// as `Layer{i}`. Shared by HD [`Anim::parse`] and `mainSD.anim`'s [`crate::mainsd::MainSdAnim`],
+/// whose layer-name regions are byte-identical.
+pub(crate) fn parse_layer_names(data: &[u8], num_layers: usize) -> Vec<String> {
+    let total_layers = num_layers.min(MAX_LAYERS);
+    let named_layers = num_layers.min(LAYER_NAME_SLOTS);
+
+    let mut layer_names: Vec<String> = Vec::with_capacity(total_layers);
+    for i in 0..named_layers {
+        let start = LAYER_NAME_REGION_START + i * LAYER_NAME_SLOT_SIZE;
+        let name = if start < data.len() {
+            let end = (start + LAYER_NAME_SLOT_SIZE).min(data.len());
+            let raw = &data[start..end];
+            let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..nul_pos]).into_owned()
+        } else {
+            String::new()
+        };
+        layer_names.push(name);
+    }
+    for i in named_layers..total_layers {
+        layer_names.push(format!("Layer{i}"));
+    }
+    layer_names
+}
+
+/// Parses `names.len()` consecutive 12-byte layer texture records starting at `records_offset`,
+/// returning one [`AnimLayer`] per record whose offset is nonzero and whose payload fits within
+/// `data`; absent (offset 0) or out-of-bounds records are silently skipped rather than erroring.
+/// Shared by HD [`Anim::parse`] (fixed `records_offset`) and `mainSD.anim`'s
+/// [`crate::mainsd::MainSdAnim`] (`records_offset` relative to each entry), whose layer-record
+/// layout is byte-identical.
+pub(crate) fn parse_layer_records<'a>(
+    data: &'a [u8],
+    records_offset: usize,
+    names: Vec<String>,
+) -> Vec<AnimLayer<'a>> {
+    let mut layers = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        let Some(rec_start) = i
+            .checked_mul(LAYER_RECORD_SIZE)
+            .and_then(|o| records_offset.checked_add(o))
+        else {
+            continue;
+        };
+        let Some(rec_end) = rec_start.checked_add(LAYER_RECORD_SIZE) else {
+            continue;
+        };
+        if rec_end > data.len() {
+            continue;
+        }
+        let rec = &data[rec_start..rec_end];
+        let offset = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as usize;
+        let tex_width = u16::from_le_bytes(rec[8..10].try_into().unwrap());
+        let tex_height = u16::from_le_bytes(rec[10..12].try_into().unwrap());
+
+        if offset == 0 {
+            // Layer absent.
+            continue;
+        }
+        let Some(payload_end) = offset.checked_add(size) else {
+            continue;
+        };
+        if payload_end > data.len() {
+            continue;
+        }
+
+        layers.push(AnimLayer {
+            name,
+            data: &data[offset..payload_end],
+            width: tex_width,
+            height: tex_height,
+        });
+    }
+    layers
+}
+
+/// Parses up to `count` consecutive 16-byte frame records starting at `offset`, stopping early
+/// (keeping whatever was parsed so far) if reading the next record would run past `data`'s end —
+/// truncated input yields a truncated, not panicking, frame list. Preallocation is capped by
+/// [`MAX_PREALLOC_FRAMES`] regardless of `count`, so an untrusted declared count can't drive an
+/// unbounded allocation. Shared by HD [`Anim::parse`] and `mainSD.anim`'s
+/// [`crate::mainsd::MainSdAnim`], whose frame-record layout is byte-identical (only the
+/// coordinate-space *interpretation* differs — see [`crate::mainsd`]'s module docs).
+pub(crate) fn parse_frame_records(data: &[u8], offset: usize, count: usize) -> Vec<AnimFrame> {
+    let mut frames = Vec::with_capacity(count.min(MAX_PREALLOC_FRAMES));
+    let mut offset = offset;
+    for _ in 0..count {
+        let Some(end) = offset.checked_add(FRAME_RECORD_SIZE) else {
+            break;
+        };
+        if end > data.len() {
+            break;
+        }
+        let rec = &data[offset..end];
+        let texture_x = u16::from_le_bytes(rec[0..2].try_into().unwrap());
+        let texture_y = u16::from_le_bytes(rec[2..4].try_into().unwrap());
+        let offset_x = i16::from_le_bytes(rec[4..6].try_into().unwrap());
+        let offset_y = i16::from_le_bytes(rec[6..8].try_into().unwrap());
+        let frame_width = u16::from_le_bytes(rec[8..10].try_into().unwrap());
+        let frame_height = u16::from_le_bytes(rec[10..12].try_into().unwrap());
+        // rec[12..16] is an unknown u32, skipped.
+
+        frames.push(AnimFrame {
+            texture_x,
+            texture_y,
+            offset_x,
+            offset_y,
+            width: frame_width,
+            height: frame_height,
+        });
+        offset = end;
+    }
+    frames
 }
 
 /// One layer of a parsed `.anim` (e.g. "diffuse", "teamcolor"). Its `data` is the raw embedded
@@ -128,25 +256,7 @@ impl<'a> Anim<'a> {
             ));
         }
 
-        let total_layers = num_layers.min(MAX_LAYERS);
-        let named_layers = num_layers.min(LAYER_NAME_SLOTS);
-
-        let mut layer_names: Vec<String> = Vec::with_capacity(total_layers);
-        for i in 0..named_layers {
-            let start = LAYER_NAME_REGION_START + i * LAYER_NAME_SLOT_SIZE;
-            let name = if start < data.len() {
-                let end = (start + LAYER_NAME_SLOT_SIZE).min(data.len());
-                let raw = &data[start..end];
-                let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-                String::from_utf8_lossy(&raw[..nul_pos]).into_owned()
-            } else {
-                String::new()
-            };
-            layer_names.push(name);
-        }
-        for i in named_layers..total_layers {
-            layer_names.push(format!("Layer{i}"));
-        }
+        let layer_names = parse_layer_names(data, num_layers);
 
         if data.len() < FRAME_TABLE_HEADER_OFFSET + FRAME_TABLE_HEADER_SIZE {
             return Err(AnimError::TooShort);
@@ -165,68 +275,8 @@ impl<'a> Anim<'a> {
             ));
         }
 
-        let mut layers = Vec::with_capacity(total_layers);
-        for (i, name) in layer_names.into_iter().enumerate() {
-            let rec_start = LAYER_RECORDS_OFFSET + i * LAYER_RECORD_SIZE;
-            let Some(rec_end) = rec_start.checked_add(LAYER_RECORD_SIZE) else {
-                continue;
-            };
-            if rec_end > data.len() {
-                continue;
-            }
-            let rec = &data[rec_start..rec_end];
-            let offset = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as usize;
-            let size = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as usize;
-            let tex_width = u16::from_le_bytes(rec[8..10].try_into().unwrap());
-            let tex_height = u16::from_le_bytes(rec[10..12].try_into().unwrap());
-
-            if offset == 0 {
-                // Layer absent.
-                continue;
-            }
-            let Some(payload_end) = offset.checked_add(size) else {
-                continue;
-            };
-            if payload_end > data.len() {
-                continue;
-            }
-
-            layers.push(AnimLayer {
-                name,
-                data: &data[offset..payload_end],
-                width: tex_width,
-                height: tex_height,
-            });
-        }
-
-        let mut frames = Vec::with_capacity(frame_count.min(MAX_PREALLOC_FRAMES));
-        let mut offset = frame_arr_offset;
-        for _ in 0..frame_count {
-            let Some(end) = offset.checked_add(FRAME_RECORD_SIZE) else {
-                break;
-            };
-            if end > data.len() {
-                break;
-            }
-            let rec = &data[offset..end];
-            let texture_x = u16::from_le_bytes(rec[0..2].try_into().unwrap());
-            let texture_y = u16::from_le_bytes(rec[2..4].try_into().unwrap());
-            let offset_x = i16::from_le_bytes(rec[4..6].try_into().unwrap());
-            let offset_y = i16::from_le_bytes(rec[6..8].try_into().unwrap());
-            let frame_width = u16::from_le_bytes(rec[8..10].try_into().unwrap());
-            let frame_height = u16::from_le_bytes(rec[10..12].try_into().unwrap());
-            // rec[12..16] is an unknown u32, skipped.
-
-            frames.push(AnimFrame {
-                texture_x,
-                texture_y,
-                offset_x,
-                offset_y,
-                width: frame_width,
-                height: frame_height,
-            });
-            offset = end;
-        }
+        let layers = parse_layer_records(data, LAYER_RECORDS_OFFSET, layer_names);
+        let frames = parse_frame_records(data, frame_arr_offset, frame_count);
 
         Ok(Anim {
             scale,
@@ -235,6 +285,25 @@ impl<'a> Anim<'a> {
             layers,
             frames,
         })
+    }
+
+    /// Builds an `Anim` directly from already-parsed parts. `pub(crate)` so [`crate::mainsd`] can
+    /// construct one from a `mainSD.anim` entry (whose normalized frames/canvas are computed
+    /// there) without `Anim`'s fields being otherwise exposed outside this module.
+    pub(crate) fn from_parts(
+        scale: u8,
+        width: u16,
+        height: u16,
+        layers: Vec<AnimLayer<'a>>,
+        frames: Vec<AnimFrame>,
+    ) -> Anim<'a> {
+        Anim {
+            scale,
+            width,
+            height,
+            layers,
+            frames,
+        }
     }
 
     /// The file's raw scale tier byte, as stored in the file: nominally 4 = HD, 2 = HD2, 1 = SD.
