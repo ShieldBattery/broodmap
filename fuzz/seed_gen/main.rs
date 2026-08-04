@@ -15,8 +15,8 @@ use broodmap::chk::terrain::{TerrainTileIds, TileId};
 use broodmap::chk::tileset::Tileset;
 use broodmap::extract_chk_from_map;
 use broodmap_formats::{
-    Anim, DdsVr4, Frame, parse_cv5, parse_dds, parse_flingy_dat, parse_images_dat,
-    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat,
+    Anim, DdsVr4, Frame, MainSdAnim, parse_cv5, parse_dds, parse_flingy_dat, parse_images_dat,
+    parse_images_rel, parse_sprites_dat, parse_tbl, parse_teamcolor_mask, parse_units_dat,
 };
 use broodmap_render::{
     ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, RenderOptions, render_terrain,
@@ -117,6 +117,7 @@ fn main() {
     write_formats_parse_seeds(&seeds_root);
     write_render_terrain_seed(&seeds_root);
     write_anim_parse_seed(&seeds_root);
+    write_mainsd_parse_seed(&seeds_root);
 
     println!("done");
 }
@@ -785,6 +786,175 @@ fn write_anim_parse_seed(seeds_root: &Path) {
         }
     }
     write_seed(&dir, "hd_anim_valid.bin", &anim_bytes);
+}
+
+// ---------------------------------------------------------------------------------------------
+// mainSD.anim synthetic seed builder
+// ---------------------------------------------------------------------------------------------
+//
+// Mirrors the byte layout from `broodmap-formats/src/mainsd.rs`'s private `MainSdBuilder` test
+// fixture, which isn't reachable from here (it's a `#[cfg(test)]` helper in another crate). See
+// that module's doc comments for the full layout: 12 B header, 10x32 B name region at 0x0C,
+// entry offset table (num_entries x u32 absolute) at 0x14C, then entries.
+
+const MAINSD_LAYER_NAME_REGION_START: usize = 0x0C;
+const MAINSD_LAYER_NAME_SLOT_SIZE: usize = 32;
+const MAINSD_LAYER_NAME_SLOTS: usize = 10;
+const MAINSD_ENTRY_OFFSET_TABLE_START: usize =
+    MAINSD_LAYER_NAME_REGION_START + MAINSD_LAYER_NAME_SLOTS * MAINSD_LAYER_NAME_SLOT_SIZE; // 0x14C
+const MAINSD_ENTRY_OFFSET_SIZE: usize = 4;
+const MAINSD_ENTRY_HEADER_SIZE: usize = 12;
+const MAINSD_LAYER_RECORD_SIZE: usize = 12;
+const MAINSD_FRAME_RECORD_SIZE: usize = 16;
+const MAINSD_TYPE_SD: u8 = 1;
+const MAINSD_NO_REF_ID: u16 = 0xFFFF;
+const MAINSD_TEAMCOLOR_MAGIC: &[u8; 4] = b"BMP ";
+
+/// Builds a valid `mainSD.anim` buffer with two entries: entry 0 is a real entry with 2 layers
+/// (`"diffuse"`, `"teamcolor"`) and 2 frames, entry 1 is a 12-byte inline reference pointing at
+/// entry 0.
+fn make_mainsd_seed() -> Vec<u8> {
+    let layer_names = ["diffuse", "teamcolor"];
+    let num_layers = layer_names.len();
+    let num_entries = 2usize;
+
+    // diffuse: reuse the same synthetic DXT1 DDS bytes the HD anim seed uses.
+    let diffuse_payload = make_dxt1_dds(4, 4, 0xF800); // solid red, 4x4
+    let (diffuse_w, diffuse_h) = (4u16, 4u16);
+
+    // teamcolor: "BMP " magic + width*height bytes of 0/255 (per mainsd.rs's raw stencil format),
+    // width/height matching the diffuse layer's dimensions.
+    let mut teamcolor_payload = MAINSD_TEAMCOLOR_MAGIC.to_vec();
+    for i in 0..(diffuse_w as usize * diffuse_h as usize) {
+        teamcolor_payload.push(if i % 2 == 0 { 0 } else { 255 });
+    }
+
+    let frames = [
+        AnimSeedFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 0,
+            offset_y: 0,
+            width: 4,
+            height: 4,
+        },
+        AnimSeedFrame {
+            texture_x: 4,
+            texture_y: 0,
+            offset_x: 1,
+            offset_y: -1,
+            width: 4,
+            height: 4,
+        },
+    ];
+
+    let offset_table_size = num_entries * MAINSD_ENTRY_OFFSET_SIZE;
+    let mut data = vec![0u8; MAINSD_ENTRY_OFFSET_TABLE_START + offset_table_size];
+
+    data[0..4].copy_from_slice(b"ANIM");
+    data[4] = 1; // scale: SD is definitionally 1 texel/logical px
+    data[5] = MAINSD_TYPE_SD;
+    data[6..8].copy_from_slice(&0u16.to_le_bytes()); // unknown
+    data[8..10].copy_from_slice(&(num_layers as u16).to_le_bytes());
+    data[10..12].copy_from_slice(&(num_entries as u16).to_le_bytes());
+
+    for (i, name) in layer_names.iter().enumerate() {
+        let start = MAINSD_LAYER_NAME_REGION_START + i * MAINSD_LAYER_NAME_SLOT_SIZE;
+        data[start..start + name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    let mut entry_offsets = Vec::with_capacity(num_entries);
+
+    // Entry 0: the real entry.
+    entry_offsets.push(data.len() as u32);
+    {
+        let header_pos = data.len();
+        data.extend(std::iter::repeat_n(0u8, MAINSD_ENTRY_HEADER_SIZE));
+
+        let layer_records_pos = data.len();
+        data.extend(std::iter::repeat_n(0u8, num_layers * MAINSD_LAYER_RECORD_SIZE));
+
+        let frame_arr_offset = data.len();
+        data.extend(std::iter::repeat_n(0u8, frames.len() * MAINSD_FRAME_RECORD_SIZE));
+        for (fi, frame) in frames.iter().enumerate() {
+            let fo = frame_arr_offset + fi * MAINSD_FRAME_RECORD_SIZE;
+            data[fo..fo + 2].copy_from_slice(&frame.texture_x.to_le_bytes());
+            data[fo + 2..fo + 4].copy_from_slice(&frame.texture_y.to_le_bytes());
+            data[fo + 4..fo + 6].copy_from_slice(&frame.offset_x.to_le_bytes());
+            data[fo + 6..fo + 8].copy_from_slice(&frame.offset_y.to_le_bytes());
+            data[fo + 8..fo + 10].copy_from_slice(&frame.width.to_le_bytes());
+            data[fo + 10..fo + 12].copy_from_slice(&frame.height.to_le_bytes());
+            // unknown u32 left zeroed
+        }
+
+        let layer_payloads: [(&[u8], u16, u16); 2] = [
+            (&diffuse_payload, diffuse_w, diffuse_h),
+            (&teamcolor_payload, diffuse_w, diffuse_h),
+        ];
+        for (li, (payload, w, h)) in layer_payloads.iter().enumerate() {
+            let rec_pos = layer_records_pos + li * MAINSD_LAYER_RECORD_SIZE;
+            let payload_off = data.len();
+            data[rec_pos..rec_pos + 4].copy_from_slice(&(payload_off as u32).to_le_bytes());
+            data[rec_pos + 4..rec_pos + 8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            data[rec_pos + 8..rec_pos + 10].copy_from_slice(&w.to_le_bytes());
+            data[rec_pos + 10..rec_pos + 12].copy_from_slice(&h.to_le_bytes());
+            data.extend_from_slice(payload);
+        }
+
+        data[header_pos..header_pos + 2].copy_from_slice(&(frames.len() as u16).to_le_bytes());
+        data[header_pos + 2..header_pos + 4].copy_from_slice(&MAINSD_NO_REF_ID.to_le_bytes());
+        data[header_pos + 4..header_pos + 6].copy_from_slice(&0u16.to_le_bytes()); // canvas_width
+        data[header_pos + 6..header_pos + 8].copy_from_slice(&0u16.to_le_bytes()); // canvas_height
+        data[header_pos + 8..header_pos + 12]
+            .copy_from_slice(&(frame_arr_offset as u32).to_le_bytes());
+    }
+
+    // Entry 1: a 12-byte inline reference pointing at entry 0.
+    entry_offsets.push(data.len() as u32);
+    {
+        let mut hdr = [0u8; MAINSD_ENTRY_HEADER_SIZE];
+        hdr[2..4].copy_from_slice(&0u16.to_le_bytes()); // ref_id = 0 (target entry)
+        data.extend_from_slice(&hdr);
+    }
+
+    for (i, off) in entry_offsets.iter().enumerate() {
+        let pos = MAINSD_ENTRY_OFFSET_TABLE_START + i * MAINSD_ENTRY_OFFSET_SIZE;
+        data[pos..pos + MAINSD_ENTRY_OFFSET_SIZE].copy_from_slice(&off.to_le_bytes());
+    }
+
+    data
+}
+
+/// Writes a synthetic (not Blizzard-derived) seed for the `mainsd_parse` target: a valid
+/// 2-layer, 2-entry `mainSD.anim` bundle (one real entry with both a `diffuse` and `teamcolor`
+/// layer, plus a reference entry pointing at it).
+fn write_mainsd_parse_seed(seeds_root: &Path) {
+    let dir = seeds_root.join("mainsd_parse");
+    fs::create_dir_all(&dir).expect("create mainsd_parse seed dir");
+
+    let sd_bytes = make_mainsd_seed();
+    {
+        let sd_anim = MainSdAnim::parse(&sd_bytes).expect("seed mainSD.anim should parse");
+        assert_eq!(sd_anim.num_entries(), 2, "seed mainSD.anim should round-trip");
+
+        let real = sd_anim.entry(0).expect("real entry should resolve");
+        assert_eq!(real.frame_count(), 2);
+        let diffuse = real.layer("diffuse").expect("diffuse layer should be present");
+        parse_dds(diffuse.data).expect("seed diffuse layer should parse as DDS");
+        let teamcolor = real
+            .layer("teamcolor")
+            .expect("teamcolor layer should be present");
+        parse_teamcolor_mask(teamcolor.data, teamcolor.width, teamcolor.height)
+            .expect("seed teamcolor layer should parse as a mask");
+
+        let referenced = sd_anim.entry(1).expect("ref entry should resolve");
+        assert_eq!(
+            referenced.frame_count(),
+            2,
+            "ref entry should resolve to the real entry's frames"
+        );
+    }
+    write_seed(&dir, "sd_bundle_valid.bin", &sd_bytes);
 }
 
 fn write_seed(dir: &Path, name: &str, bytes: &[u8]) {

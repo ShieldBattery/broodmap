@@ -63,6 +63,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "mainsd_parse"
+path = "fuzz_targets/mainsd_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "seed_gen"
 path = "seed_gen/main.rs"
 test = false
