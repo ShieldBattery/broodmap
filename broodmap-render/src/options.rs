@@ -87,6 +87,11 @@ pub struct RenderOptions {
     /// toggle, [`Self::show_resources`]) or start locations, and never affects player-owned
     /// buildings. Default `true`.
     pub show_neutral_buildings: bool,
+    /// Draw a drop shadow underneath units and sprites that have one (see
+    /// `crate::GameData::shadow_image_pre_redirect` and the "Shadows" note in
+    /// `docs/render-design.md`). Applies to `UNIT`-chunk units, THG2 unit-sprites, and THG2
+    /// doodad sprites alike; start-location graphics never get one. Default `true`.
+    pub show_shadows: bool,
 }
 
 impl Default for RenderOptions {
@@ -102,6 +107,7 @@ impl Default for RenderOptions {
             show_resources: true,
             show_doodad_sprites: true,
             show_neutral_buildings: true,
+            show_shadows: true,
         }
     }
 }

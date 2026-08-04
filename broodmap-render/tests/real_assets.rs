@@ -221,23 +221,40 @@ fn required_preview_assets_exist_in_real_install() {
         }
 
         let data = GameData::load(&source).expect("the .dat tables should load");
-        let graphics = required_preview_graphics(
-            chk.placed_units().expect("lt.scm should have units"),
-            chk.sprites().expect("lt.scm should have sprites"),
-            &data,
-            map_w,
-            map_h,
-            &options,
-        );
+        let units = chk.placed_units().expect("lt.scm should have units");
+        let sprites = chk.sprites().expect("lt.scm should have sprites");
+        let graphics = required_preview_graphics(units, sprites, &data, map_w, map_h, &options);
         assert!(
             !graphics.is_empty(),
             "{style:?}: Lost Temple's units must need some art"
         );
+
+        // Shadow anims are a best-effort layer (see `RenderOptions::show_shadows`'s docs and
+        // `docs/render-design.md`'s "Shadows" note): a real install's Cartooned pack doesn't ship
+        // every shadow, and the renderer's contract for that is a silent, per-drawable skip, not
+        // an error. So the *baseline* (shadow-free) requests are a hard requirement here — a
+        // missing one would mean a real `.anim` path-scheme regression — but any extra request
+        // that only exists because of shadows is allowed to 404.
+        let baseline_options = RenderOptions {
+            show_shadows: false,
+            ..options.clone()
+        };
+        let baseline =
+            required_preview_graphics(units, sprites, &data, map_w, map_h, &baseline_options);
+        let baseline_set: std::collections::HashSet<_> = baseline.iter().collect();
+
         for req in &graphics {
-            let bytes = source
-                .read(req)
-                .unwrap_or_else(|e| panic!("{style:?}: {} unreadable: {e}", req.casc_path()));
-            assert!(!bytes.is_empty(), "{}", req.casc_path());
+            match source.read(req) {
+                Ok(bytes) => assert!(!bytes.is_empty(), "{}", req.casc_path()),
+                Err(e) if !baseline_set.contains(req) => {
+                    eprintln!(
+                        "{style:?}: shadow-only asset {} unreadable ({e}) -- tolerated, the \
+                         renderer must skip the shadow for it, not fail",
+                        req.casc_path()
+                    );
+                }
+                Err(e) => panic!("{style:?}: {} unreadable: {e}", req.casc_path()),
+            }
         }
     }
 }

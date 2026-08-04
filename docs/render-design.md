@@ -31,6 +31,12 @@ minimap-style images) from Brood War maps using StarCraft: Remastered assets.
   data-source seam leaves the door open if someone wants this later.
 - Animation: palette cycling, iscript playback, water/lava animation. Static first-frame renders
   only.
+- Parsing or executing `scripts/iscript.bin` in any form, including a VM-free static extraction
+  of its Init animations. This is a permanent non-goal, not a stopgap: everything iscript would
+  normally drive at render time (shadow attachment being the running example — see "Shadows"
+  below) is instead approximated with a data-only heuristic over `.dat`/`.rel`, verified against
+  real data and, where useful, cross-checked offline against a real iscript disassembly as a
+  development-time oracle. The oracle informs the heuristic; it is never wired into the crate.
 - Game-accurate creep edge transitions (`.tmsk`) in v1. Creep rendering starts simple.
 - Writing/authoring any of these formats.
 
@@ -129,6 +135,61 @@ Phase-2 facts pinned from neobrood + a real install (full specs live in the
   directional images map direction to frame with horizontal flip for the mirrored half.
 - Resource art: mineral frame by amount thresholds and geyser frame by tileset are bw-chk
   conventions (neobrood has neither); we follow bw-chk.
+
+**Shadows.** In the real game, a unit/sprite's shadow is a separate image attached as an underlay
+by an iscript `imgul` opcode — a VM this library deliberately never implements or runs (see
+Non-goals). In its place, `show_shadows` (default on; `RenderOptions::show_shadows`, CLI
+`--no-shadows`) uses a data-only heuristic: a drawable's shadow art is `main_image_id + 1` (the
+PRE-`images.rel`-redirect ID, mirroring how the main image's own rendering metadata is looked
+up), gated on that slot's `images.dat` entry being flagged with BW's "shadow" draw style
+(`render_style == 10`; see `GameData::shadow_image_pre_redirect`). One case gets a hardcoded
+offset instead of `+1`: the vespene geyser (`unit_id == UNIT_ID_VESPENE_GEYSER`) uses `+2`,
+because its `+1` is a same-GRP art variant of the geyser itself (not a shadow) and its real
+shadow (`neutral\geyShad.grp`, verified against a real install) sits one slot further out. This
+mirrors the existing resource-specific stand-ins for iscript behavior this library doesn't run
+(mineral frame by amount, geyser frame by tileset — see `select_unit_frame`) rather than a
+general mechanism: units whose own turret/overlay image pushes their real shadow to `+2` are
+still not covered and simply get no shadow under `--as-placed` (accepted — melee, the default,
+drops preplaced player-owned units anyway, so this only shows up in UMS/`--as-placed` views).
+Applies uniformly to `UNIT`-chunk units, THG2 unit-sprites, and THG2 doodad sprites (the geyser
+special case only ever applies to the first two, since doodads carry no unit ID); start-location
+graphics never get a shadow. A shadow is emitted as its own [`Drawable`] carrying the owner's
+exact position, frame index and flip (shadow anim frame tables mirror their owner's directional
+tables), pushed immediately before the owner into the same painter-order sort key — genuine
+per-drawable ordering (not a global shadows-first pass), relying on `Vec::sort_by_key`'s
+stability to keep it immediately beneath its owner without a separate band. Compositing replaces
+the shadow anim's diffuse RGB with black and scales its alpha by a constant
+(`SHADOW_ALPHA_SCALE`, `overlay.rs`), calibrated visually to 0.5 (within the 0.4-0.6 range
+considered); no team color is ever applied to a shadow, and its tile-cache key is forced onto the
+no-teamcolor sentinel plus its own `is_shadow` bit, so every owner sharing a shadow image/frame/
+flip shares one cached tile. A missing shadow `.anim` (e.g. the Cartooned/Carbot pack, which does
+not ship every shadow image) is a silent per-drawable skip, exactly like a missing main-art anim
+— the owner still draws, just without its shadow.
+
+Verified against a real SC:R install before implementation: walking every unit ID (0..228) and
+THG2 sprite ID (0..517) through the resolution chain, 59.6% of units (81/127 non-building units,
+49/95 buildings, 6/6 critters) resolve a `+1` shadow under the gate. This was cross-checked
+against neobrood's generated iscript disassembly (`src/gamedata/generated/{image,iscript}.rs`,
+via a custom control-flow walker over its `ISCRIPT_ANIMS` tables) as a development-time oracle:
+of 745 resolved unit/sprite image IDs, the gate produces a real, wrong-image false positive in
+only 2 cases (a unit/sprite pair whose Init genuinely attaches a *different* image than `+1`);
+the rest of the gate's "no" and "yes-but-oracle-can't-confirm" cases are safe divergences —
+buildings mostly don't use this convention at all, units with a separate turret/overlay image
+push their real shadow to `+2` instead (the gate correctly declines to guess — still true after
+the geyser fix, since that's a hardcoded one-unit special case, not a general scan), and a large
+block of THG2 doodad/prop image pairs (contiguous main/shadow slots, correctly styled) show no
+*iscript*-driven attachment at all in the oracle, most likely because BW attaches those specific
+pairs outside `imgul` entirely rather than because the data pairing is wrong. Net effect: the
+heuristic never fabricates a shadow from an unrelated image beyond that 2-case margin, and its
+failure mode is under-coverage (some real shadows missed, most notably buildings and
+turret-bearing units), which is the safe direction for a heuristic that isn't running the real
+VM. The vespene geyser was the one exception worth hardcoding: user-visible (every melee map has
+geysers) and confirmed with certainty against real data (image 344 → `+1` 345, a render_style-0
+variant → `+2` 346, `neutral\geyShad.grp`, render_style 10). The oracle script and its
+cross-check are throwaway (not part of the crate or its tests) but the underlying real-data
+verification lives on as `GameData::tests::shadow_plus_one_convention_holds_broadly` and
+`GameData::tests::geyser_shadow_resolves_to_the_real_plus_two_image` (both gated on
+`BROODMAP_TEST_SCR_DIR`, like the rest of the real-install suite).
 
 Art style is the only user-facing quality knob: `ArtStyle { Original, Remastered, Cartooned }`.
 The SD art is genuinely different art from the HD art (HD2 is the same art as HD at half

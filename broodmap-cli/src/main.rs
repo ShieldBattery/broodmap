@@ -91,6 +91,10 @@ struct RenderArgs {
     #[arg(long)]
     no_doodads: bool,
 
+    /// Don't draw drop shadows under units and sprites.
+    #[arg(long)]
+    no_shadows: bool,
+
     /// Render terrain only, skipping the unit/sprite overlay entirely.
     #[arg(long)]
     terrain_only: bool,
@@ -165,6 +169,7 @@ fn render(args: RenderArgs) -> Result<()> {
         show_resources: !args.no_resources,
         show_doodad_sprites: !args.no_doodads,
         show_neutral_buildings: !args.no_neutral_buildings,
+        show_shadows: !args.no_shadows,
         ..Default::default()
     };
 

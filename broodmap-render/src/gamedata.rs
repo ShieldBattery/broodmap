@@ -50,6 +50,11 @@ pub(crate) const UNIT_IDS_CRITTER: [u16; 6] = [89, 90, 93, 94, 95, 96];
 /// The `units.dat` `special_ability_flags` bit meaning "this unit is a building".
 const SPECIAL_ABILITY_FLAG_BUILDING: u32 = 0x0000_0001;
 
+/// `images.dat`'s raw `render_style` code for BW's "shadow" draw function (see
+/// [`broodmap_formats::ImageEntry::render_style`]'s docs). Used by [`GameData::shadow_image_pre_redirect`]
+/// to gate the shadow-image heuristic.
+const RENDER_STYLE_SHADOW: u8 = 10;
+
 /// Builds the [`AssetRequest::Anim`] for an image, applying the Carbot start-location quirk.
 ///
 /// The Cartooned art pack ships no `main_588.anim`, so the game falls back to the standard
@@ -185,6 +190,55 @@ impl GameData {
             .entry(unit_id)
             .is_some_and(|e| e.special_ability_flags & SPECIAL_ABILITY_FLAG_BUILDING != 0)
     }
+
+    /// The image whose `.anim` art should be drawn as `main_pre_redirect`'s shadow underlay, if
+    /// any.
+    ///
+    /// In the real game, a drawable's shadow is a separate image attached by an iscript `imgul`
+    /// ("image underlay") opcode -- a VM this library deliberately does not implement or run (see
+    /// `docs/render-design.md`'s Non-goals). Instead, this applies a data-only heuristic in its
+    /// place: a shadow conventionally lives at `main_pre_redirect + 1`, gated on that slot's
+    /// `images.dat` entry being flagged with BW's "shadow" draw style (`render_style == 10`).
+    /// This was verified against a real SC:R install (228 units + 517 THG2 sprite IDs) and
+    /// cross-checked against neobrood's generated iscript disassembly as a development-time
+    /// oracle -- see `docs/render-design.md`'s "Shadows" note for the numbers.
+    ///
+    /// One case gets a hardcoded offset instead of the general `+1` rule: the vespene geyser
+    /// (`unit_id == `[`UNIT_ID_VESPENE_GEYSER`]) uses `+2`, because `+1` there is a same-GRP art
+    /// variant of the geyser itself (`render_style` other than 10), not a shadow -- verified
+    /// against a real install (image 344's `+1`, 345, is a render_style-0 variant; its real
+    /// shadow is 346, `neutral\geyShad.grp`, render_style 10). This mirrors the existing
+    /// resource-specific stand-ins for iscript behavior this library doesn't run (mineral frame
+    /// by amount, geyser frame by tileset — see `select_unit_frame`), rather than a general
+    /// mechanism: units whose own turret/overlay image pushes their real shadow to `+2` are not
+    /// covered and simply get no shadow (an accepted gap -- see `docs/render-design.md`'s
+    /// "Shadows" note).
+    ///
+    /// `main_pre_redirect` must be the image ID *before* the `images.rel` redirect (the same ID
+    /// that indexes `images.dat`'s other rendering metadata -- see
+    /// [`Self::unit_image_pre_redirect`]'s docs), since that's what the render-style gate is
+    /// checked against. The redirect is then applied to the shadow slot itself (mirroring how the
+    /// main image's art is resolved) to get the ID whose `.anim` actually holds the shadow art.
+    ///
+    /// `unit_id` is the drawable's own unit ID where one exists (placed units and THG2
+    /// unit-sprites); `None` for THG2 doodad sprites, which have no unit ID and so never match
+    /// the geyser special case.
+    pub(crate) fn shadow_image_pre_redirect(
+        &self,
+        main_pre_redirect: u16,
+        unit_id: Option<u16>,
+    ) -> Option<u16> {
+        let offset: u16 = if unit_id == Some(UNIT_ID_VESPENE_GEYSER) {
+            2
+        } else {
+            1
+        };
+        let shadow_id = main_pre_redirect.checked_add(offset)?;
+        self.images
+            .entry(shadow_id)
+            .filter(|e| e.render_style == RENDER_STYLE_SHADOW)
+            .map(|_| shadow_id)
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +364,181 @@ pub(crate) mod tests {
         for id in [175u16, 179, 187, 189] {
             assert!(!is_resource(id), "{id} should not be a resource");
         }
+    }
+
+    /// Verifies the shadow-image heuristic (used by the overlay's shadow rendering, see
+    /// `crate::overlay`) against real data: a drawable's shadow art is conventionally
+    /// `image_id + 1` (the PRE-`images.rel`-redirect ID, since that's what indexes `images.dat`'s
+    /// rendering metadata — see [`GameData::unit_image_pre_redirect`]'s docs), gated on
+    /// `images.dat[main + 1].render_style == 10` (BW's "shadow" draw function). There's no
+    /// iscript VM here to confirm this by actually running `imgul` opcodes, so this is the
+    /// substitute: it walks every unit ID (0..228) and every THG2 "pure sprite" ID (0..517,
+    /// doodads like trees) through the resolution chain and reports how often the `+1` slot is
+    /// actually flagged as a shadow.
+    ///
+    /// Gated on `BROODMAP_TEST_SCR_DIR` like `tests/real_assets.rs`; run with:
+    /// `BROODMAP_TEST_SCR_DIR='C:\Program Files (x86)\StarCraft' cargo test -p broodmap-render --features casc shadow_plus_one_convention -- --nocapture`
+    #[cfg(feature = "casc")]
+    #[test]
+    fn shadow_plus_one_convention_holds_broadly() {
+        let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+            eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+            return;
+        };
+        let source = crate::source::CascSource::open(dir)
+            .expect("BROODMAP_TEST_SCR_DIR should be a valid SC:R install");
+        let data = GameData::load(&source).expect("the .dat tables should load");
+
+        let mut total = 0u32;
+        let mut with_shadow = 0u32;
+        let mut building_total = 0u32;
+        let mut building_with_shadow = 0u32;
+        let mut critter_total = 0u32;
+        let mut critter_with_shadow = 0u32;
+        let mut resource_total = 0u32;
+        let mut resource_with_shadow = 0u32;
+        let mut plain_total = 0u32;
+        let mut plain_with_shadow = 0u32;
+        let mut exceptions: Vec<String> = Vec::new();
+        for unit_id in 0u16..228 {
+            let Some(main_pre_redirect) = data.unit_image_pre_redirect(unit_id) else {
+                continue;
+            };
+            total += 1;
+            let shadow_id = main_pre_redirect + 1;
+            let render_style = data.images_dat().entry(shadow_id).map(|e| e.render_style);
+            let has_shadow = render_style == Some(10);
+
+            let is_building = data.is_building(unit_id);
+            let is_critter = is_critter(unit_id);
+            let is_resource = is_resource(unit_id);
+            if is_building {
+                building_total += 1;
+                building_with_shadow += has_shadow as u32;
+            } else if is_critter {
+                critter_total += 1;
+                critter_with_shadow += has_shadow as u32;
+            } else if is_resource {
+                resource_total += 1;
+                resource_with_shadow += has_shadow as u32;
+            } else {
+                plain_total += 1;
+                plain_with_shadow += has_shadow as u32;
+            }
+
+            if has_shadow {
+                with_shadow += 1;
+            } else {
+                exceptions.push(format!(
+                    "unit {unit_id} (building={is_building} critter={is_critter} resource={is_resource}) \
+                     image {main_pre_redirect}, +1={shadow_id} render_style {render_style:?}"
+                ));
+            }
+        }
+        eprintln!(
+            "units overall: {with_shadow}/{total} ({:.1}%) resolve a +1 shadow (render_style == 10)",
+            100.0 * with_shadow as f64 / total.max(1) as f64
+        );
+        eprintln!(
+            "  plain units:  {plain_with_shadow}/{plain_total} ({:.1}%)",
+            100.0 * plain_with_shadow as f64 / plain_total.max(1) as f64
+        );
+        eprintln!(
+            "  buildings:    {building_with_shadow}/{building_total} ({:.1}%)",
+            100.0 * building_with_shadow as f64 / building_total.max(1) as f64
+        );
+        eprintln!(
+            "  critters:     {critter_with_shadow}/{critter_total} ({:.1}%)",
+            100.0 * critter_with_shadow as f64 / critter_total.max(1) as f64
+        );
+        eprintln!(
+            "  resources:    {resource_with_shadow}/{resource_total} ({:.1}%)",
+            100.0 * resource_with_shadow as f64 / resource_total.max(1) as f64
+        );
+        eprintln!(
+            "all unit exceptions ({}): {exceptions:#?}",
+            exceptions.len()
+        );
+
+        let mut sprite_total = 0u32;
+        let mut sprite_with_shadow = 0u32;
+        let mut sprite_exceptions: Vec<String> = Vec::new();
+        for sprite_id in 0u16..517 {
+            let Some(main_pre_redirect) = data.sprite_image_pre_redirect(sprite_id) else {
+                continue;
+            };
+            sprite_total += 1;
+            let shadow_id = main_pre_redirect + 1;
+            let render_style = data.images_dat().entry(shadow_id).map(|e| e.render_style);
+            if render_style == Some(10) {
+                sprite_with_shadow += 1;
+            } else if sprite_exceptions.len() < 60 {
+                sprite_exceptions.push(format!(
+                    "sprite {sprite_id} (image {main_pre_redirect}, +1={shadow_id} render_style {render_style:?})"
+                ));
+            }
+        }
+        eprintln!(
+            "sprites: {sprite_with_shadow}/{sprite_total} ({:.1}%) resolve a +1 shadow",
+            100.0 * sprite_with_shadow as f64 / sprite_total.max(1) as f64
+        );
+        eprintln!("sprite exceptions (up to 60): {sprite_exceptions:#?}");
+
+        // Regression guard, not a hardcoded golden count (the exact split was measured manually
+        // when this heuristic was chosen and cross-checked against a real iscript disassembly —
+        // see `docs/render-design.md`'s "Shadows" note): critters and plain (non-building) units
+        // should keep resolving a `+1` shadow for a solid majority. Buildings and THG2 sprites
+        // legitimately sit much lower (many buildings don't use this convention at all; see the
+        // docs note), so they aren't asserted here — only that a future asset change didn't
+        // collapse the parts of the heuristic that carry the most weight in a typical preview.
+        assert!(
+            critter_with_shadow as f64 / critter_total.max(1) as f64 > 0.9,
+            "critters should almost always resolve a +1 shadow"
+        );
+        assert!(
+            plain_with_shadow as f64 / plain_total.max(1) as f64 > 0.5,
+            "non-building units should resolve a +1 shadow more often than not"
+        );
+    }
+
+    /// Targeted real-data check for the vespene geyser special case in
+    /// [`GameData::shadow_image_pre_redirect`]: image 344's `+1` (345) is a same-GRP art variant,
+    /// not a shadow, and its real shadow (`neutral\geyShad.grp`, `render_style == 10`) is at
+    /// `+2` (346). Gated on `BROODMAP_TEST_SCR_DIR` like the rest of this module's real-data
+    /// tests.
+    #[cfg(feature = "casc")]
+    #[test]
+    fn geyser_shadow_resolves_to_the_real_plus_two_image() {
+        let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+            eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+            return;
+        };
+        let source = crate::source::CascSource::open(dir)
+            .expect("BROODMAP_TEST_SCR_DIR should be a valid SC:R install");
+        let data = GameData::load(&source).expect("the .dat tables should load");
+
+        let main = data
+            .unit_image_pre_redirect(UNIT_ID_VESPENE_GEYSER)
+            .expect("the vespene geyser should resolve a main image");
+        eprintln!("geyser main image: {main}");
+
+        // +1 is a same-GRP variant, not a shadow.
+        let plus_one = data.images_dat().entry(main + 1);
+        assert_ne!(
+            plus_one.map(|e| e.render_style),
+            Some(RENDER_STYLE_SHADOW),
+            "the geyser's +1 image ({}) should be a variant, not a shadow",
+            main + 1
+        );
+
+        // shadow_image_pre_redirect must skip it and land on +2.
+        let shadow = data.shadow_image_pre_redirect(main, Some(UNIT_ID_VESPENE_GEYSER));
+        assert_eq!(
+            shadow,
+            Some(main + 2),
+            "the geyser's shadow should resolve to +2 ({}), not +1",
+            main + 2
+        );
     }
 
     #[test]

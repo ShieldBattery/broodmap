@@ -333,6 +333,10 @@ struct Drawable {
     /// Painter's-order band: 0 for the map's own contents, 1 for start-location graphics, which
     /// always sit on top.
     layer: u8,
+    /// Whether this is a shadow underlay rather than the drawable it belongs to (see
+    /// [`push_with_shadow`]). Shadows are never team-colored and are drawn as a translucent black
+    /// silhouette (see [`apply_shadow_tint`]).
+    is_shadow: bool,
 }
 
 /// Resolves and filters the map's units and sprites into an ordered list of drawables.
@@ -381,6 +385,7 @@ fn collect_drawables(
                     y: unit.y as i32,
                     owner: unit.owner.unwrap_or(u8::MAX),
                     layer: 1,
+                    is_shadow: false,
                 });
             }
             continue;
@@ -395,15 +400,23 @@ fn collect_drawables(
             continue;
         };
         let (frame, flip) = select_unit_frame(unit, image_id, data, tileset);
-        drawables.push(Drawable {
-            art_image_id: data.resolve_art(image_id),
-            frame,
-            flip,
-            x: unit.x as i32,
-            y: unit.y as i32,
-            owner: unit.owner.unwrap_or(u8::MAX),
-            layer: 0,
-        });
+        push_with_shadow(
+            &mut drawables,
+            data,
+            options,
+            image_id,
+            Some(unit.unit_id),
+            Drawable {
+                art_image_id: data.resolve_art(image_id),
+                frame,
+                flip,
+                x: unit.x as i32,
+                y: unit.y as i32,
+                owner: unit.owner.unwrap_or(u8::MAX),
+                layer: 0,
+                is_shadow: false,
+            },
+        );
     }
 
     for sprite in sprites {
@@ -433,21 +446,66 @@ fn collect_drawables(
         let Some(image_id) = image_id else {
             continue;
         };
-        drawables.push(Drawable {
-            art_image_id: data.resolve_art(image_id),
-            // THG2 entries carry no facing or resource data, so they always use frame 0 (the
-            // same thing bw-chk draws for them).
-            frame: 0,
-            flip: false,
-            x: sprite.x as i32,
-            y: sprite.y as i32,
-            owner: sprite.owner,
-            layer: 0,
-        });
+        // Doodads (pure sprites) have no unit ID, so they only ever qualify for the same-GRP
+        // skip rule in `shadow_image_pre_redirect`; "unit sprite" THG2 entries carry a real unit
+        // ID (their own `id` field, per the chain above) and so also get the subunit rule.
+        let unit_id_for_shadow = (!is_doodad).then_some(sprite.id);
+        push_with_shadow(
+            &mut drawables,
+            data,
+            options,
+            image_id,
+            unit_id_for_shadow,
+            Drawable {
+                art_image_id: data.resolve_art(image_id),
+                // THG2 entries carry no facing or resource data, so they always use frame 0 (the
+                // same thing bw-chk draws for them).
+                frame: 0,
+                flip: false,
+                x: sprite.x as i32,
+                y: sprite.y as i32,
+                owner: sprite.owner,
+                layer: 0,
+                is_shadow: false,
+            },
+        );
     }
 
     drawables.sort_by_key(|d| (d.layer, d.y, d.x));
     drawables
+}
+
+/// Pushes `owner_drawable`, first pushing its shadow underlay (if [`RenderOptions::show_shadows`]
+/// is on and [`GameData::shadow_image_pre_redirect`]'s bounded scan from `pre_redirect_image_id`
+/// finds one) immediately before it. `unit_id` is the drawable's own unit ID where one exists
+/// (placed units and THG2 unit-sprites; `None` for THG2 doodad sprites), enabling the scan's
+/// subunit-skip rule — see that function's docs.
+///
+/// Ordering note: this is genuine per-drawable ordering, not a global "shadows first" pass. The
+/// shadow is given the exact same `(layer, y, x)` as its owner, and [`Vec::sort_by_key`] (used by
+/// [`collect_drawables`]) is a stable sort, so pushing the shadow immediately before its owner
+/// keeps it immediately before the owner after sorting too — i.e. painted directly beneath it —
+/// without needing a separate shadows-first band. Start-location graphics never call this (they
+/// build their `Drawable` directly), so they never get a shadow.
+fn push_with_shadow(
+    drawables: &mut Vec<Drawable>,
+    data: &GameData,
+    options: &RenderOptions,
+    pre_redirect_image_id: u16,
+    unit_id: Option<u16>,
+    owner_drawable: Drawable,
+) {
+    if options.show_shadows
+        && let Some(shadow_pre_redirect) =
+            data.shadow_image_pre_redirect(pre_redirect_image_id, unit_id)
+    {
+        drawables.push(Drawable {
+            art_image_id: data.resolve_art(shadow_pre_redirect),
+            is_shadow: true,
+            ..owner_drawable
+        });
+    }
+    drawables.push(owner_drawable);
 }
 
 /// Whether a placed unit survives `options`' filters (start locations excluded — they're handled
@@ -609,6 +667,14 @@ struct TileKey {
     frame: usize,
     flip: bool,
     color: [u8; 3],
+    /// Whether this tile is a shadow underlay. Shadows are colorless (see
+    /// [`apply_shadow_tint`]), so their `color` is always [`NO_TEAMCOLOR_SENTINEL`] regardless of
+    /// the owning drawable's real color — one cached tile per shadow image/frame/flip, no matter
+    /// how many differently-colored owners share it. Carried as its own field (rather than
+    /// relying solely on the sentinel color) so a shadow tile can never alias a same-keyed
+    /// non-shadow tile of the same `art_image_id`/frame/flip, which is compositied completely
+    /// differently (see [`build_tile`]).
+    is_shadow: bool,
 }
 
 /// The color placeholder used in a [`TileKey`] when the art has no `teamcolor` layer at all.
@@ -773,7 +839,16 @@ fn draw_overlay(
                 art_image_id,
                 frame: frame_index,
                 flip: drawable.flip,
-                color: tile_key_color(color, has_teamcolor),
+                // Shadows are colorless (see `apply_shadow_tint`): always the no-teamcolor
+                // sentinel, regardless of the owning drawable's real color or whether this art
+                // even has a `teamcolor` layer, so every owner sharing a shadow image/frame/flip
+                // shares one cached tile.
+                color: if drawable.is_shadow {
+                    NO_TEAMCOLOR_SENTINEL
+                } else {
+                    tile_key_color(color, has_teamcolor)
+                },
+                is_shadow: drawable.is_shadow,
             };
 
             let tile_ref = match tiles.entry(key) {
@@ -787,6 +862,7 @@ fn draw_overlay(
                         drawable.flip,
                         zoom,
                         texel_scale,
+                        drawable.is_shadow,
                     ) else {
                         continue;
                     };
@@ -910,7 +986,28 @@ fn clipped_span_len(start: u32, len: u32, bound: u32) -> u32 {
     len.min(bound - start)
 }
 
-/// Crops `rect` out of the diffuse atlas, applies the team color mask, downscales to output
+/// The alpha multiplier applied to a shadow's diffuse frame after its RGB is zeroed (see
+/// [`apply_shadow_tint`]) — BW's classic shadow draw-function semantics: a flat, translucent
+/// black silhouette, never team-colored. Calibrated visually against real renders (Lost Temple's
+/// mineral lines/trees, and `Impossible_Scen._Future.scx`'s dense units) within the brief's
+/// suggested 0.4-0.6 range — see the "Shadows" note in `docs/render-design.md`.
+const SHADOW_ALPHA_SCALE: f32 = 0.5;
+
+/// Recolors a cropped diffuse frame into a translucent black shadow silhouette: RGB is zeroed
+/// (BW always draws shadows as flat black, never team-colored — there is no shadow-specific
+/// `teamcolor` layer to apply) and alpha is scaled by [`SHADOW_ALPHA_SCALE`], so the diffuse
+/// frame's own alpha channel still provides the silhouette's shape.
+fn apply_shadow_tint(frame: &mut [u8]) {
+    for texel in frame.chunks_exact_mut(4) {
+        texel[0] = 0;
+        texel[1] = 0;
+        texel[2] = 0;
+        texel[3] = (texel[3] as f32 * SHADOW_ALPHA_SCALE).round() as u8;
+    }
+}
+
+/// Crops `rect` out of the diffuse atlas, applies the team color mask (or, for a shadow tile, the
+/// black/alpha-scaled shadow tint — see [`apply_shadow_tint`] — instead), downscales to output
 /// resolution and mirrors it if needed.
 ///
 /// `rect` is untrusted: it's derived from a frame's `u16` width/height (see
@@ -919,6 +1016,7 @@ fn clipped_span_len(start: u32, len: u32, bound: u32) -> u32 {
 /// taken at face value). `rect` is intersected with `diffuse`'s real dimensions *before* any
 /// allocation happens — the atlas itself is already capped at [`MAX_ANIM_TEXTURE_DIM`], so the
 /// intersection is always bounded by that regardless of what `rect` claims.
+#[allow(clippy::too_many_arguments)]
 fn build_tile(
     diffuse: &DecodedLayer,
     teamcolor: Option<&DecodedLayer>,
@@ -927,6 +1025,7 @@ fn build_tile(
     flip: bool,
     zoom: f32,
     texel_scale: f32,
+    is_shadow: bool,
 ) -> Option<Tile> {
     let (rect_x, rect_y, rect_w, rect_h) = rect;
     let rect_w = clipped_span_len(rect_x, rect_w, diffuse.width);
@@ -936,7 +1035,9 @@ fn build_tile(
     }
 
     let mut cropped = crop(diffuse, rect_x, rect_y, rect_w, rect_h);
-    if let Some(teamcolor) = teamcolor {
+    if is_shadow {
+        apply_shadow_tint(&mut cropped);
+    } else if let Some(teamcolor) = teamcolor {
         let mask = crop(teamcolor, rect_x, rect_y, rect_w, rect_h);
         apply_team_color(&mut cropped, &mask, color);
     }
@@ -1283,6 +1384,13 @@ mod tests {
     /// Byte offset of `images.dat`'s `has_directional_frames` column: right after the `grp` u32
     /// column, for 999 images.
     const IMAGES_DIRECTIONAL_COLUMN: usize = 999 * 4;
+    /// Byte offset of `images.dat`'s `render_style` column (the 6th of 14): the `grp` u32 column
+    /// plus the four single-byte columns ahead of it (`has_directional_frames`, `clickable`,
+    /// `use_full_iscript`, `always_visible`) — see `broodmap_formats::dat`'s
+    /// `IMAGES_COLUMN_SIZES`, whose own test independently pins this same offset at 7992.
+    const IMAGES_RENDER_STYLE_COLUMN: usize = 999 * 4 + 999 * 4;
+    /// `images.dat`'s raw `render_style` code for BW's "shadow" draw function.
+    const RENDER_STYLE_SHADOW: u8 = 10;
 
     fn unit(unit_id: u16, owner: Option<u8>, x: u16, y: u16) -> PlacedUnit {
         PlacedUnit {
@@ -1325,6 +1433,16 @@ mod tests {
     /// all the filtering tests need.
     fn game_data() -> GameData {
         GameData::load(&synthetic_source(synthetic_parts(0, 0, 0, 0, None))).unwrap()
+    }
+
+    /// Game data where unit/sprite ID 0 resolves to `main_image_id`, with `images.dat`'s
+    /// `render_style` column at `main_image_id + 1` set to `shadow_render_style` -- the shadow
+    /// tests' one knob.
+    fn game_data_with_shadow_render_style(main_image_id: u16, shadow_render_style: u8) -> GameData {
+        let mut parts = synthetic_parts(0, 0, 0, main_image_id, None);
+        let shadow_id = main_image_id as usize + 1;
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_id] = shadow_render_style;
+        GameData::load(&synthetic_source(parts)).unwrap()
     }
 
     /// Baseline options for tests: as-placed (the library default is Melee, but most of these
@@ -1553,6 +1671,246 @@ mod tests {
         assert_eq!(
             order,
             vec![(0, 99, 10), (0, 10, 30), (0, 50, 30), (1, 0, 0)]
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Shadows
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn shadow_emitted_when_plus_one_is_render_style_shadow() {
+        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let units = [unit(0, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+
+        assert_eq!(
+            drawn.len(),
+            2,
+            "expected a shadow plus its owner: {drawn:?}"
+        );
+        assert!(
+            drawn[0].is_shadow,
+            "the shadow must come first (painted beneath its owner)"
+        );
+        assert!(!drawn[1].is_shadow);
+        assert_eq!(
+            drawn[0].art_image_id, 6,
+            "shadow art is the +1 (post-redirect) image"
+        );
+        assert_eq!(drawn[1].art_image_id, 5);
+        // Same position, frame and flip as the owner.
+        assert_eq!((drawn[0].x, drawn[0].y), (drawn[1].x, drawn[1].y));
+        assert_eq!(drawn[0].frame, drawn[1].frame);
+        assert_eq!(drawn[0].flip, drawn[1].flip);
+        assert_eq!(drawn[0].layer, drawn[1].layer);
+    }
+
+    #[test]
+    fn no_shadow_when_plus_one_is_not_render_style_shadow() {
+        // render_style 9 ("use remapping"/teamcolor) is a real draw style, just not Shadow.
+        let data = game_data_with_shadow_render_style(5, 9);
+        let units = [unit(0, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+        assert_eq!(drawn.len(), 1, "no shadow should be emitted: {drawn:?}");
+        assert!(!drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn no_shadow_when_plus_one_entry_is_missing() {
+        // Image 998 is the last valid images.dat index (999 entries, 0-indexed); +1 (999) is out
+        // of range, so there's no entry to gate on at all.
+        let data = game_data_with_shadow_render_style(998, RENDER_STYLE_SHADOW);
+        let units = [unit(0, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+        assert_eq!(
+            drawn.len(),
+            1,
+            "out-of-range +1 must not panic or synthesize a shadow"
+        );
+        assert!(!drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn geyser_shadow_uses_plus_two_not_plus_one() {
+        // Mirrors the real data (image 344, +1=345 a same-GRP render_style-0 variant, +2=346
+        // "neutral\geyShad.grp" render_style 10): a vespene geyser's shadow lives at +2, not +1.
+        let mut parts = synthetic_parts(UNIT_ID_VESPENE_GEYSER, 0, 0, 10, None);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0; // +1: a variant, not a shadow
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW; // +2: the real shadow
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        let units = [unit(UNIT_ID_VESPENE_GEYSER, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+        assert_eq!(
+            drawn.len(),
+            2,
+            "the geyser should get a shadow at +2: {drawn:?}"
+        );
+        assert!(drawn[0].is_shadow);
+        assert_eq!(
+            drawn[0].art_image_id, 12,
+            "shadow art must be the +2 image, not +1"
+        );
+    }
+
+    #[test]
+    fn non_geyser_units_never_fall_back_to_plus_two() {
+        // Same images.dat layout as the geyser case above (+1 not a shadow, +2 is), but for an
+        // ordinary unit ID: only +1 is ever consulted for anything other than the geyser special
+        // case, so no shadow should be emitted even though +2 is a real one.
+        let mut parts = synthetic_parts(0, 0, 0, 10, None);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0;
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW;
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        let units = [unit(0, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+        assert_eq!(
+            drawn.len(),
+            1,
+            "ordinary units must not fall back to +2: {drawn:?}"
+        );
+        assert!(!drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn doodad_sprites_never_get_the_geyser_plus_two_special_case() {
+        // Sprite ID 188 coincides with the vespene geyser's *unit* ID, but doodads have no unit
+        // ID at all (THG2 pure-sprite entries), so the special case must never apply to them.
+        let mut parts = synthetic_parts(0, 0, UNIT_ID_VESPENE_GEYSER, 10, None);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0;
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW;
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        let drawn = collect_drawables(
+            &[],
+            &[doodad(UNIT_ID_VESPENE_GEYSER)],
+            &data,
+            &options(),
+            Tileset::Jungle,
+        );
+        assert_eq!(
+            drawn.len(),
+            1,
+            "doodads must never use the geyser +2 rule: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn show_shadows_false_suppresses_shadows_even_when_the_gate_would_pass() {
+        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let units = [unit(0, Some(11), 10, 20)];
+        let opts = RenderOptions {
+            show_shadows: false,
+            ..options()
+        };
+        let drawn = collect_drawables(&units, &[], &data, &opts, Tileset::Jungle);
+        assert_eq!(drawn.len(), 1);
+        assert!(!drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn shadows_apply_to_thg2_doodad_and_unit_sprites_too() {
+        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+
+        // A pure-sprite (doodad) THG2 entry resolves through `sprites.dat` directly, but the
+        // synthetic table chain routes both unit ID 0 and sprite ID 0 to image 5 (see
+        // `synthetic_parts`), so `doodad(0)` exercises the same shadow gate through the
+        // sprite-image path.
+        let drawn = collect_drawables(&[], &[doodad(0)], &data, &options(), Tileset::Jungle);
+        assert_eq!(drawn.len(), 2, "doodad sprites get shadows too: {drawn:?}");
+        assert!(drawn[0].is_shadow);
+
+        // A "unit sprite" THG2 entry (DRAW_AS_SPRITE clear) takes the full units.dat chain.
+        let drawn = collect_drawables(
+            &[],
+            &[unit_sprite(0, SpriteFlags::empty())],
+            &data,
+            &options(),
+            Tileset::Jungle,
+        );
+        assert_eq!(
+            drawn.len(),
+            2,
+            "THG2 unit-sprites get shadows too: {drawn:?}"
+        );
+        assert!(drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn start_locations_never_get_a_shadow() {
+        // Give image 588 (the start-location graphic) a real shadow-styled +1 neighbor; the
+        // start-location path must still never emit one.
+        let mut parts = synthetic_parts(0, 0, 0, 0, None);
+        let shadow_id = IMAGE_ID_START_LOCATION as usize + 1;
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_id] = RENDER_STYLE_SHADOW;
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        let units = [unit(UNIT_ID_START_LOCATION, Some(0), 64, 64)];
+        let opts = RenderOptions {
+            start_locations: StartLocations::Sprite,
+            ..options()
+        };
+        let drawn = collect_drawables(&units, &[], &data, &opts, Tileset::Jungle);
+        assert_eq!(
+            drawn.len(),
+            1,
+            "start locations must never get a shadow: {drawn:?}"
+        );
+        assert!(!drawn[0].is_shadow);
+    }
+
+    #[test]
+    fn required_preview_graphics_includes_shadow_anims_only_when_enabled() {
+        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let units = [unit(0, Some(11), 10, 20)];
+        let opts = RenderOptions {
+            art_style: ArtStyle::Remastered,
+            max_dimension: Some(1024),
+            unit_filter: UnitFilter::AsPlaced,
+            ..Default::default()
+        };
+
+        let with_shadows = required_preview_graphics(&units, &[], &data, 64, 64, &opts);
+        assert!(
+            with_shadows.contains(&AssetRequest::Anim {
+                image_id: 5,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            }),
+            "{with_shadows:?}"
+        );
+        assert!(
+            with_shadows.contains(&AssetRequest::Anim {
+                image_id: 6,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            }),
+            "the shadow anim must be prefetched too: {with_shadows:?}"
+        );
+
+        let no_shadows_opts = RenderOptions {
+            show_shadows: false,
+            ..opts
+        };
+        let without_shadows =
+            required_preview_graphics(&units, &[], &data, 64, 64, &no_shadows_opts);
+        assert!(
+            without_shadows.contains(&AssetRequest::Anim {
+                image_id: 5,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            }),
+            "{without_shadows:?}"
+        );
+        assert!(
+            !without_shadows.contains(&AssetRequest::Anim {
+                image_id: 6,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            }),
+            "show_shadows: false must not prefetch the shadow anim: {without_shadows:?}"
         );
     }
 
@@ -2201,6 +2559,7 @@ mod tests {
                 y: 64,
                 owner: 0,
                 layer: 0,
+                is_shadow: false,
             },
             // Placed absurdly far away: at zoom 1 this is tens of thousands of px off a 128x128
             // image, so no legitimate frame could ever reach back onto it.
@@ -2212,6 +2571,7 @@ mod tests {
                 y: 60_000,
                 owner: 0,
                 layer: 0,
+                is_shadow: false,
             },
         ];
 
