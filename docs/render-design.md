@@ -97,6 +97,39 @@ container, same building blocks; this is new work (neobrood explicitly doesn't s
 its own parser module. Player color uses the anim `teamcolor` mask layer composited with a
 player color, replacing classic palette remapping.
 
+Phase-2 facts pinned from neobrood + a real install (full specs live in the
+`broodmap-formats` module docs):
+
+- .dat files are column-major (struct-of-arrays); units.dat 228 entries/19876 B, flingy.dat
+  209/3135, sprites.dat 517/3229, images.dat 999/37962. Some columns exist only for ID
+  subranges (buildings 106..202, "units" 0..106; sprites 130..517 for selectable fields).
+- `images.rel` is 999 x 8-byte records (u32 rel_type, u32 ref_image); `rel_type & 0x200` +
+  a non-sentinel ref means "load this image's art from ref_image's anim instead".
+- Anim paths: `{tier}anim/{pack}main_{id:03}.anim` (tier prefix ""/"HD2/", pack infix
+  "Carbot/"; note the pack infix sits INSIDE anim/, unlike tilesets). `images.tbl` is NOT
+  needed for anim resolution — only for classic GRP/LO paths (phase 3+).
+- .anim container: 12 B header (magic ANIM, u8 scale, u8 type 1=SD/2=HD, layer/entry counts),
+  fixed-size name table to 0x14C, frame-table header (count, ref_id, canvas w/h, table
+  offset), per-layer 12 B texture records (absolute offset/size + dims, offset 0 = absent,
+  payloads are embedded DDS/PNG — sniff), per-frame 12 B records. All frame coords are in
+  fixed "4K" units (1 logical px = 4 units); embedded texels = 4K units / (4 / scale). Layers
+  share one frame table. `ref_id != 0xFFFF` = inline reference (rare; unsupported for now).
+- Teamcolor compositing, pinned empirically in phase 2 (no reference implementation exists):
+  the mask is the teamcolor layer's RED/grayscale channel, not alpha — all 155 teamcolor
+  layers in the HD2 corpus are BC1 (no meaningful alpha; every diffuse layer is BC3). Blend is
+  multiplicative, per channel: `out = diffuse * ((255 - m) + m * player_rgb / 255) / 255`,
+  which preserves the art's shading (straight lerp collapses masked regions into flat
+  shadeless color). See `apply_team_color` in `broodmap-render/src/overlay.rs`.
+- 10 of 868 HD2 anims (all editor-only graphics, including 588, the start-location marker)
+  declare a 0x0 canvas in their frame-table header; taking it literally misplaces the frame by
+  its half-extent. Fall back to `2 * offset + size` per axis (see `effective_canvas`).
+- THG2 "unit sprite" entries (DRAW_AS_SPRITE clear) hold UNIT ids and resolve through the
+  full units.dat chain; only pure-sprite entries (flag set) are sprites.dat ids.
+- Facing: units.dat `unit_direction` (0-31; 32 = random, rendered deterministically);
+  directional images map direction to frame with horizontal flip for the mirrored half.
+- Resource art: mineral frame by amount thresholds and geyser frame by tileset are bw-chk
+  conventions (neobrood has neither); we follow bw-chk.
+
 Art style is the only user-facing quality knob: `ArtStyle { Original, Remastered, Cartooned }`.
 The SD art is genuinely different art from the HD art (HD2 is the same art as HD at half
 resolution), and Cartooned (the "StarCraft: Cartooned" / Carbot pack, CASC paths with a
@@ -106,11 +139,12 @@ exists at); the Remastered-family styles use HD only when the effective px/tile 
 native 64 — including treating "no size cap" as HD2-native, since full HD is enormous
 (128px/tile) and only worth fetching when the output actually shows it. Invalid style/tier
 combinations (original at HD, SD Cartooned) are unrepresentable rather than runtime errors.
-Requested output size is honored by scaling at draw time —
-each megatile/sprite frame is decoded and downscaled to the effective tile size before
-blitting, so memory stays proportional to the output buffer. This matters: compositing a
-256x256 map at full HD (128 px/tile) would be a 32k x 32k image (~4 GB RGBA); "1024x1024
-rendered from HD assets" must never materialize that intermediate.
+Requested output size is honored without ever materializing a full-resolution intermediate —
+this matters because compositing a 256x256 map at full HD (128 px/tile) would be a 32k x 32k
+image (~4 GB RGBA), and "1024x1024 rendered from HD assets" must not pay that. Sprite frames are
+decoded and downscaled individually before blitting; terrain composites at native resolution but
+only a strip at a time, then resamples (see "Terrain downscaling"). Either way peak memory stays
+proportional to the output buffer plus a bounded working set.
 
 ## broodmap-render API
 
@@ -160,6 +194,15 @@ WASM flow: parse CHK -> fetch round 1 -> resolve -> fetch round 2 -> render, all
 fetches. Native sources just answer `read()` on demand and never see the rounds. Options
 participate in round 2: filtered-out units' anims are never requested.
 
+Round 1's own rule changed once the render's read pattern turned out wider than "only when unit
+art is available": `required_preview_assets` also pulls in the `.dat`/`.rel` tables whenever
+`start_locations` is `ColorBlock` (the default), because sizing that token reads `units.dat`'s
+placebox even when the unit layer itself is `Original` (unit art unavailable). The tables are
+omitted only when *neither* condition holds — i.e. `Original` units with start locations set to
+`Sprite` or `Hidden`. `required_preview_assets_for_chk`/`required_preview_graphics_for_chk` wrap
+both rounds for callers that already have a parsed `Chk`, so they can't drift from what
+`render_chk_preview` actually reads.
+
 ### Render plan (decide vs. draw)
 
 The compositor's intermediate representation is public: a tile layer (megatile ID grid), an
@@ -179,14 +222,35 @@ Defaults are preview-oriented: everything a navigating player would want visible
 resources, preplaced buildings and units, doodad sprites, critters (toggleable, but most map
 previews keep them).
 
-- `start_locations: Hidden | Marker { style } | Sprite`
-- toggles: critters, neutral buildings, resources, THG2 doodad sprites
-- `unit_filter: AsPlaced | Melee` — melee drops preplaced player-owned units (the game replaces
-  them with starting workers) and keeps neutral units/resources; decided from CHK ownership,
-  forces, and unit properties
+- `start_locations: ColorBlock (default) | Sprite | Hidden` — the in-game start-location
+  graphic reads poorly at preview scale, so the default is the pro-map-preview convention: a
+  solid block in the owning player's resolved color, sized to the start location's footprint
+  (its units.dat placebox, 4x3 tiles), centered on the placed position. `Sprite` uses the
+  actual image (ID 588; note Carbot doesn't ship it — force the Standard pack for that one
+  image, matching the game).
+- toggles: critters, neutral buildings (`show_neutral_buildings`, implemented — drops
+  neutral-owned `UNIT`-chunk entries whose `units.dat` special-ability flags mark them as a
+  Building, but never resources or start locations), resources, THG2 doodad sprites
+- `unit_filter: Melee (default) | AsPlaced` — previews overwhelmingly serve melee play, and
+  the game applies melee rules regardless of what the map placed, so Melee is the default
+  (`--as-placed` for the UMS view). Melee drops preplaced player-owned units (the game
+  replaces them with starting workers) and clears units whose `units.dat` collision bounds
+  overlap a start location's spawn area (the game destroys anything within the spawned HQ's
+  bounds — we use the smallest of the three HQs' bounds, since mapmakers design for
+  race-independent behavior; collision bounds, NOT the placebox, which is the larger
+  placement-grid footprint). Neutral units/resources are kept. Units preplaced in the
+  hallucinated state are dropped under BOTH filters — mappers use them to push starting
+  workers into position and they expire moments into a real game.
 - creep on/off
 - `art_style: Original | Remastered | Cartooned`; target output size (the HD/HD2 tier is
   derived from these two — there is deliberately no explicit tier knob)
+- `unit_style: Option<ArtStyle>` (phase 2): render the unit/sprite layer in a different style
+  than the terrain (e.g. Cartooned terrain + Remastered units). Mixing tiers is cheap because
+  all drawing normalizes through draw-time scaling: each tier's art has a fixed scale
+  multiplier (SD 1x, HD2 2x, HD 4x; 1 tile = 32 logical px), so a layer's frames — and its
+  anim frame offsets, which are authored in the same tier pixels — scale by
+  `output_zoom / layer_scale`. `Original` units require `mainSD.anim` and stay unavailable
+  until phase 3.
 - `max_output_pixels` (default 64Mi px = 256 MiB RGBA): a hard output-buffer budget. The
   resolution is clamped down (before tier selection, so budget-shrunk renders also fetch the
   cheaper tier) rather than errored, so rendering always succeeds within bounded memory.
@@ -194,6 +258,65 @@ previews keep them).
 `required_terrain_assets(tileset, map_w, map_h, options)` exposes exactly which
 `AssetRequest`s a render will make, so prefetching callers (WASM) don't duplicate
 tier-selection logic. The phase-2 two-round `required_*` API extends this.
+
+### Terrain downscaling
+
+Resolved (was an open question). The terrain layer composites megatiles at the art's **native**
+tile size into a rolling window of horizontal strips — one tile row live at a time — and resamples
+the native image to the output size with a separable **Catmull-Rom** kernel evaluated in
+**linear light**. When the output's px/tile already equals the native tile size there is a fast
+path that skips filtering entirely, so native-resolution renders are unchanged.
+
+The strip window is what makes whole-image resampling affordable: peak memory is one strip
+(`map_w * tile_px` x `tile_px`, at most 16 MiB) plus a ring of a few resampled output rows (~2 MiB
+worst case) plus the output buffer. The full native intermediate — 32Ki x 32Ki, 4 GiB, for a
+256x256 map at HD — is never materialized, which was the constraint that forced per-tile
+downscaling in the first place.
+
+**What this fixes.** The old path box-filtered each megatile in isolation, in sRGB space. A box
+filter is a poor low-pass filter, so detail above the output's Nyquist limit folds back in as
+speckle; and a per-tile window cannot see the neighbouring tile's pixels that belong in an output
+pixel straddling the seam. Together those broke up shorelines and cliff edges into stippled,
+discontinuous runs, worst at non-integer ratios (a 64px tile into 7 output pixels: some output
+pixels average 9 source rows, some 10, which beats against the art's own texture) but clearly
+visible at aligned ratios too. sRGB-space averaging compounded it by darkening every
+mixed-brightness pixel.
+
+Measured against a linear-light Lanczos-3 downscale of the native render of Lost Temple (RMSE,
+0-1 scale):
+
+| output              | old: per-tile box | new: strip Catmull-Rom |
+|---------------------|-------------------|------------------------|
+| HD2 `--size 900`    | 0.00963           | 0.00363                |
+| HD2 `--size 1024`   | 0.00916           | 0.00370                |
+| HD2 `--size 2048`   | 0.00776           | 0.00361                |
+| SD  `--size 900`    | 0.01239           | 0.00424                |
+
+Catmull-Rom (B = 0, C = 1/2) was picked over the more usual Mitchell (B = C = 1/3) by
+measurement: Mitchell scored 0.0066-0.0069 across the same cases — better than box, but its wide
+main lobe visibly softens terrain — while Catmull-Rom's ringing stays under the output clamp even
+on this art's highest-contrast content (cliff against water). Cost: the terrain render goes from
+~87 ms to ~345 ms for a 128x128 map at 1024px (release, warm cache), because the whole native
+image is now composited and filtered rather than one thumbnail per distinct megatile. That is
+driven by the native resolution, not the output size, so it is roughly flat in `--size`.
+
+**What this does not fix, and why we stopped.** Heavy downscales still make open ground look
+repetitive: Brood War terrain draws from a small set of megatile variants, and the SC:R HD/HD2
+art's variants differ from one another less than the original art's did. In game this is hidden
+by zoom and by SC:R's `.fol` foliage overlays (an SC:R-only addition, a possible later
+authenticity feature). It is a property of the art, not of the filter.
+
+A deterministic "texture breakup" option was implemented and rejected: hashed per-tile luminance
+jitter plus a low-frequency luminance field plus per-pixel dither, all keyed off tile/pixel
+coordinates. It did what it claimed numerically — in a 128x128px patch of Lost Temple grass, the
+old path produced 256 tile blocks with only 48 distinct values (208 exact duplicates), the
+resampler alone brought that to 251 distinct, and the noise to 256 — but it did not read as an
+improvement. The perceived grid comes from the *within-tile* pattern repeating at the tile pitch,
+which a per-tile brightness offset cannot touch; at amplitudes low enough to be unobtrusive the
+effect was invisible against the texture's own variance, and at amplitudes high enough to notice
+it drew a soft checkerboard at exactly the tile pitch, i.e. more grid, not less. Don't re-attempt
+this from the luminance-noise direction; if it's worth revisiting, the leverage is in the art
+(foliage overlays, or per-instance variant selection), not in post-processing.
 
 ### Minimap
 
@@ -275,12 +398,11 @@ render plan computes up front; the executor walks it bandwise).
   VX4EX/VR4/WPE parsers are needed after all — but only by the dev-time minimap table
   generator, not at render time.)
 - SD `mainSD.anim` container details — reverse from community docs + real data in phase 3.
-- Downscaling quality: visible artifacting has been observed in scaled-down terrain. Likely
-  contributors: each tile is filtered independently (fractional sample boundaries don't line
-  up across tiles -> seams, the same artifact bw-chk documents), averaging happens in sRGB
-  rather than linear space, and pixel-art SD suffers at non-integer ratios. Candidate fixes
-  (later phase): composite at tile-native resolution in strips and downscale across tile
-  boundaries, gamma-correct averaging, and/or an integer-ratio/nearest mode for SD.
+- ~~Downscaling quality~~ — resolved: see the "Terrain downscaling" section for the shipped
+  pipeline (native-resolution strip compositing, linear-light Catmull-Rom resampling), the
+  measurements behind the kernel choice, and the record of the texture-breakup experiment that
+  was implemented and rejected. Terrain repetition at preview scale is *not* fixed and is not a
+  filtering problem; that section says where the remaining leverage actually is.
 - `scale_rgba` averages channels independently (straight alpha) — exact for opaque terrain,
   but produces dark fringes on translucent sprite edges; switch to premultiplied-alpha
   filtering before phase 2 reuses it for `.anim` frames (TODO recorded in the code).

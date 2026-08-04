@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use broodmap::extract_chk_from_map;
-use broodmap_render::{ArtStyle, CascSource, DirSource, RenderOptions, render_terrain};
+use broodmap_render::{
+    ArtStyle, CascSource, DirSource, Preview, RenderOptions, RgbaImage, StartLocations, UnitFilter,
+    render_chk_preview, render_terrain,
+};
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
 /// given.
@@ -22,7 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Renders a map's terrain to a PNG image using StarCraft: Remastered assets.
+    /// Renders a map preview (terrain plus units, resources and doodads) to a PNG image using
+    /// StarCraft: Remastered assets.
     Render(RenderArgs),
 }
 
@@ -53,6 +57,63 @@ struct RenderArgs {
     /// is picked automatically from `--size`.
     #[arg(long, value_enum, default_value_t = ArtStyleArg::Remastered)]
     style: ArtStyleArg,
+
+    /// Art style for the unit/sprite layer, if it should differ from `--style` (e.g. Cartooned
+    /// terrain with Remastered units). Defaults to `--style`.
+    #[arg(long, value_enum)]
+    unit_style: Option<ArtStyleArg>,
+
+    /// How start locations are drawn.
+    #[arg(long, value_enum, default_value_t = StartLocationsArg::Block)]
+    start_locations: StartLocationsArg,
+
+    /// Show everything the map placed, as placed (UMS view). By default the preview applies
+    /// melee rules instead: preplaced player-owned units are dropped (the game replaces them
+    /// with starting workers) and units overlapping a start location's spawn area are cleared,
+    /// keeping neutral units, resources and start locations.
+    #[arg(long)]
+    as_placed: bool,
+
+    /// Don't draw critters.
+    #[arg(long)]
+    no_critters: bool,
+
+    /// Don't draw mineral fields or vespene geysers.
+    #[arg(long)]
+    no_resources: bool,
+
+    /// Don't draw neutral-owned buildings (e.g. an unclaimed Zerg Extractor). Player-owned
+    /// buildings, resources and start locations are unaffected.
+    #[arg(long)]
+    no_neutral_buildings: bool,
+
+    /// Don't draw THG2 doodad sprites.
+    #[arg(long)]
+    no_doodads: bool,
+
+    /// Render terrain only, skipping the unit/sprite overlay entirely.
+    #[arg(long)]
+    terrain_only: bool,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum StartLocationsArg {
+    /// A solid block in the owning player's color (the map-preview convention).
+    Block,
+    /// The in-game start-location graphic.
+    Sprite,
+    /// Not drawn.
+    Hidden,
+}
+
+impl From<StartLocationsArg> for StartLocations {
+    fn from(value: StartLocationsArg) -> Self {
+        match value {
+            StartLocationsArg::Block => StartLocations::ColorBlock,
+            StartLocationsArg::Sprite => StartLocations::Sprite,
+            StartLocationsArg::Hidden => StartLocations::Hidden,
+        }
+    }
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -90,14 +151,20 @@ fn render(args: RenderArgs) -> Result<()> {
     let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
         .with_context(|| format!("failed to parse map file {}", args.map.display()))?;
 
-    let terrain = chk
-        .terrain()
-        .map_err(|e| anyhow::anyhow!("failed to read map terrain: {e}"))?;
-    let tileset = chk.tileset();
-
     let options = RenderOptions {
         art_style: args.style.into(),
+        unit_style: args.unit_style.map(Into::into),
         max_dimension: Some(args.size),
+        start_locations: args.start_locations.into(),
+        unit_filter: if args.as_placed {
+            UnitFilter::AsPlaced
+        } else {
+            UnitFilter::Melee
+        },
+        show_critters: !args.no_critters,
+        show_resources: !args.no_resources,
+        show_doodad_sprites: !args.no_doodads,
+        show_neutral_buildings: !args.no_neutral_buildings,
         ..Default::default()
     };
 
@@ -106,10 +173,24 @@ fn render(args: RenderArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_out_path(&args.map));
 
-    let image = if let Some(assets_dir) = &args.assets_dir {
-        let source = DirSource::new(assets_dir);
-        render_terrain(terrain, tileset, &source, &options)
-            .context("failed to render map terrain")?
+    let render = |source: &dyn broodmap_render::TilesetDataSource| -> Result<Preview> {
+        if args.terrain_only {
+            let terrain = chk
+                .terrain()
+                .map_err(|e| anyhow::anyhow!("failed to read map terrain: {e}"))?;
+            let image: RgbaImage = render_terrain(terrain, chk.tileset(), source, &options)
+                .context("failed to render map terrain")?;
+            Ok(Preview {
+                image,
+                warnings: Vec::new(),
+            })
+        } else {
+            render_chk_preview(&chk, source, &options).context("failed to render map preview")
+        }
+    };
+
+    let preview = if let Some(assets_dir) = &args.assets_dir {
+        render(&DirSource::new(assets_dir))?
     } else {
         let source = CascSource::open(&args.install).with_context(|| {
             format!(
@@ -117,11 +198,15 @@ fn render(args: RenderArgs) -> Result<()> {
                 args.install.display()
             )
         })?;
-        render_terrain(terrain, tileset, &source, &options)
-            .context("failed to render map terrain")?
+        render(&source)?
     };
 
-    let png_bytes = image
+    for warning in &preview.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let png_bytes = preview
+        .image
         .encode_png()
         .context("failed to encode rendered map as PNG")?;
     std::fs::write(&out_path, png_bytes)
@@ -130,8 +215,8 @@ fn render(args: RenderArgs) -> Result<()> {
     println!(
         "Wrote {} ({}x{})",
         out_path.display(),
-        image.width,
-        image.height
+        preview.image.width,
+        preview.image.height
     );
 
     Ok(())

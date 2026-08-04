@@ -9,6 +9,32 @@ use broodmap::chk::tileset::Tileset;
 
 use crate::tier::{ArtPack, AssetTier};
 
+/// Which of BW's `.dat` stat tables an [`AssetRequest::Dat`] refers to. All of them live under
+/// `arr/` in the CASC catalog.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum DatKind {
+    /// `arr/units.dat` — per-unit-type stats (including the flingy each unit uses).
+    Units,
+    /// `arr/flingy.dat` — movement types; maps a flingy to a sprite.
+    Flingy,
+    /// `arr/sprites.dat` — maps a sprite to an image.
+    Sprites,
+    /// `arr/images.dat` — per-image rendering metadata.
+    Images,
+}
+
+impl DatKind {
+    /// The filename stem of this table (`"units"`, `"flingy"`, ...).
+    fn stem(&self) -> &'static str {
+        match self {
+            DatKind::Units => "units",
+            DatKind::Flingy => "flingy",
+            DatKind::Sprites => "sprites",
+            DatKind::Images => "images",
+        }
+    }
+}
+
 /// A request for a specific piece of SC:R asset data, keyed by what's needed rather than by
 /// path. `Eq + Hash` so it can key caches (and `MemorySource`'s prefetch map) directly.
 ///
@@ -23,6 +49,21 @@ pub enum AssetRequest {
     /// A tileset's pre-rendered megatile textures at a given quality tier, from a given art
     /// pack.
     TilesetDds(Tileset, AssetTier, ArtPack),
+    /// One of BW's `.dat` stat tables (`arr/units.dat` and friends), needed to resolve a placed
+    /// unit or THG2 sprite to the image whose art should be drawn.
+    Dat(DatKind),
+    /// `images.rel`, the per-image art redirection table.
+    ImagesRel,
+    /// A single image's `.anim` art container at a given tier/pack.
+    ///
+    /// [`AssetTier::Sd`] doesn't have per-image files at all: all SD art lives in one bundled
+    /// `SD/mainSD.anim`, so every SD request maps to that same path (and `image_id`/`pack` are
+    /// only meaningful for indexing *into* it, which is a later phase).
+    Anim {
+        image_id: u16,
+        tier: AssetTier,
+        pack: ArtPack,
+    },
 }
 
 impl std::hash::Hash for AssetRequest {
@@ -35,6 +76,23 @@ impl std::hash::Hash for AssetRequest {
             AssetRequest::TilesetDds(tileset, tier, pack) => {
                 1u8.hash(state);
                 tileset_discriminant(*tileset).hash(state);
+                tier.hash(state);
+                pack.hash(state);
+            }
+            AssetRequest::Dat(kind) => {
+                2u8.hash(state);
+                kind.hash(state);
+            }
+            AssetRequest::ImagesRel => {
+                3u8.hash(state);
+            }
+            AssetRequest::Anim {
+                image_id,
+                tier,
+                pack,
+            } => {
+                4u8.hash(state);
+                image_id.hash(state);
                 tier.hash(state);
                 pack.hash(state);
             }
@@ -61,6 +119,24 @@ impl AssetRequest {
                 pack.casc_infix(),
                 tileset_stem(*tileset)
             ),
+            AssetRequest::Dat(kind) => format!("arr/{}.dat", kind.stem()),
+            AssetRequest::ImagesRel => "images.rel".to_string(),
+            // NOTE the pack infix sits *inside* `anim/` here (`HD2/anim/Carbot/main_005.anim`),
+            // unlike tilesets where it sits before the directory (`HD2/Carbot/TileSet/...`).
+            // Both spellings are verified against a real install's catalog.
+            AssetRequest::Anim {
+                image_id,
+                tier,
+                pack,
+            } => match tier {
+                AssetTier::Sd => "SD/mainSD.anim".to_string(),
+                _ => format!(
+                    "{}anim/{}main_{:03}.anim",
+                    tier.casc_prefix(),
+                    pack.casc_infix(),
+                    image_id
+                ),
+            },
         }
     }
 }
@@ -276,6 +352,108 @@ mod tests {
             AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Hd2, ArtPack::Carbot).casc_path(),
             "HD2/Carbot/TileSet/jungle.dds.vr4"
         );
+    }
+
+    /// Verified against a real SC:R install's catalog listing.
+    #[test]
+    fn anim_dat_and_rel_paths_match_the_real_catalog() {
+        use crate::tier::ArtPack;
+
+        let anim = |image_id, tier, pack| {
+            AssetRequest::Anim {
+                image_id,
+                tier,
+                pack,
+            }
+            .casc_path()
+        };
+
+        assert_eq!(
+            anim(5, AssetTier::Hd, ArtPack::Standard),
+            "anim/main_005.anim"
+        );
+        assert_eq!(
+            anim(5, AssetTier::Hd2, ArtPack::Standard),
+            "HD2/anim/main_005.anim"
+        );
+        // The Carbot infix goes *inside* anim/, unlike the tileset layout.
+        assert_eq!(
+            anim(899, AssetTier::Hd, ArtPack::Carbot),
+            "anim/Carbot/main_899.anim"
+        );
+        assert_eq!(
+            anim(955, AssetTier::Hd2, ArtPack::Carbot),
+            "HD2/anim/Carbot/main_955.anim"
+        );
+        // SD art is one bundled file, regardless of image ID or pack.
+        assert_eq!(anim(5, AssetTier::Sd, ArtPack::Standard), "SD/mainSD.anim");
+        assert_eq!(anim(900, AssetTier::Sd, ArtPack::Carbot), "SD/mainSD.anim");
+
+        assert_eq!(
+            AssetRequest::Dat(DatKind::Units).casc_path(),
+            "arr/units.dat"
+        );
+        assert_eq!(
+            AssetRequest::Dat(DatKind::Flingy).casc_path(),
+            "arr/flingy.dat"
+        );
+        assert_eq!(
+            AssetRequest::Dat(DatKind::Sprites).casc_path(),
+            "arr/sprites.dat"
+        );
+        assert_eq!(
+            AssetRequest::Dat(DatKind::Images).casc_path(),
+            "arr/images.dat"
+        );
+        assert_eq!(AssetRequest::ImagesRel.casc_path(), "images.rel");
+    }
+
+    /// The hand-written `Hash` impl must agree with `Eq` across every variant (a mismatch would
+    /// silently break `MemorySource`'s prefetch map and the renderer's caches).
+    #[test]
+    fn hash_agrees_with_eq_across_variants() {
+        use crate::tier::ArtPack;
+        use std::collections::HashSet;
+
+        let requests = [
+            AssetRequest::Cv5(Tileset::Jungle),
+            AssetRequest::Cv5(Tileset::Desert),
+            AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Hd2, ArtPack::Standard),
+            AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Hd2, ArtPack::Carbot),
+            AssetRequest::Dat(DatKind::Units),
+            AssetRequest::Dat(DatKind::Images),
+            AssetRequest::ImagesRel,
+            AssetRequest::Anim {
+                image_id: 5,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            },
+            AssetRequest::Anim {
+                image_id: 6,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            },
+            AssetRequest::Anim {
+                image_id: 5,
+                tier: AssetTier::Hd,
+                pack: ArtPack::Standard,
+            },
+            AssetRequest::Anim {
+                image_id: 5,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Carbot,
+            },
+        ];
+
+        let set: HashSet<&AssetRequest> = requests.iter().collect();
+        assert_eq!(
+            set.len(),
+            requests.len(),
+            "distinct requests must not alias"
+        );
+        for req in &requests {
+            assert!(set.contains(req));
+        }
     }
 
     #[test]
