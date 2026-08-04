@@ -14,7 +14,10 @@ use broodmap::Chk;
 use broodmap::chk::terrain::{TerrainTileIds, TileId};
 use broodmap::chk::tileset::Tileset;
 use broodmap::extract_chk_from_map;
-use broodmap_formats::{DdsVr4, Frame, parse_cv5, parse_dds};
+use broodmap_formats::{
+    Anim, DdsVr4, Frame, parse_cv5, parse_dds, parse_flingy_dat, parse_images_dat,
+    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat,
+};
 use broodmap_render::{
     ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, RenderOptions, render_terrain,
 };
@@ -113,6 +116,7 @@ fn main() {
 
     write_formats_parse_seeds(&seeds_root);
     write_render_terrain_seed(&seeds_root);
+    write_anim_parse_seed(&seeds_root);
 
     println!("done");
 }
@@ -169,6 +173,91 @@ fn write_formats_parse_seeds(seeds_root: &Path) {
         assert!(vr4.palette().is_some());
     }
     write_seed(&dir, "paletted_vr4.bin", &paletted_vr4);
+
+    // A `units.dat`-shaped buffer at its real size (19876 bytes, mostly zero) with a few nonzero
+    // values planted in each column this crate exposes, at unit ID 5 -- mirrors
+    // `broodmap-formats/src/dat.rs`'s own
+    // `units_dat_extracts_exposed_columns_incl_subrange_affected_offsets` test, including a
+    // subrange-affected column (bounds sits after the buildings-only `addon_size` column) so the
+    // seed exercises non-trivial offset computation, not just column 0.
+    let units_dat = make_units_dat_seed();
+    {
+        let dat = parse_units_dat(&units_dat);
+        let entry = dat.entry(5).expect("seed units.dat entry 5 should parse");
+        assert_eq!(entry.flingy, 42, "seed units.dat should round-trip");
+    }
+    write_seed(&dir, "units_dat_valid.bin", &units_dat);
+
+    // Small (not full-size) `flingy.dat`/`sprites.dat`/`images.dat` buffers: each exposed column
+    // starts near the front of its file (see dat.rs's column layout), so a short buffer covering
+    // just past the interesting entry -- with the remaining, unwritten entries reading back as
+    // zero via the parser's own permissive truncation handling -- exercises the same real column
+    // math as a full-size file while staying small, matching this corpus's preference for compact
+    // seeds. (`images.dat`'s `special_overlay` column sits much further into the file, so that one
+    // entry stays zero/`None` here rather than requiring a near-full-size buffer.)
+    let flingy_dat = make_flingy_dat_seed();
+    {
+        let dat = parse_flingy_dat(&flingy_dat);
+        assert_eq!(
+            dat.sprite_id(3),
+            Some(555),
+            "seed flingy.dat should round-trip"
+        );
+    }
+    write_seed(&dir, "flingy_dat_valid.bin", &flingy_dat);
+
+    let sprites_dat = make_sprites_dat_seed();
+    {
+        let dat = parse_sprites_dat(&sprites_dat);
+        assert_eq!(
+            dat.image_id(20),
+            Some(42),
+            "seed sprites.dat should round-trip"
+        );
+    }
+    write_seed(&dir, "sprites_dat_valid.bin", &sprites_dat);
+
+    let images_dat = make_images_dat_seed();
+    {
+        let dat = parse_images_dat(&images_dat);
+        let entry = dat.entry(0).expect("seed images.dat entry 0 should parse");
+        assert_eq!(entry.grp, 12, "seed images.dat should round-trip");
+        assert!(entry.has_directional_frames);
+        assert_eq!(entry.render_style, 9);
+        assert_eq!(entry.color_shift, 2);
+    }
+    write_seed(&dir, "images_dat_valid.bin", &images_dat);
+
+    // A valid `images.rel`: a couple of records, one with the redirect flag+ref set, matching
+    // `broodmap-formats/src/rel.rs`'s own test layout.
+    let rel_bytes = make_rel_seed();
+    {
+        let rel = parse_images_rel(&rel_bytes);
+        assert_eq!(
+            rel.resolve(0),
+            0,
+            "seed images.rel entry 0 should not redirect"
+        );
+        assert_eq!(
+            rel.resolve(1),
+            42,
+            "seed images.rel entry 1 should redirect to 42"
+        );
+    }
+    write_seed(&dir, "rel_valid.bin", &rel_bytes);
+
+    // A valid `.tbl` string table with a few entries.
+    let tbl_bytes = make_tbl_seed();
+    {
+        let tbl = parse_tbl(&tbl_bytes);
+        assert_eq!(
+            tbl.get(0).as_deref(),
+            Some("Zerg"),
+            "seed .tbl should round-trip"
+        );
+        assert_eq!(tbl.get(2).as_deref(), Some("Protoss"));
+    }
+    write_seed(&dir, "tbl_valid.bin", &tbl_bytes);
 }
 
 /// Writes a synthetic (not Blizzard-derived) seed for the `render_terrain` target: a
@@ -314,6 +403,388 @@ fn make_paletted_vr4(width: u16, height: u16, palette: &[u8; 1024], tiles: &[&[u
         data.extend_from_slice(tile);
     }
     data
+}
+
+// ---------------------------------------------------------------------------------------------
+// units.dat / flingy.dat / sprites.dat / images.dat synthetic seed builders
+// ---------------------------------------------------------------------------------------------
+//
+// These mirror the private column layouts in `broodmap-formats/src/dat.rs` (kept in sync there by
+// that crate's own `total_size(...) == *_DAT_SIZE` compile-time assertions); duplicated here since
+// those layout constants aren't part of the crate's public API.
+
+const UNITS_COUNT: usize = 228;
+const BUILDINGS_COUNT: usize = 96;
+const UNITS_ONLY_COUNT: usize = 106;
+const UNITS_DAT_SIZE: usize = 19876;
+
+const UNITS_COLUMN_SIZES: &[usize] = &[
+    UNITS_COUNT,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    BUILDINGS_COUNT * 2,
+    UNITS_COUNT * 4,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 4,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT * 4,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_ONLY_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_ONLY_COUNT * 2,
+    UNITS_ONLY_COUNT * 2,
+    UNITS_ONLY_COUNT * 2,
+    UNITS_ONLY_COUNT * 2,
+    UNITS_COUNT * 4,
+    BUILDINGS_COUNT * 4,
+    UNITS_COUNT * 8,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT * 2,
+    UNITS_COUNT,
+    UNITS_COUNT * 2,
+];
+const UNITS_COL_FLINGY: usize = 0;
+const UNITS_COL_SUB_UNIT_1: usize = 1;
+const UNITS_COL_UNIT_DIRECTION: usize = 5;
+const UNITS_COL_SPECIAL_ABILITY_FLAGS: usize = 22;
+const UNITS_COL_PLACEBOX_SIZE: usize = 36;
+const UNITS_COL_BOUNDS: usize = 38;
+const UNITS_COL_STAR_EDIT_GROUP_FLAGS: usize = 44;
+
+const FLINGY_COLUMN_SIZES: &[usize] = &[
+    209 * 2, // sprite: u16
+    209 * 4, // speed: u32
+    209 * 2, // acceleration: u16
+    209 * 4, // halt_distance: u32
+    209,     // turn_radius: u8
+    209,     // unused: u8
+    209,     // movement_control: u8
+];
+const FLINGY_COL_SPRITE: usize = 0;
+
+const SPRITES_COLUMN_SIZES: &[usize] = &[
+    517 * 2, // image: u16
+    387,     // health_bar: u8 (selectable-only)
+    517,     // unknown: u8
+    517,     // visible: u8
+    387,     // selection_circle: u8 (selectable-only)
+    387,     // selection_circle_offset: u8 (selectable-only)
+];
+const SPRITES_COL_IMAGE: usize = 0;
+
+const IMAGES_COLUMN_SIZES: &[usize] = &[
+    999 * 4, // grp: u32
+    999,     // has_directional_frames: u8
+    999,     // clickable: u8
+    999,     // use_full_iscript: u8
+    999,     // always_visible: u8
+    999,     // render_style: u8
+    999,     // color_shift: u8
+    999 * 4, // iscript: u32
+    999 * 4, // shield_overlay: u32
+    999 * 4, // attack_overlay: u32
+    999 * 4, // damage_overlay: u32
+    999 * 4, // special_overlay: u32
+    999 * 4, // landing_dust_overlay: u32
+    999 * 4, // lift_off_dust_overlay: u32
+];
+const IMAGES_COL_GRP: usize = 0;
+const IMAGES_COL_HAS_DIRECTIONAL_FRAMES: usize = 1;
+const IMAGES_COL_RENDER_STYLE: usize = 5;
+const IMAGES_COL_COLOR_SHIFT: usize = 6;
+
+/// Returns the byte offset where column `index` (into `sizes`) begins, matching
+/// `dat.rs::column_offset`.
+fn dat_column_offset(sizes: &[usize], index: usize) -> usize {
+    sizes[..index].iter().sum()
+}
+
+fn dat_total_size(sizes: &[usize]) -> usize {
+    sizes.iter().sum()
+}
+
+/// Builds a full-size (19876-byte) `units.dat` buffer, mostly zero, with unit ID 5's exposed
+/// columns set to distinctive nonzero values -- mirrors dat.rs's own
+/// `units_dat_extracts_exposed_columns_incl_subrange_affected_offsets` test, including a
+/// subrange-affected column (`bounds` sits after the buildings-only `addon_size` column), so the
+/// seed exercises non-trivial offset computation, not just column 0.
+fn make_units_dat_seed() -> Vec<u8> {
+    assert_eq!(
+        dat_total_size(UNITS_COLUMN_SIZES),
+        UNITS_DAT_SIZE,
+        "seed_gen's copy of the units.dat column layout has drifted from dat.rs"
+    );
+    let mut data = vec![0u8; UNITS_DAT_SIZE];
+    let unit_id = 5usize;
+
+    data[dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_FLINGY) + unit_id] = 42;
+
+    let sub_unit_1_off = dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_SUB_UNIT_1) + unit_id * 2;
+    data[sub_unit_1_off..sub_unit_1_off + 2].copy_from_slice(&777u16.to_le_bytes());
+
+    data[dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_UNIT_DIRECTION) + unit_id] = 3;
+
+    let flags_off =
+        dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_SPECIAL_ABILITY_FLAGS) + unit_id * 4;
+    data[flags_off..flags_off + 4].copy_from_slice(&0x0000_0005u32.to_le_bytes());
+
+    let placebox_off = dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_PLACEBOX_SIZE) + unit_id * 4;
+    data[placebox_off..placebox_off + 2].copy_from_slice(&10i16.to_le_bytes());
+    data[placebox_off + 2..placebox_off + 4].copy_from_slice(&20i16.to_le_bytes());
+
+    let bounds_off = dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_BOUNDS) + unit_id * 8;
+    data[bounds_off..bounds_off + 2].copy_from_slice(&(-1i16).to_le_bytes());
+    data[bounds_off + 2..bounds_off + 4].copy_from_slice(&(-2i16).to_le_bytes());
+    data[bounds_off + 4..bounds_off + 6].copy_from_slice(&30i16.to_le_bytes());
+    data[bounds_off + 6..bounds_off + 8].copy_from_slice(&40i16.to_le_bytes());
+
+    data[dat_column_offset(UNITS_COLUMN_SIZES, UNITS_COL_STAR_EDIT_GROUP_FLAGS) + unit_id] = 0x80;
+
+    data
+}
+
+/// Builds a small (not full-size) `flingy.dat`-shaped buffer covering just past `sprite` column
+/// entry 3 (the only column this crate exposes, at column 0), with the rest of the real file
+/// permissively read back as zero by the parser's own truncation handling.
+fn make_flingy_dat_seed() -> Vec<u8> {
+    let sprite_off = dat_column_offset(FLINGY_COLUMN_SIZES, FLINGY_COL_SPRITE) + 3 * 2;
+    let mut data = vec![0u8; sprite_off + 2];
+    data[sprite_off..sprite_off + 2].copy_from_slice(&555u16.to_le_bytes());
+    data
+}
+
+/// Builds a small `sprites.dat`-shaped buffer covering just past `image` column entry 20.
+fn make_sprites_dat_seed() -> Vec<u8> {
+    let image_off = dat_column_offset(SPRITES_COLUMN_SIZES, SPRITES_COL_IMAGE) + 20 * 2;
+    let mut data = vec![0u8; image_off + 2];
+    data[image_off..image_off + 2].copy_from_slice(&42u16.to_le_bytes());
+    data
+}
+
+/// Builds a small `images.dat`-shaped buffer covering entry 0's `grp`/`has_directional_frames`/
+/// `render_style`/`color_shift` columns (all near the front of the file at entry 0). The overlay
+/// columns (including `special_overlay`) sit much further into the file and are left permissively
+/// zero (`None`) here to keep the seed small.
+fn make_images_dat_seed() -> Vec<u8> {
+    let image_id = 0usize;
+    let color_shift_end =
+        dat_column_offset(IMAGES_COLUMN_SIZES, IMAGES_COL_COLOR_SHIFT) + image_id + 1;
+    let mut data = vec![0u8; color_shift_end];
+
+    let grp_off = dat_column_offset(IMAGES_COLUMN_SIZES, IMAGES_COL_GRP) + image_id * 4;
+    data[grp_off..grp_off + 4].copy_from_slice(&12u32.to_le_bytes());
+    data[dat_column_offset(IMAGES_COLUMN_SIZES, IMAGES_COL_HAS_DIRECTIONAL_FRAMES) + image_id] = 1;
+    data[dat_column_offset(IMAGES_COLUMN_SIZES, IMAGES_COL_RENDER_STYLE) + image_id] = 9;
+    data[dat_column_offset(IMAGES_COLUMN_SIZES, IMAGES_COL_COLOR_SHIFT) + image_id] = 2;
+
+    data
+}
+
+// ---------------------------------------------------------------------------------------------
+// images.rel / .tbl synthetic seed builders
+// ---------------------------------------------------------------------------------------------
+
+/// Builds a valid `images.rel` buffer: a couple of 8-byte records, one with the redirect flag and
+/// a real ref image set, matching `broodmap-formats/src/rel.rs`'s own test layout.
+fn make_rel_seed() -> Vec<u8> {
+    const REDIRECT_FLAG: u32 = 0x200;
+    let mut data = Vec::new();
+    data.extend_from_slice(&0u32.to_le_bytes()); // image 0: rel_type = 0, no redirect
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&REDIRECT_FLAG.to_le_bytes()); // image 1: redirect to 42
+    data.extend_from_slice(&42u32.to_le_bytes());
+    data
+}
+
+/// Builds a valid `.tbl` string table with three entries, matching `broodmap-formats/src/tbl.rs`'s
+/// own test layout.
+fn make_tbl_seed() -> Vec<u8> {
+    let entries = ["Zerg", "Terran", "Protoss"];
+    let header_size = 2 + entries.len() * 2;
+    let mut offsets = Vec::with_capacity(entries.len());
+    let mut strings_blob = Vec::new();
+    for s in entries {
+        offsets.push((header_size + strings_blob.len()) as u16);
+        strings_blob.extend_from_slice(s.as_bytes());
+        strings_blob.push(0);
+    }
+
+    let mut data = Vec::with_capacity(header_size + strings_blob.len());
+    data.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for offset in offsets {
+        data.extend_from_slice(&offset.to_le_bytes());
+    }
+    data.extend_from_slice(&strings_blob);
+    data
+}
+
+// ---------------------------------------------------------------------------------------------
+// .anim synthetic seed builder
+// ---------------------------------------------------------------------------------------------
+//
+// Mirrors the byte layout from `broodmap-formats/src/anim.rs`'s private `AnimBuilder` test
+// fixture, which isn't reachable from here (it's a `#[cfg(test)]` helper in another crate).
+
+const ANIM_LAYER_NAME_REGION_START: usize = 0x0C;
+const ANIM_LAYER_NAME_SLOT_SIZE: usize = 32;
+const ANIM_FRAME_TABLE_HEADER_OFFSET: usize = 0x14C;
+const ANIM_LAYER_RECORDS_OFFSET: usize = 0x158;
+const ANIM_LAYER_RECORD_SIZE: usize = 12;
+const ANIM_FRAME_RECORD_SIZE: usize = 16;
+const ANIM_TYPE_HD: u8 = 2;
+const ANIM_NO_REF_ID: u16 = 0xFFFF;
+
+/// A single synthetic anim frame, in raw 4K-unit coordinates (see anim.rs's module docs).
+struct AnimSeedFrame {
+    texture_x: u16,
+    texture_y: u16,
+    offset_x: i16,
+    offset_y: i16,
+    width: u16,
+    height: u16,
+}
+
+/// Builds a valid 2-layer (`"diffuse"`, `"teamcolor"`), 2-frame HD `.anim` buffer, each layer's
+/// payload a real (tiny) DXT1 DDS file so downstream `parse_dds` calls succeed too.
+fn make_anim_seed() -> Vec<u8> {
+    let layer_names = ["diffuse", "teamcolor"];
+    let diffuse_payload = make_dxt1_dds(4, 4, 0xF800); // solid red
+    let teamcolor_payload = make_dxt1_dds(4, 4, 0x001F); // solid blue
+    let layer_payloads: [(&[u8], u16, u16); 2] =
+        [(&diffuse_payload, 4, 4), (&teamcolor_payload, 4, 4)];
+    let frames = [
+        AnimSeedFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 0,
+            offset_y: 0,
+            width: 4,
+            height: 4,
+        },
+        AnimSeedFrame {
+            texture_x: 4,
+            texture_y: 0,
+            offset_x: 1,
+            offset_y: -1,
+            width: 4,
+            height: 4,
+        },
+    ];
+
+    let num_layers = layer_names.len();
+    let mut data = vec![0u8; ANIM_LAYER_RECORDS_OFFSET + num_layers * ANIM_LAYER_RECORD_SIZE];
+    data[0..4].copy_from_slice(b"ANIM");
+    data[4] = 4; // scale: HD
+    data[5] = ANIM_TYPE_HD;
+    data[6..8].copy_from_slice(&0u16.to_le_bytes()); // unknown
+    data[8..10].copy_from_slice(&(num_layers as u16).to_le_bytes());
+    data[10..12].copy_from_slice(&1u16.to_le_bytes()); // num_entries
+
+    for (i, name) in layer_names.iter().enumerate() {
+        let start = ANIM_LAYER_NAME_REGION_START + i * ANIM_LAYER_NAME_SLOT_SIZE;
+        data[start..start + name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    let canvas_width = 8u16;
+    let canvas_height = 4u16;
+    let frame_arr_offset = data.len(); // frames appended after the (fixed-size) layer records
+    data[ANIM_FRAME_TABLE_HEADER_OFFSET..ANIM_FRAME_TABLE_HEADER_OFFSET + 2]
+        .copy_from_slice(&(frames.len() as u16).to_le_bytes());
+    data[ANIM_FRAME_TABLE_HEADER_OFFSET + 2..ANIM_FRAME_TABLE_HEADER_OFFSET + 4]
+        .copy_from_slice(&ANIM_NO_REF_ID.to_le_bytes());
+    data[ANIM_FRAME_TABLE_HEADER_OFFSET + 4..ANIM_FRAME_TABLE_HEADER_OFFSET + 6]
+        .copy_from_slice(&canvas_width.to_le_bytes());
+    data[ANIM_FRAME_TABLE_HEADER_OFFSET + 6..ANIM_FRAME_TABLE_HEADER_OFFSET + 8]
+        .copy_from_slice(&canvas_height.to_le_bytes());
+    data[ANIM_FRAME_TABLE_HEADER_OFFSET + 8..ANIM_FRAME_TABLE_HEADER_OFFSET + 12]
+        .copy_from_slice(&(frame_arr_offset as u32).to_le_bytes());
+
+    // Layer texture records, payloads appended right after the (fixed-size) frame table, in
+    // layer order.
+    let mut payload_cursor = frame_arr_offset + frames.len() * ANIM_FRAME_RECORD_SIZE;
+    let mut payloads: Vec<&[u8]> = Vec::new();
+    for (i, (payload, w, h)) in layer_payloads.iter().enumerate() {
+        let rec_start = ANIM_LAYER_RECORDS_OFFSET + i * ANIM_LAYER_RECORD_SIZE;
+        data[rec_start..rec_start + 4].copy_from_slice(&(payload_cursor as u32).to_le_bytes());
+        data[rec_start + 4..rec_start + 8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        data[rec_start + 8..rec_start + 10].copy_from_slice(&w.to_le_bytes());
+        data[rec_start + 10..rec_start + 12].copy_from_slice(&h.to_le_bytes());
+        payloads.push(payload);
+        payload_cursor += payload.len();
+    }
+
+    data.resize(payload_cursor, 0);
+
+    let mut frame_offset = frame_arr_offset;
+    for frame in &frames {
+        data[frame_offset..frame_offset + 2].copy_from_slice(&frame.texture_x.to_le_bytes());
+        data[frame_offset + 2..frame_offset + 4].copy_from_slice(&frame.texture_y.to_le_bytes());
+        data[frame_offset + 4..frame_offset + 6].copy_from_slice(&frame.offset_x.to_le_bytes());
+        data[frame_offset + 6..frame_offset + 8].copy_from_slice(&frame.offset_y.to_le_bytes());
+        data[frame_offset + 8..frame_offset + 10].copy_from_slice(&frame.width.to_le_bytes());
+        data[frame_offset + 10..frame_offset + 12].copy_from_slice(&frame.height.to_le_bytes());
+        // unknown u32 left zeroed
+        frame_offset += ANIM_FRAME_RECORD_SIZE;
+    }
+
+    let mut payload_offset = frame_arr_offset + frames.len() * ANIM_FRAME_RECORD_SIZE;
+    for payload in &payloads {
+        data[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+        payload_offset += payload.len();
+    }
+
+    data
+}
+
+/// Writes a synthetic (not Blizzard-derived) seed for the `anim_parse` target: a valid 2-layer
+/// (`"diffuse"`, `"teamcolor"`), 2-frame HD `.anim` file.
+fn write_anim_parse_seed(seeds_root: &Path) {
+    let dir = seeds_root.join("anim_parse");
+    fs::create_dir_all(&dir).expect("create anim_parse seed dir");
+
+    let anim_bytes = make_anim_seed();
+    {
+        let anim = Anim::parse(&anim_bytes).expect("seed anim should parse");
+        assert_eq!(anim.frame_count(), 2, "seed anim should round-trip");
+        assert_eq!(anim.layers().len(), 2);
+        assert!(anim.layer("diffuse").is_some());
+        assert!(anim.layer("teamcolor").is_some());
+        for i in 0..anim.frame_count() {
+            assert!(anim.frame_texel_rect(i).is_some());
+        }
+    }
+    write_seed(&dir, "hd_anim_valid.bin", &anim_bytes);
 }
 
 fn write_seed(dir: &Path, name: &str, bytes: &[u8]) {

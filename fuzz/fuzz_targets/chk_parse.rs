@@ -35,4 +35,5 @@ fn exercise_lazy_accessors(chk: &Chk) {
     let _ = chk.terrain();
     let _ = chk.sprites();
     let _ = chk.placed_units();
+    let _ = chk.player_colors();
 }
