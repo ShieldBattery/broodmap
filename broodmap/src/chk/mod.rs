@@ -16,6 +16,7 @@ use crate::chk::forces::{
 };
 use crate::chk::format_version::{FormatVersion, FormatVersionError, read_format_version};
 use crate::chk::placed_units::{PlacedUnit, PlacedUnitsError, read_placed_units};
+use crate::chk::player_colors::{PlayerColors, read_colr, read_crgb, resolve_player_colors};
 use crate::chk::scenario_props::{
     RawScenarioProps, ScenarioProps, ScenarioPropsError, read_scenario_props,
 };
@@ -39,6 +40,7 @@ pub mod dimensions;
 pub mod forces;
 pub mod format_version;
 pub mod placed_units;
+pub mod player_colors;
 pub mod scenario_props;
 pub mod sprites;
 pub mod strings;
@@ -95,6 +97,7 @@ pub struct Chk {
     terrain: OnceLock<Result<TerrainTileIds, TerrainError>>,
     sprites: OnceLock<Result<Vec<Sprite>, SpriteError>>,
     placed_units: OnceLock<Result<Vec<PlacedUnit>, PlacedUnitsError>>,
+    player_colors: OnceLock<PlayerColors>,
 }
 
 impl Chk {
@@ -166,6 +169,7 @@ impl Chk {
             terrain: OnceLock::new(),
             sprites: OnceLock::new(),
             placed_units: OnceLock::new(),
+            player_colors: OnceLock::new(),
         })
     }
 
@@ -337,6 +341,20 @@ impl Chk {
                 )
             })
             .as_ref()
+    }
+
+    /// Returns the resolved player colors for this scenario, combining the `COLR` and `CRGB`
+    /// chunks. Works even when neither chunk is present (all players resolve to
+    /// [`player_colors::PlayerColor::Default`] in that case), and malformed chunk data is treated
+    /// the same as an absent chunk (matching this crate's permissive parsing style).
+    pub fn player_colors(&self) -> &PlayerColors {
+        self.player_colors.get_or_init(|| {
+            let colr = read_chunk_data(&self.data, &self.chunks, ChunkType::COLR)
+                .and_then(|data| read_colr(&data).ok());
+            let crgb = read_chunk_data(&self.data, &self.chunks, ChunkType::CRGB)
+                .and_then(|data| read_crgb(&data).ok());
+            resolve_player_colors(colr.as_ref(), crgb.as_ref())
+        })
     }
 }
 
@@ -1240,6 +1258,75 @@ mod tests {
         assert_eq!(
             read_chunk_data(&data, &chunks, ChunkType::UNIT).as_deref(),
             Some(&b"abcdef"[..])
+        );
+    }
+
+    /// Builds the minimal set of chunks required for [`Chk::from_bytes`] to succeed (`VER `,
+    /// `DIM `, `ERA `, `STR `), followed by any additional raw chunk bytes.
+    fn minimal_chk_with_extra(extra: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend(chunk(*b"VER ", &206u16.to_le_bytes()));
+        data.extend(chunk(*b"DIM ", &[64, 0, 64, 0]));
+        data.extend(chunk(*b"ERA ", &0u16.to_le_bytes()));
+        data.extend(chunk(*b"STR ", &0u16.to_le_bytes()));
+        data.extend_from_slice(extra);
+        data
+    }
+
+    #[test]
+    fn player_colors_defaults_when_chunks_absent() {
+        let data = minimal_chk_with_extra(&[]);
+        let chk = assert_ok!(Chk::from_bytes(data, None));
+
+        assert_eq!(
+            chk.player_colors().colors,
+            [player_colors::PlayerColor::Default; 8]
+        );
+    }
+
+    #[test]
+    fn player_colors_from_colr_only() {
+        let colr = chunk(*b"COLR", &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let data = minimal_chk_with_extra(&colr);
+        let chk = assert_ok!(Chk::from_bytes(data, None));
+
+        for (i, color) in chk.player_colors().colors.iter().enumerate() {
+            assert_eq!(*color, player_colors::PlayerColor::Indexed(i as u8));
+        }
+    }
+
+    #[test]
+    fn player_colors_crgb_takes_precedence_over_colr() {
+        let colr = chunk(*b"COLR", &[7u8; 8]);
+
+        let mut crgb_bytes = Vec::with_capacity(32);
+        crgb_bytes.extend_from_slice(&[1, 2, 3]); // player 0's RGB triple
+        crgb_bytes.extend_from_slice(&[0u8; 3 * 7]); // players 1-7's RGB triples (unused here)
+        // Selection bytes: player 0 = Custom RGB (2), player 1 = Random (0), rest = Default (1).
+        crgb_bytes.extend_from_slice(&[2, 0, 1, 1, 1, 1, 1, 1]);
+        let crgb = chunk(*b"CRGB", &crgb_bytes);
+
+        let mut data = minimal_chk_with_extra(&colr);
+        data.extend(crgb);
+        let chk = assert_ok!(Chk::from_bytes(data, None));
+
+        let colors = chk.player_colors().colors;
+        assert_eq!(colors[0], player_colors::PlayerColor::Rgb([1, 2, 3]));
+        assert_eq!(colors[1], player_colors::PlayerColor::Random);
+        assert_eq!(colors[2], player_colors::PlayerColor::Default);
+    }
+
+    #[test]
+    fn player_colors_ignores_malformed_chunks() {
+        // A COLR chunk that's the wrong size gets skipped by the chunk gatherer (min/max size of
+        // 8 bytes), so this should behave the same as no COLR chunk being present at all.
+        let colr = chunk(*b"COLR", &[0, 1, 2]);
+        let data = minimal_chk_with_extra(&colr);
+        let chk = assert_ok!(Chk::from_bytes(data, None));
+
+        assert_eq!(
+            chk.player_colors().colors,
+            [player_colors::PlayerColor::Default; 8]
         );
     }
 }

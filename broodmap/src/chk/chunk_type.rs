@@ -122,6 +122,8 @@ impl ChunkType {
             ChunkType::DIM => Some(4),
             ChunkType::UNIS => Some(4048),
             ChunkType::UNIx => Some(4168),
+            ChunkType::COLR => Some(8),
+            ChunkType::CRGB => Some(32),
             _ => None,
         }
     }
@@ -137,6 +139,8 @@ impl ChunkType {
             ChunkType::SPRP => Some(4),
             ChunkType::DIM => Some(4),
             ChunkType::MTXM => Some(256 * 256 * 2),
+            ChunkType::COLR => Some(8),
+            ChunkType::CRGB => Some(32),
             _ => None,
         }
     }
@@ -150,6 +154,9 @@ impl ChunkType {
             ChunkType::THG2 => MultiChunkHandling::Append,
             ChunkType::TRIG => MultiChunkHandling::Append,
             ChunkType::MBRF => MultiChunkHandling::Append,
+            // COLR and CRGB (player colors) fall through to the default FullOverwrite handling
+            // below, matching Chkdraft's "Standard" load behavior for both (i.e. no entry for
+            // either in its `nonStandardLoadBehaviors` map).
             _ => MultiChunkHandling::FullOverwrite,
         }
     }
