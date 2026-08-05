@@ -3,13 +3,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use std::collections::HashSet;
+
 use broodcasc::CdnStorage;
 use broodcasc::cdn::{CachingTransport, HttpTransport};
 use broodmap::extract_chk_from_map;
 use broodmap_render::{
-    ArtStyle, CascSource, CdnSource, DirSource, GameData, MinimapOptions, Preview, RenderOptions,
-    RgbaImage, StartLocations, UnitFilter, build_minimap_table, compress_minimap_table,
-    render_chk_minimap, render_chk_preview, render_terrain,
+    ArtStyle, AssetRequest, CascSource, CdnSource, DirSource, GameData, MinimapOptions, Preview,
+    RenderOptions, RgbaImage, SourceError, StartLocations, TilesetDataSource, UnitFilter,
+    build_minimap_table, compress_minimap_table, render_chk_minimap, render_chk_preview,
+    render_terrain, required_preview_assets_for_chk, required_preview_graphics_for_chk,
 };
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
@@ -39,6 +42,12 @@ enum Command {
     /// SC:R assets by default; pass `--install`/`--assets-dir`/`--cdn` only to size unit dots
     /// from `units.dat` and refine melee filtering (see `--help`).
     Minimap(MinimapArgs),
+    /// Packs the exact SC:R asset files the given maps' preview renders need into a plain
+    /// directory (a "slim bundle") that `render`/`minimap` consume via `--assets-dir` -- server
+    /// rendering with no game install. The bundle covers every render-option combination at the
+    /// packed `--style`/`--size` (option toggles only ever shrink the asset set, so it's packed
+    /// at the maximal settings); pack with the same style and size you intend to render with.
+    Pack(PackArgs),
     /// Regenerates the 8 committed per-tileset minimap color tables
     /// (`broodmap-render/src/minimap/tables/*.bin`) from a real StarCraft: Remastered install.
     /// Dev-time only -- the committed output is what `minimap`/the library's zero-asset renderer
@@ -204,6 +213,46 @@ impl CdnArgs {
 }
 
 #[derive(clap::Args)]
+struct PackArgs {
+    /// Paths to .scm/.scx map files the bundle must cover (it packs the union of their needs).
+    #[arg(required = true)]
+    maps: Vec<PathBuf>,
+
+    /// Output directory for the bundle, created if needed. Existing files are overwritten, so
+    /// re-packing with more maps grows a bundle in place.
+    #[arg(long)]
+    out: PathBuf,
+
+    /// StarCraft: Remastered install directory to read assets from, unless `--assets-dir` or
+    /// `--cdn` is given.
+    #[arg(long, default_value = DEFAULT_INSTALL_DIR)]
+    install: PathBuf,
+
+    /// Read assets from a plain directory of extracted files (e.g. another bundle) instead of a
+    /// CASC install.
+    #[arg(long)]
+    assets_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    cdn_args: CdnArgs,
+
+    /// Art style the bundle should serve (matching `render`'s `--style`).
+    #[arg(long, value_enum, default_value_t = ArtStyleArg::Original)]
+    style: ArtStyleArg,
+
+    /// Art style for the unit/sprite layer, if it should differ from `--style` (matching
+    /// `render`'s `--unit-style`).
+    #[arg(long, value_enum)]
+    unit_style: Option<ArtStyleArg>,
+
+    /// Maximum output dimension the bundle should serve (matching `render`'s `--size`; together
+    /// with the map dimensions it selects the HD vs. HD2 asset tier for the Remastered-family
+    /// styles).
+    #[arg(long, default_value_t = 1024)]
+    size: u32,
+}
+
+#[derive(clap::Args)]
 struct GenMinimapTablesArgs {
     /// StarCraft: Remastered install directory (containing `.build.info`).
     #[arg(long, default_value = DEFAULT_INSTALL_DIR)]
@@ -267,6 +316,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Render(args) => render(args),
         Command::Minimap(args) => minimap(args),
+        Command::Pack(args) => pack(args),
         Command::GenMinimapTables(args) => gen_minimap_tables(args),
     }
 }
@@ -413,6 +463,106 @@ fn minimap(args: MinimapArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Packs a "slim bundle": the union, over the given maps, of every asset a preview render could
+/// request at the packed style/size, written under `--out` in the CASC catalog layout
+/// `DirSource` reads. Asset selection reuses the library's two-round prefetch API, so the packed
+/// set can't drift from what `render_chk_preview` actually reads. Round-1 assets (the tileset
+/// files and the `.dat`/`.rel`/`.tbl` tables) are whole-render dependencies, so a miss is fatal;
+/// round-2 art (anims, GRP headers) degrades per drawable at render time, so a miss only warns
+/// -- e.g. the Carbot pack legitimately ships without most shadow anims.
+fn pack(args: PackArgs) -> Result<()> {
+    // The maximal option set at this style/size: every option toggle only ever *removes*
+    // requests, so packing with everything shown, the as-placed filter, and sprite start
+    // locations (the one start-location mode that fetches art) covers every option combination
+    // a render of these maps can use.
+    let options = RenderOptions {
+        art_style: args.style.into(),
+        unit_style: args.unit_style.map(Into::into),
+        max_dimension: Some(args.size),
+        start_locations: StartLocations::Sprite,
+        unit_filter: UnitFilter::AsPlaced,
+        ..Default::default()
+    };
+
+    let source: Box<dyn TilesetDataSource> = if let Some(assets_dir) = &args.assets_dir {
+        Box::new(DirSource::new(assets_dir))
+    } else if args.cdn_args.cdn {
+        Box::new(args.cdn_args.open_source()?)
+    } else {
+        Box::new(CascSource::open(&args.install).with_context(|| {
+            format!(
+                "failed to open StarCraft: Remastered install at {}",
+                args.install.display()
+            )
+        })?)
+    };
+    let source = source.as_ref();
+
+    let data = GameData::load(source).context("failed to load game data tables")?;
+
+    // Requests already handled (written or found missing), deduplicated across rounds and maps.
+    let mut handled: HashSet<AssetRequest> = HashSet::new();
+    let mut total_bytes: u64 = 0;
+    let mut missing = 0usize;
+    for map in &args.maps {
+        let map_bytes = std::fs::read(map)
+            .with_context(|| format!("failed to read map file {}", map.display()))?;
+        let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
+            .with_context(|| format!("failed to parse map file {}", map.display()))?;
+
+        for req in required_preview_assets_for_chk(&chk, &options) {
+            if !handled.insert(req.clone()) {
+                continue;
+            }
+            let bytes = source
+                .read(&req)
+                .with_context(|| format!("failed to read {}", req.casc_path()))?;
+            total_bytes += write_bundle_file(&args.out, &req, &bytes)?;
+        }
+        for req in required_preview_graphics_for_chk(&chk, &data, &options) {
+            if !handled.insert(req.clone()) {
+                continue;
+            }
+            match source.read(&req) {
+                Ok(bytes) => total_bytes += write_bundle_file(&args.out, &req, &bytes)?,
+                Err(SourceError::NotFound) => {
+                    eprintln!("warning: {} not in the source, skipped", req.casc_path());
+                    missing += 1;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to read {}", req.casc_path()));
+                }
+            }
+        }
+    }
+
+    println!(
+        "Packed {} files ({:.1} MB) into {}{}",
+        handled.len() - missing,
+        total_bytes as f64 / (1024.0 * 1024.0),
+        args.out.display(),
+        if missing > 0 {
+            format!(" ({missing} assets not in the source, skipped)")
+        } else {
+            String::new()
+        }
+    );
+
+    Ok(())
+}
+
+/// Writes one asset's bytes at its CASC catalog path under the bundle root (the layout
+/// `DirSource` reads), returning the byte count.
+fn write_bundle_file(root: &Path, req: &AssetRequest, bytes: &[u8]) -> Result<u64> {
+    let dest = root.join(req.casc_path());
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    std::fs::write(&dest, bytes).with_context(|| format!("failed to write {}", dest.display()))?;
+    Ok(bytes.len() as u64)
 }
 
 /// Regenerates the 8 committed per-tileset minimap color tables from a real SC:R install (see

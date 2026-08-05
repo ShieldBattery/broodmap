@@ -270,7 +270,13 @@ keying caches/URLs. Provided implementations:
   cache under the system temp dir — the CDN bootstrap alone is tens of MB of metadata).
   Non-default feature; publishing is gated on broodcasc reaching crates.io.
 - `DirSource` (feature `fs`): plain directory of extracted files (CascView trees, test
-  fixtures).
+  fixtures). Also the layout the CLI's `pack` subcommand emits — a "slim bundle": the union of
+  the two-round prefetch API's requests for one or more maps at a given style/size, fetched from
+  any source (install or CDN) and written at their CASC paths. Packing uses the maximal option
+  set (as-placed, everything shown, sprite start locations) since option toggles only ever
+  shrink the request set, so one bundle serves every option combination at its style/size —
+  verified byte-identical to install-sourced renders across all three styles. Server rendering
+  with no game install and no render-time CDN dependency.
 - `MemorySource`: prefilled map of `AssetRequest -> bytes`. The primary WASM pattern — the trait
   stays sync; browser fetch is async; prefetch-then-render bridges the two.
 - `FnSource`: closure adapter for anything else synchronous (OPFS sync handles in a worker,
