@@ -2,7 +2,8 @@
 
 use broodmap_formats::{
     DdsVr4, Frame, parse_cv5, parse_dds, parse_flingy_dat, parse_grp_header, parse_images_dat,
-    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat, parse_vf4,
+    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat, parse_vf4, parse_vr4,
+    parse_vx4, parse_vx4ex, parse_wpe,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -78,5 +79,40 @@ fuzz_target!(|data: &[u8]| {
         .unwrap_or(0);
     for index in [0u16, 1, declared_count, u16::MAX] {
         let _ = tbl.get(index);
+    }
+
+    // Dev-time minimap color-table inputs (VX4/VX4EX, VR4, WPE -- see broodmap-formats' vx4.rs/
+    // vr4.rs/wpe.rs and docs/render-design.md's "Minimap" section). `megatile_count()`/
+    // `minitile_count()` derive from `data.len() / record size`, so they're already bounded by
+    // the input, but cap the walk anyway (mirrors mainsd_parse.rs's `num_entries` cap) since a
+    // large `-max_len` could otherwise make this the dominant cost of the target.
+    let vx4 = parse_vx4(data);
+    for megatile in 0..vx4.megatile_count().min(4096) {
+        for index in 0..16 {
+            let _ = vx4.minitile(megatile, index);
+        }
+    }
+    let _ = vx4.minitile(usize::MAX, 0);
+
+    let vx4ex = parse_vx4ex(data);
+    for megatile in 0..vx4ex.megatile_count().min(4096) {
+        for index in 0..16 {
+            let _ = vx4ex.minitile(megatile, index);
+        }
+    }
+    let _ = vx4ex.minitile(usize::MAX, 0);
+
+    let vr4 = parse_vr4(data);
+    for index in 0..vr4.minitile_count().min(4096) {
+        let _ = vr4.bitmap(index);
+    }
+    let _ = vr4.bitmap(usize::MAX);
+
+    // .wpe palette: always exactly 256 entries once parsed, so sweeping every index is cheap and
+    // bounded regardless of input.
+    if let Ok(wpe) = parse_wpe(data) {
+        for index in 0..=u8::MAX {
+            let _ = wpe.color(index);
+        }
     }
 });

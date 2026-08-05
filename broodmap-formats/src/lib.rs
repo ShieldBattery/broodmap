@@ -19,6 +19,9 @@ pub mod mainsd;
 pub mod rel;
 pub mod tbl;
 pub mod vf4;
+pub mod vr4;
+pub mod vx4;
+pub mod wpe;
 
 pub use anim::{Anim, AnimError, AnimFrame, AnimLayer};
 pub use cv5::{Cv5, TileGroup, TileGroupFlags, parse_cv5};
@@ -33,3 +36,6 @@ pub use mainsd::{MainSdAnim, parse_teamcolor_mask};
 pub use rel::{ImagesRel, parse_images_rel};
 pub use tbl::{Tbl, parse_tbl};
 pub use vf4::{MiniTileFlags, Vf4, parse_vf4};
+pub use vr4::{Vr4, parse_vr4};
+pub use vx4::{MinitileRef, Vx4, parse_vx4, parse_vx4ex};
+pub use wpe::{Wpe, WpeError, parse_wpe};
