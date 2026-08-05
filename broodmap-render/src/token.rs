@@ -120,6 +120,18 @@ pub(crate) fn draw_player_token(
     bottom: i32,
     color: [u8; 3],
 ) {
+    // The rect is untrusted (a hostile `RenderPlan` block can put corners at i32 extremes, where
+    // `right - left`, `left - pad` and friends overflow). Clamping to a generous range keeps
+    // every downstream i32 computation overflow-free while passing all legitimate values through
+    // unchanged — real tokens live within a few thousand output pixels of the image, and
+    // anything beyond the limit is off-image garbage whose visible (clipped) portion this still
+    // draws sensibly.
+    const COORD_LIMIT: i32 = 1 << 20;
+    let left = left.clamp(-COORD_LIMIT, COORD_LIMIT);
+    let top = top.clamp(-COORD_LIMIT, COORD_LIMIT);
+    let right = right.clamp(-COORD_LIMIT, COORD_LIMIT);
+    let bottom = bottom.clamp(-COORD_LIMIT, COORD_LIMIT);
+
     let box_w = (right - left).max(1) as f32;
     let box_h = (bottom - top).max(1) as f32;
     let min_dim = box_w.min(box_h);

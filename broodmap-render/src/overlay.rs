@@ -1747,12 +1747,14 @@ fn draw_planned_blocks(image: &mut RgbaImage, blocks: &[PlannedBlock], zoom: f32
         let top = ((block.y as f32 - box_h as f32 / 2.0) * zoom).round() as i32;
         let right = ((block.x as f32 + box_w as f32 / 2.0) * zoom).round() as i32;
         let bottom = ((block.y as f32 + box_h as f32 / 2.0) * zoom).round() as i32;
+        // Saturating: a hostile plan can put `block.x`/`y` at i32 extremes, where the rounded
+        // casts above saturate and a plain `+ 1` would overflow.
         crate::token::draw_player_token(
             image,
             left,
             top,
-            right.max(left + 1),
-            bottom.max(top + 1),
+            right.max(left.saturating_add(1)),
+            bottom.max(top.saturating_add(1)),
             block.color,
         );
     }
@@ -2863,9 +2865,35 @@ mod tests {
             },
             unit_tier: AssetTier::Sd,
             unit_pack: ArtPack::Standard,
-            sprites: Vec::new(),
+            // Coordinates at the i32 extremes: the saturated float-to-int placement casts must
+            // not feed overflowing integer arithmetic downstream (found by the `plan_execute`
+            // fuzz target in the block-drawing path).
+            sprites: vec![PlannedSprite {
+                image_id: 0,
+                frame: u32::MAX,
+                flip: true,
+                x: i32::MAX,
+                y: i32::MIN,
+                tint: None,
+                is_shadow: false,
+            }],
             sd_canvases: Vec::new(),
-            blocks: Vec::new(),
+            blocks: vec![
+                PlannedBlock {
+                    x: i32::MAX,
+                    y: i32::MIN,
+                    width: u32::MAX,
+                    height: u32::MAX,
+                    color: [1, 2, 3],
+                },
+                PlannedBlock {
+                    x: i32::MIN,
+                    y: i32::MAX,
+                    width: 0,
+                    height: 0,
+                    color: [4, 5, 6],
+                },
+            ],
             manifest: Vec::new(),
         };
 
