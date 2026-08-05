@@ -1,0 +1,6 @@
+# wasm-pack output
+/pkg/
+/pkg-node/
+/node_modules/
+# fetch-assets output: Blizzard game data, never committed
+/examples/assets/

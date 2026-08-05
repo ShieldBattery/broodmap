@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>broodmap browser example</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 72rem; }
+  fieldset { border: 1px solid #8884; border-radius: 6px; margin-bottom: 1rem; }
+  label { margin-right: 1rem; }
+  canvas { max-width: 100%; height: auto; border: 1px solid #8884; image-rendering: pixelated; }
+  #status { white-space: pre-line; font-family: monospace; margin: 0.75rem 0; }
+  .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
+</style>
+</head>
+<body>
+<h1>broodmap browser example</h1>
+<p>
+  Renders a StarCraft: Brood War map preview entirely in the browser: the map is parsed and
+  rendered by <code>broodmap-wasm</code>; SC:R assets are fetched on demand from a static
+  directory produced by <code>broodmap-cli fetch-assets</code> (see the README).
+</p>
+
+<fieldset>
+  <legend>Inputs</legend>
+  <label>Map (.scm/.scx): <input type="file" id="map" accept=".scm,.scx"></label>
+  <label>Asset base URL: <input type="text" id="assetBase" value="./assets" size="20"></label>
+  <label>Style:
+    <select id="style">
+      <option value="original" selected>original</option>
+      <option value="remastered">remastered</option>
+      <option value="cartooned">cartooned</option>
+    </select>
+  </label>
+  <label>Size: <input type="number" id="size" value="1024" min="64" max="8192" step="64"></label>
+  <button id="render" disabled>Render</button>
+</fieldset>
+
+<div id="status">Pick a map file to begin.</div>
+
+<div class="row">
+  <div>
+    <h2>Preview</h2>
+    <canvas id="preview" width="0" height="0"></canvas>
+  </div>
+  <div>
+    <h2>Minimap (zero-asset)</h2>
+    <canvas id="minimap" width="0" height="0"></canvas>
+  </div>
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>

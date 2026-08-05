@@ -6,4 +6,5 @@ members = [
     "broodmap-cli",
     "broodmap-formats",
     "broodmap-render",
+    "broodmap-wasm",
 ]

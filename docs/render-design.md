@@ -56,6 +56,12 @@ broodmap-formats   SC:R asset format parsers: CV5, VF4, VX4/VX4EX, VR4, WPE, .dd
 broodmap-render    data-source trait, BC decode -> RGBA, render plan, CPU rasterizer,
                    RenderOptions, minimap, encoders
 broodmap-cli       grows a real `render` subcommand (dogfood + manual testing)
+broodmap-wasm      wasm-bindgen bindings (phase 4, unpublished): MapRenderer drives parse ->
+                   two-round prefetch (CASC paths as asset keys/URL suffixes) -> render/
+                   minimap/plan-JSON over a MemorySource; its examples/ (vite dev server,
+                   pnpm scripts, layout mirroring broodrep-wasm) hold the reference browser
+                   and Node consumers (verified in headless Chrome via the vite server,
+                   byte-identical to native renders)
 ```
 
 `broodmap-formats` exists as its own crate (rather than a module of `broodmap-render`) because
@@ -549,8 +555,10 @@ render plan computes up front; the executor walks it bandwise).
    `ArtStyle::Original` preview path); minimap: color-table generator bin + baked tables +
    zero-asset renderer (depends only on phase 1, can be pulled earlier if wanted);
    `MemorySource`/`FnSource`, encoder features, wasm32 CI build.
-4. **Plan API + integrations.** Public serde-able render plan, a browser GPU example, neobrood
-   migration to `broodmap-formats`.
+4. **Plan API + integrations.** Public serde-able render plan (done: `plan_preview`/
+   `execute_plan`, see "Render plan"), WASM packaging + browser example (done:
+   `broodmap-wasm` and its `examples/` — CPU rendering in-browser; a GPU executor over the
+   plan remains open), neobrood migration to `broodmap-formats`.
 
 ## Open questions
 

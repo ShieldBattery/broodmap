@@ -1,0 +1,23 @@
+[package]
+name = "broodmap-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+description = "wasm-bindgen bindings for rendering StarCraft: Brood War map previews in the browser"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+broodmap = { version = "0.1.0", path = "../broodmap" }
+# No default features: `fs` (DirSource) is meaningless in a browser; assets arrive through
+# MemorySource via the two-round prefetch. `png` gives Blob-friendly output, `serde` the plan.
+broodmap-render = { version = "0.1.0", path = "../broodmap-render", default-features = false, features = [
+    "png",
+    "serde",
+] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
