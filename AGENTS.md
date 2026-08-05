@@ -15,7 +15,7 @@ The CLI (`broodmap-cli`) is currently a placeholder.
 
 ## Fuzzing
 
-`fuzz/` is a cargo-fuzz crate (its own workspace, nightly-only — doesn't affect the library's MSRV) with one target per parser/pipeline: `chk_parse`, `mpq_parse`, `full_pipeline`, `formats_parse`, `anim_parse`, `mainsd_parse`, `render_terrain`. Because parsing is lazy, targets must exercise every lazy accessor (e.g. every `Chk` field, every `MainSdAnim` entry), not just construct the top-level type.
+`fuzz/` is a cargo-fuzz crate (its own workspace, nightly-only — doesn't affect the library's MSRV) with one target per parser/pipeline: `chk_parse`, `mpq_parse`, `full_pipeline`, `formats_parse`, `anim_parse`, `mainsd_parse`, `render_terrain`, `minimap_parse`, `plan_execute` (hostile deserialized `RenderPlan`s through the plan executor). Because parsing is lazy, targets must exercise every lazy accessor (e.g. every `Chk` field, every `MainSdAnim` entry), not just construct the top-level type.
 
 ```bash
 cargo +nightly fuzz run chk_parse fuzz/corpus/chk_parse fuzz/seeds/chk_parse -- -max_len=65536

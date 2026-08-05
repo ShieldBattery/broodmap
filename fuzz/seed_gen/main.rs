@@ -22,8 +22,9 @@ use broodmap_formats::{
     parse_images_rel, parse_sprites_dat, parse_tbl, parse_teamcolor_mask, parse_units_dat,
 };
 use broodmap_render::{
-    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, MinimapOptions, RenderOptions,
-    build_minimap_table, render_minimap, render_terrain,
+    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, MinimapOptions, PlannedBlock,
+    PlannedSprite, RenderOptions, RenderPlan, SdCanvasSource, TerrainPlan, build_minimap_table,
+    execute_plan, render_minimap, render_terrain,
 };
 
 /// Seeds (and CHKs extracted from map seeds) larger than this are skipped.
@@ -123,6 +124,7 @@ fn main() {
     write_anim_parse_seed(&seeds_root);
     write_mainsd_parse_seed(&seeds_root);
     write_minimap_parse_seed(&seeds_root);
+    write_plan_execute_seed(&seeds_root);
 
     println!("done");
 }
@@ -335,6 +337,139 @@ fn write_render_terrain_seed(seeds_root: &Path) {
         .expect("seed render_terrain input should render successfully");
 
     write_seed(&dir, "checkerboard.bin", &seed);
+}
+
+/// Writes a synthetic (not Blizzard-derived) seed for the `plan_execute` target: a byte string
+/// matching that target's carve order (flags, small-mode dims, ppt, tier/pack, megatiles, one
+/// sprite on image 0, the second canvas-source image id, one block, the informational
+/// width/height, then four equal quarters of asset bytes: TilesetDds, mainSD.anim, per-image
+/// anim, GRP). Built so the executed plan actually renders — terrain from a real DDS-record
+/// `.dds.vr4`, SD sprite art from a valid `mainSD.anim`, a parseable GRP header — rather than
+/// exercising only the everything-fails paths.
+fn write_plan_execute_seed(seeds_root: &Path) {
+    let dir = seeds_root.join("plan_execute");
+    fs::create_dir_all(&dir).expect("create plan_execute seed dir");
+
+    let mut seed = Vec::new();
+    seed.push(0u8); // flags: bit 0 clear -> small-dims mode
+    seed.extend_from_slice(&1u16.to_le_bytes()); // map_w: (1 % 8) + 1 == 2
+    seed.extend_from_slice(&1u16.to_le_bytes()); // map_h: 2
+    seed.extend_from_slice(&32u32.to_le_bytes()); // px_per_tile
+    seed.push(0u8); // tier: Sd
+    seed.push(0u8); // pack: Standard
+    seed.push(4u8); // megatile count
+    for megatile in [0u16, 1, 1, 0] {
+        seed.extend_from_slice(&megatile.to_le_bytes());
+    }
+    seed.push(1u8); // sprite count
+    // Sprite 0 (image id is forced to 0 by the target, not read from bytes):
+    seed.extend_from_slice(&0u32.to_le_bytes()); // frame
+    seed.push(0u8); // flip: false
+    seed.extend_from_slice(&32i32.to_le_bytes()); // x
+    seed.extend_from_slice(&32i32.to_le_bytes()); // y
+    seed.push(1u8); // tint: Some
+    seed.extend_from_slice(&[255, 0, 0]); // tint rgb
+    seed.push(0u8); // is_shadow: false
+    seed.extend_from_slice(&5u16.to_le_bytes()); // second sd_canvases image id
+    seed.push(1u8); // block count
+    seed.extend_from_slice(&32i32.to_le_bytes()); // block x
+    seed.extend_from_slice(&32i32.to_le_bytes()); // block y
+    seed.extend_from_slice(&64u32.to_le_bytes()); // block width
+    seed.extend_from_slice(&64u32.to_le_bytes()); // block height
+    seed.extend_from_slice(&[0, 255, 0]); // block color
+    seed.extend_from_slice(&64u32.to_le_bytes()); // plan.width (informational)
+    seed.extend_from_slice(&64u32.to_le_bytes()); // plan.height (informational)
+
+    // The four asset quarters, zero-padded to equal length so the target's split_at quarters
+    // land exactly on the payload boundaries (all these parsers ignore trailing bytes).
+    let red_frame = make_dxt1_dds(4, 4, 0xF800);
+    let blue_frame = make_dxt1_dds(4, 4, 0x001F);
+    let mut dds_bytes = make_dds_record_vr4(&[&red_frame, &blue_frame]);
+    let mut mainsd_bytes = make_mainsd_seed();
+    let mut anim_bytes = make_anim_seed();
+    // A classic GRP header: 1 frame, 64x64 canvas (the frame table/pixels are never read).
+    let mut grp_bytes = Vec::new();
+    grp_bytes.extend_from_slice(&1u16.to_le_bytes());
+    grp_bytes.extend_from_slice(&64u16.to_le_bytes());
+    grp_bytes.extend_from_slice(&64u16.to_le_bytes());
+    let quarter = dds_bytes
+        .len()
+        .max(mainsd_bytes.len())
+        .max(anim_bytes.len())
+        .max(grp_bytes.len());
+    for bytes in [
+        &mut dds_bytes,
+        &mut mainsd_bytes,
+        &mut anim_bytes,
+        &mut grp_bytes,
+    ] {
+        bytes.resize(quarter, 0);
+    }
+
+    // Sanity check: replay the exact plan/source the fuzz target will carve from this seed and
+    // make sure it executes successfully rather than erroring, before committing it.
+    let plan = RenderPlan {
+        width: 64,
+        height: 64,
+        px_per_tile: 32,
+        terrain: TerrainPlan {
+            tileset: Tileset::Jungle,
+            tier: AssetTier::Sd,
+            pack: ArtPack::Standard,
+            width: 2,
+            height: 2,
+            megatiles: vec![0, 1, 1, 0],
+        },
+        unit_tier: AssetTier::Sd,
+        unit_pack: ArtPack::Standard,
+        sprites: vec![PlannedSprite {
+            image_id: 0,
+            frame: 0,
+            flip: false,
+            x: 32,
+            y: 32,
+            tint: Some([255, 0, 0]),
+            is_shadow: false,
+        }],
+        sd_canvases: vec![
+            SdCanvasSource {
+                image_id: 0,
+                grp_path: "a".to_string(),
+            },
+            SdCanvasSource {
+                image_id: 5,
+                grp_path: "missing".to_string(),
+            },
+        ],
+        blocks: vec![PlannedBlock {
+            x: 32,
+            y: 32,
+            width: 64,
+            height: 64,
+            color: [0, 255, 0],
+        }],
+        manifest: Vec::new(),
+    };
+    let mut source = MemorySource::new();
+    source.insert(
+        AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Sd, ArtPack::Standard),
+        dds_bytes.clone(),
+    );
+    source.insert(AssetRequest::MainSdAnim, mainsd_bytes.clone());
+    source.insert(
+        AssetRequest::Grp {
+            path: "a".to_string(),
+        },
+        grp_bytes.clone(),
+    );
+    let image = execute_plan(&plan, &source).expect("seed plan_execute input should execute");
+    assert_eq!((image.width, image.height), (64, 64));
+
+    seed.extend(&dds_bytes);
+    seed.extend(&mainsd_bytes);
+    seed.extend(&anim_bytes);
+    seed.extend(&grp_bytes);
+    write_seed(&dir, "sd_plan.bin", &seed);
 }
 
 /// Writes a synthetic (not Blizzard-derived) seed for the `minimap_parse` target: four

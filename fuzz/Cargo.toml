@@ -77,6 +77,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "plan_execute"
+path = "fuzz_targets/plan_execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "seed_gen"
 path = "seed_gen/main.rs"
 test = false
