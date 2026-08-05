@@ -33,7 +33,7 @@ use broodmap::chk::sprites::{Sprite, SpriteFlags};
 use broodmap::chk::terrain::TerrainTileIds;
 use broodmap::chk::tileset::Tileset;
 use broodmap_formats::{
-    Anim, AnimFrame, AnimLayer, DdsFormat, MainSdAnim, parse_dds, parse_grp_header,
+    Anim, AnimFrame, AnimLayer, DdsFormat, IMAGES_COUNT, MainSdAnim, parse_dds, parse_grp_header,
     parse_teamcolor_mask,
 };
 
@@ -45,7 +45,7 @@ use crate::gamedata::{
 };
 use crate::image::{RgbaImage, scale_rgba_premultiplied};
 use crate::options::{RenderOptions, StartLocations, UnitFilter, resolve_tier, resolve_unit_tier};
-use crate::source::{AssetRequest, TilesetDataSource};
+use crate::source::{AssetRequest, DatKind, TilesetDataSource};
 use crate::terrain::render_terrain;
 use crate::tier::{ArtPack, AssetTier};
 
@@ -322,6 +322,97 @@ pub fn required_preview_graphics(
     }
 
     seen
+}
+
+/// Every asset *any* map could request under `options` — the "style-complete" superset, for
+/// building offline asset directories that serve arbitrary maps (the CLI's `fetch-assets`
+/// subcommand), where the per-map two-round lists above serve a known map.
+///
+/// The set is closed because everything a render reads is bounded: the `.dat`/`.rel`/`.tbl`
+/// tables, the 8 tilesets' files, and art for the [`IMAGES_COUNT`] `images.dat` entries. The
+/// tier axis needs care: tiers are derived from map dimensions plus `options`, never chosen
+/// (see [`resolve_tier`]), so this evaluates the derivation across every possible map dimension
+/// (CHK dimensions are permissive — 1..=256 tiles per side) and covers every outcome. At typical
+/// `max_dimension`s the Remastered-family styles resolve to HD2 for standard map sizes but reach
+/// HD for degenerate tiny maps, so both tiers are included — those styles' complete sets are
+/// inherently large. `Original` always resolves to SD, whose art set (one `mainSD.anim`, every
+/// classic GRP any image names for its canvas header, and the 32px tilesets) is by far the
+/// smallest, which is what makes it the style of choice for install-free servers.
+///
+/// `data` supplies the GRP paths (`images.dat`'s `grp` column through `images.tbl`); load it
+/// from the same source the assets will be fetched from.
+pub fn required_style_assets(data: &GameData, options: &RenderOptions) -> Vec<AssetRequest> {
+    // Distinct tier/pack outcomes across the map-dimension space. At most two per layer (HD2 +
+    // HD), so linear dedupe is fine.
+    let mut terrain_tiers: Vec<(AssetTier, ArtPack)> = Vec::new();
+    let mut unit_tiers: Vec<(AssetTier, ArtPack)> = Vec::new();
+    for map_w in 1..=256 {
+        for map_h in 1..=256 {
+            let (tier, pack, ppt) = resolve_tier(options, map_w, map_h);
+            if !terrain_tiers.contains(&(tier, pack)) {
+                terrain_tiers.push((tier, pack));
+            }
+            let unit_tier = resolve_unit_tier(options, ppt);
+            if !unit_tiers.contains(&unit_tier) {
+                unit_tiers.push(unit_tier);
+            }
+        }
+    }
+
+    let mut assets = vec![
+        AssetRequest::Dat(DatKind::Units),
+        AssetRequest::Dat(DatKind::Flingy),
+        AssetRequest::Dat(DatKind::Sprites),
+        AssetRequest::Dat(DatKind::Images),
+        AssetRequest::ImagesRel,
+        AssetRequest::ImagesTbl,
+    ];
+
+    const ALL_TILESETS: [Tileset; 8] = [
+        Tileset::Badlands,
+        Tileset::SpacePlatform,
+        Tileset::Installation,
+        Tileset::Ashworld,
+        Tileset::Jungle,
+        Tileset::Desert,
+        Tileset::Arctic,
+        Tileset::Twilight,
+    ];
+    for tileset in ALL_TILESETS {
+        assets.push(AssetRequest::Cv5(tileset));
+        for &(tier, pack) in &terrain_tiers {
+            assets.push(AssetRequest::TilesetDds(tileset, tier, pack));
+        }
+    }
+
+    for &(tier, pack) in &unit_tiers {
+        for image_id in 0..IMAGES_COUNT as u16 {
+            // Art is always loaded for the post-`images.rel`-redirect id (`resolve_art`), and
+            // redirected ids have no art files of their own — sweeping raw ids would request
+            // files that don't exist. `anim_request` then folds every SD image into the one
+            // `MainSdAnim` request and applies the Carbot start-location fallback, exactly as
+            // at render time.
+            let art_image_id = data.resolve_art(image_id);
+            let req = anim_request(art_image_id, tier, pack);
+            if !assets.contains(&req) {
+                assets.push(req);
+            }
+        }
+        if tier == AssetTier::Sd {
+            for image_id in 0..IMAGES_COUNT as u16 {
+                if let Some(path) = data.grp_path(data.resolve_art(image_id)) {
+                    let req = AssetRequest::Grp {
+                        path: path.to_string(),
+                    };
+                    if !assets.contains(&req) {
+                        assets.push(req);
+                    }
+                }
+            }
+        }
+    }
+
+    assets
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3093,6 +3184,133 @@ mod tests {
             ],
             "{requests:?}"
         );
+    }
+
+    /// The style-complete sweep (`required_style_assets`): the fetch-everything mode's
+    /// closed-world coverage. For `Original` the whole unit layer folds into `MainSdAnim` plus
+    /// resolvable GRPs; the Remastered-family styles cover both derivable tiers (HD2 for
+    /// standard map sizes, HD for degenerate tiny maps at the same `max_dimension`), and the
+    /// Carbot start-location quirk carries through.
+    #[test]
+    fn required_style_assets_covers_the_closed_asset_world() {
+        let mut parts = synthetic_parts(0, 0, 0, 0, None);
+        parts.3[0..4].copy_from_slice(&1u32.to_le_bytes()); // images.dat[0].grp = 1 (1-based)
+        parts.5 = build_tbl(&["terran\\marine.grp"]);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        // Original: everything is SD; no per-image anim requests exist at all.
+        let original = RenderOptions {
+            art_style: ArtStyle::Original,
+            max_dimension: Some(1024),
+            ..Default::default()
+        };
+        let requests = required_style_assets(&data, &original);
+        let unique: std::collections::HashSet<_> = requests.iter().collect();
+        assert_eq!(unique.len(), requests.len(), "no duplicate requests");
+        for kind in [
+            DatKind::Units,
+            DatKind::Flingy,
+            DatKind::Sprites,
+            DatKind::Images,
+        ] {
+            assert!(requests.contains(&AssetRequest::Dat(kind)));
+        }
+        assert!(requests.contains(&AssetRequest::ImagesRel));
+        assert!(requests.contains(&AssetRequest::ImagesTbl));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, AssetRequest::Cv5(_)))
+                .count(),
+            8,
+            "all 8 tilesets"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    AssetRequest::TilesetDds(_, AssetTier::Sd, ArtPack::Standard)
+                ))
+                .count(),
+            8
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, AssetRequest::TilesetDds(..)))
+                .count(),
+            8,
+            "SD is the only derivable tier for Original"
+        );
+        assert!(requests.contains(&AssetRequest::MainSdAnim));
+        assert!(requests.contains(&AssetRequest::Grp {
+            path: "terran\\marine.grp".to_string(),
+        }));
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, AssetRequest::Anim { .. })),
+            "SD has no per-image anim files"
+        );
+
+        // Remastered at a typical size: both HD2 (standard map sizes) and HD (degenerate tiny
+        // maps) are derivable, so both tiers' tilesets and full per-image anim sets appear.
+        let remastered = RenderOptions {
+            art_style: ArtStyle::Remastered,
+            max_dimension: Some(1024),
+            ..Default::default()
+        };
+        let requests = required_style_assets(&data, &remastered);
+        let unique: std::collections::HashSet<_> = requests.iter().collect();
+        assert_eq!(unique.len(), requests.len(), "no duplicate requests");
+        for wanted_tier in [AssetTier::Hd2, AssetTier::Hd] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| matches!(
+                        r,
+                        AssetRequest::TilesetDds(_, tier, ArtPack::Standard) if *tier == wanted_tier
+                    ))
+                    .count(),
+                8
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| matches!(
+                        r,
+                        AssetRequest::Anim { tier, pack: ArtPack::Standard, .. }
+                            if *tier == wanted_tier
+                    ))
+                    .count(),
+                IMAGES_COUNT,
+                "one anim per image id at each derivable tier"
+            );
+        }
+        assert!(!requests.contains(&AssetRequest::MainSdAnim));
+
+        // Cartooned: the start-location image comes from the standard pack (Carbot doesn't ship
+        // it), exactly like at render time.
+        let cartooned = RenderOptions {
+            art_style: ArtStyle::Cartooned,
+            max_dimension: Some(1024),
+            ..Default::default()
+        };
+        let requests = required_style_assets(&data, &cartooned);
+        assert!(requests.contains(&AssetRequest::Anim {
+            image_id: IMAGE_ID_START_LOCATION,
+            tier: AssetTier::Hd2,
+            pack: ArtPack::Standard,
+        }));
+        assert!(!requests.iter().any(|r| matches!(
+            r,
+            AssetRequest::Anim {
+                image_id: IMAGE_ID_START_LOCATION,
+                pack: ArtPack::Carbot,
+                ..
+            }
+        )));
     }
 
     /// The `.dat`/`.rel` tables are now an unconditional part of round 1: every art style

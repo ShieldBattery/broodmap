@@ -26,8 +26,8 @@ pub mod wpe;
 pub use anim::{Anim, AnimError, AnimFrame, AnimLayer};
 pub use cv5::{Cv5, TileGroup, TileGroupFlags, parse_cv5};
 pub use dat::{
-    FlingyDat, ImageEntry, ImagesDat, SpritesDat, UnitEntry, UnitsDat, parse_flingy_dat,
-    parse_images_dat, parse_sprites_dat, parse_units_dat,
+    FlingyDat, IMAGES_COUNT, ImageEntry, ImagesDat, SpritesDat, UnitEntry, UnitsDat,
+    parse_flingy_dat, parse_images_dat, parse_sprites_dat, parse_units_dat,
 };
 pub use dds::{DdsError, DdsFile, DdsFormat, parse_dds};
 pub use dds_vr4::{DdsVr4, DdsVr4Error, Frame, Palette};

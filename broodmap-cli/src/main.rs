@@ -13,6 +13,7 @@ use broodmap_render::{
     RenderOptions, RgbaImage, SourceError, StartLocations, TilesetDataSource, UnitFilter,
     build_minimap_table, compress_minimap_table, render_chk_minimap, render_chk_preview,
     render_terrain, required_preview_assets_for_chk, required_preview_graphics_for_chk,
+    required_style_assets,
 };
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
@@ -42,12 +43,15 @@ enum Command {
     /// SC:R assets by default; pass `--install`/`--assets-dir`/`--cdn` only to size unit dots
     /// from `units.dat` and refine melee filtering (see `--help`).
     Minimap(MinimapArgs),
-    /// Packs the exact SC:R asset files the given maps' preview renders need into a plain
-    /// directory (a "slim bundle") that `render`/`minimap` consume via `--assets-dir` -- server
-    /// rendering with no game install. The bundle covers every render-option combination at the
-    /// packed `--style`/`--size` (option toggles only ever shrink the asset set, so it's packed
-    /// at the maximal settings); pack with the same style and size you intend to render with.
-    Pack(PackArgs),
+    /// Downloads the SC:R asset files map preview rendering depends on into a plain directory
+    /// that `render`/`minimap` consume via `--assets-dir` -- server rendering with no game
+    /// install. By default fetches the style-complete set that serves ANY map at the given
+    /// `--style`/`--size` (pleasantly small for the default `original` style: the one
+    /// mainSD.anim, the 8 tilesets, GRP canvas sources and the stat tables; the
+    /// Remastered-family styles' complete sets are much larger). Passing map files instead
+    /// fetches just the union of those maps' needs. Either way the set covers every
+    /// render-option combination at that style/size.
+    FetchAssets(FetchAssetsArgs),
     /// Regenerates the 8 committed per-tileset minimap color tables
     /// (`broodmap-render/src/minimap/tables/*.bin`) from a real StarCraft: Remastered install.
     /// Dev-time only -- the committed output is what `minimap`/the library's zero-asset renderer
@@ -213,13 +217,14 @@ impl CdnArgs {
 }
 
 #[derive(clap::Args)]
-struct PackArgs {
-    /// Paths to .scm/.scx map files the bundle must cover (it packs the union of their needs).
-    #[arg(required = true)]
+struct FetchAssetsArgs {
+    /// Optional .scm/.scx map files: fetch only the union of these maps' needs instead of the
+    /// style-complete set (worthwhile for the Remastered-family styles, whose complete sets are
+    /// large; a fixed map pool needs far less).
     maps: Vec<PathBuf>,
 
-    /// Output directory for the bundle, created if needed. Existing files are overwritten, so
-    /// re-packing with more maps grows a bundle in place.
+    /// Output directory for the assets, created if needed. Existing files are overwritten, so
+    /// re-fetching into the same directory grows/refreshes it in place.
     #[arg(long)]
     out: PathBuf,
 
@@ -236,7 +241,7 @@ struct PackArgs {
     #[command(flatten)]
     cdn_args: CdnArgs,
 
-    /// Art style the bundle should serve (matching `render`'s `--style`).
+    /// Art style the fetched assets should serve (matching `render`'s `--style`).
     #[arg(long, value_enum, default_value_t = ArtStyleArg::Original)]
     style: ArtStyleArg,
 
@@ -245,9 +250,9 @@ struct PackArgs {
     #[arg(long, value_enum)]
     unit_style: Option<ArtStyleArg>,
 
-    /// Maximum output dimension the bundle should serve (matching `render`'s `--size`; together
-    /// with the map dimensions it selects the HD vs. HD2 asset tier for the Remastered-family
-    /// styles).
+    /// Maximum output dimension the fetched assets should serve (matching `render`'s `--size`;
+    /// together with the map dimensions it selects the HD vs. HD2 asset tier for the
+    /// Remastered-family styles).
     #[arg(long, default_value_t = 1024)]
     size: u32,
 }
@@ -316,7 +321,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Render(args) => render(args),
         Command::Minimap(args) => minimap(args),
-        Command::Pack(args) => pack(args),
+        Command::FetchAssets(args) => fetch_assets(args),
         Command::GenMinimapTables(args) => gen_minimap_tables(args),
     }
 }
@@ -465,18 +470,22 @@ fn minimap(args: MinimapArgs) -> Result<()> {
     Ok(())
 }
 
-/// Packs a "slim bundle": the union, over the given maps, of every asset a preview render could
-/// request at the packed style/size, written under `--out` in the CASC catalog layout
-/// `DirSource` reads. Asset selection reuses the library's two-round prefetch API, so the packed
-/// set can't drift from what `render_chk_preview` actually reads. Round-1 assets (the tileset
-/// files and the `.dat`/`.rel`/`.tbl` tables) are whole-render dependencies, so a miss is fatal;
-/// round-2 art (anims, GRP headers) degrades per drawable at render time, so a miss only warns
-/// -- e.g. the Carbot pack legitimately ships without most shadow anims.
-fn pack(args: PackArgs) -> Result<()> {
+/// Downloads render dependencies into a directory laid out the way `DirSource` reads (each
+/// asset at its CASC catalog path under `--out`). With no maps this is the library's
+/// style-complete set (`required_style_assets`) — everything any map could request at the given
+/// style/size; with maps it's the union of their two-round prefetch lists. Either way the
+/// selection comes from the library, so it can't drift from what `render_chk_preview` actually
+/// reads.
+///
+/// A missing per-drawable asset (an anim or GRP) degrades a render by exactly one drawable, so
+/// it only warns here — e.g. the Carbot pack legitimately ships without most shadow anims.
+/// Everything else (tables, tileset files, `mainSD.anim`) is a whole-layer dependency: fatal.
+fn fetch_assets(args: FetchAssetsArgs) -> Result<()> {
     // The maximal option set at this style/size: every option toggle only ever *removes*
-    // requests, so packing with everything shown, the as-placed filter, and sprite start
+    // requests, so fetching with everything shown, the as-placed filter, and sprite start
     // locations (the one start-location mode that fetches art) covers every option combination
-    // a render of these maps can use.
+    // a render can use. (Only the per-map mode reads the toggles; the style-complete set
+    // depends on style/size alone.)
     let options = RenderOptions {
         art_style: args.style.into(),
         unit_style: args.unit_style.map(Into::into),
@@ -502,45 +511,53 @@ fn pack(args: PackArgs) -> Result<()> {
 
     let data = GameData::load(source).context("failed to load game data tables")?;
 
-    // Requests already handled (written or found missing), deduplicated across rounds and maps.
-    let mut handled: HashSet<AssetRequest> = HashSet::new();
-    let mut total_bytes: u64 = 0;
-    let mut missing = 0usize;
-    for map in &args.maps {
-        let map_bytes = std::fs::read(map)
-            .with_context(|| format!("failed to read map file {}", map.display()))?;
-        let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
-            .with_context(|| format!("failed to parse map file {}", map.display()))?;
-
-        for req in required_preview_assets_for_chk(&chk, &options) {
-            if !handled.insert(req.clone()) {
-                continue;
+    let requests: Vec<AssetRequest> = if args.maps.is_empty() {
+        required_style_assets(&data, &options)
+    } else {
+        let mut seen: HashSet<AssetRequest> = HashSet::new();
+        let mut requests = Vec::new();
+        for map in &args.maps {
+            let map_bytes = std::fs::read(map)
+                .with_context(|| format!("failed to read map file {}", map.display()))?;
+            let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
+                .with_context(|| format!("failed to parse map file {}", map.display()))?;
+            let per_map = required_preview_assets_for_chk(&chk, &options)
+                .into_iter()
+                .chain(required_preview_graphics_for_chk(&chk, &data, &options));
+            for req in per_map {
+                if seen.insert(req.clone()) {
+                    requests.push(req);
+                }
             }
-            let bytes = source
-                .read(&req)
-                .with_context(|| format!("failed to read {}", req.casc_path()))?;
-            total_bytes += write_bundle_file(&args.out, &req, &bytes)?;
         }
-        for req in required_preview_graphics_for_chk(&chk, &data, &options) {
-            if !handled.insert(req.clone()) {
-                continue;
+        requests
+    };
+
+    let mut total_bytes: u64 = 0;
+    let mut written = 0usize;
+    let mut missing = 0usize;
+    for req in &requests {
+        match source.read(req) {
+            Ok(bytes) => {
+                total_bytes += write_asset_file(&args.out, req, &bytes)?;
+                written += 1;
             }
-            match source.read(&req) {
-                Ok(bytes) => total_bytes += write_bundle_file(&args.out, &req, &bytes)?,
-                Err(SourceError::NotFound) => {
-                    eprintln!("warning: {} not in the source, skipped", req.casc_path());
-                    missing += 1;
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("failed to read {}", req.casc_path()));
-                }
+            Err(SourceError::NotFound) if missing_degrades_per_drawable(req) => {
+                eprintln!("warning: {} not in the source, skipped", req.casc_path());
+                missing += 1;
+            }
+            Err(SourceError::NotFound) => {
+                anyhow::bail!("{} not found in the source", req.casc_path());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", req.casc_path()));
             }
         }
     }
 
     println!(
-        "Packed {} files ({:.1} MB) into {}{}",
-        handled.len() - missing,
+        "Fetched {} files ({:.1} MB) into {}{}",
+        written,
         total_bytes as f64 / (1024.0 * 1024.0),
         args.out.display(),
         if missing > 0 {
@@ -553,9 +570,17 @@ fn pack(args: PackArgs) -> Result<()> {
     Ok(())
 }
 
-/// Writes one asset's bytes at its CASC catalog path under the bundle root (the layout
-/// `DirSource` reads), returning the byte count.
-fn write_bundle_file(root: &Path, req: &AssetRequest, bytes: &[u8]) -> Result<u64> {
+/// Whether a missing `req` merely degrades a render per drawable (the renderer skips that one
+/// drawable and continues) rather than taking out a whole layer. Mirrors the renderer's own
+/// failure semantics: anims and GRP canvas sources are per-drawable; everything else is
+/// load-bearing.
+fn missing_degrades_per_drawable(req: &AssetRequest) -> bool {
+    matches!(req, AssetRequest::Anim { .. } | AssetRequest::Grp { .. })
+}
+
+/// Writes one asset's bytes at its CASC catalog path under `root` (the layout `DirSource`
+/// reads), returning the byte count.
+fn write_asset_file(root: &Path, req: &AssetRequest, bytes: &[u8]) -> Result<u64> {
     let dest = root.join(req.casc_path());
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)

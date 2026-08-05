@@ -59,6 +59,7 @@ pub use options::{
 pub use overlay::{
     Preview, render_chk_preview, render_preview, render_preview_with_warnings,
     required_preview_assets_for_chk, required_preview_graphics, required_preview_graphics_for_chk,
+    required_style_assets,
 };
 pub use source::{AssetRequest, DatKind, MemorySource, SourceError, TilesetDataSource};
 pub use terrain::render_terrain;

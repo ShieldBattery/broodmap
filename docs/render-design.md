@@ -270,13 +270,20 @@ keying caches/URLs. Provided implementations:
   cache under the system temp dir — the CDN bootstrap alone is tens of MB of metadata).
   Non-default feature; publishing is gated on broodcasc reaching crates.io.
 - `DirSource` (feature `fs`): plain directory of extracted files (CascView trees, test
-  fixtures). Also the layout the CLI's `pack` subcommand emits — a "slim bundle": the union of
-  the two-round prefetch API's requests for one or more maps at a given style/size, fetched from
-  any source (install or CDN) and written at their CASC paths. Packing uses the maximal option
-  set (as-placed, everything shown, sprite start locations) since option toggles only ever
-  shrink the request set, so one bundle serves every option combination at its style/size —
-  verified byte-identical to install-sourced renders across all three styles. Server rendering
-  with no game install and no render-time CDN dependency.
+  fixtures). Also the layout the CLI's `fetch-assets` subcommand emits: it downloads render
+  dependencies from any source (install or CDN) to their CASC paths, giving server rendering
+  with no game install and no render-time CDN dependency. Its default mode fetches the
+  **style-complete** set (`required_style_assets`): everything *any* map could request at a
+  given style/size — closed because renders only ever read the tables, the 8 tilesets, and art
+  for the 999 `images.dat` entries, with the derived-tier axis covered by evaluating the tier
+  derivation over every possible map dimension. For the default `Original` that's one
+  `mainSD.anim` + 8 SD tilesets + GRP canvas sources + tables (~98 MB); the Remastered-family
+  complete sets are much larger (both HD2 and HD are reachable — degenerate tiny maps derive
+  HD), which is what the per-map mode (pass map files; the union of their two-round lists) is
+  for. Both modes use maximal options (as-placed, everything shown, sprite start locations)
+  since option toggles only ever shrink the request set — one asset directory serves every
+  option combination at its style/size. Verified byte-identical to install-sourced renders
+  across all three styles.
 - `MemorySource`: prefilled map of `AssetRequest -> bytes`. The primary WASM pattern — the trait
   stays sync; browser fetch is async; prefetch-then-render bridges the two.
 - `FnSource`: closure adapter for anything else synchronous (OPFS sync handles in a worker,

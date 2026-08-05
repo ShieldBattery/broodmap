@@ -364,8 +364,10 @@ pub fn parse_sprites_dat(data: &[u8]) -> SpritesDat {
 // images.dat
 // ---------------------------------------------------------------------------------------------
 
-/// Number of image entries in `images.dat`.
-const IMAGES_COUNT: usize = 999;
+/// Number of image entries in `images.dat` — and therefore the number of valid image IDs
+/// (`0..IMAGES_COUNT`) across every table that indexes images (`images.rel`, `mainSD.anim`'s
+/// entry directory, per-image `.anim` files).
+pub const IMAGES_COUNT: usize = 999;
 /// Real-world size in bytes of `images.dat`, used to cross-check the column layout below.
 const IMAGES_DAT_SIZE: usize = 37962;
 
