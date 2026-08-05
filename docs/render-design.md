@@ -573,6 +573,12 @@ render plan computes up front; the executor walks it bandwise).
   handled alongside classic `.vx4`. One divergence remains open: a runtime palette-index remap
   LUT the real game applies couldn't be recovered from static data; an identity LUT matches
   empirically and is what's shipped.
+- Slimmer `fetch-assets` output: of a style-complete `Original` fetch's ~98 MB / 853 files,
+  ~810 files (~15 MB) are classic GRPs fetched solely for their 6-byte canvas headers. If a
+  truly minimal server payload ever matters, either truncate GRPs to their headers at fetch
+  time or replace them with a baked image-id -> canvas table — both make the directory no
+  longer a faithful CASC subset (and the table variant adds a second data path through the SD
+  canvas logic), which is why neither is done today.
 - Crate naming: `broodmap-formats` vs. a standalone name (`scr-formats`); it can start in this
   workspace and be extracted later if neobrood adoption makes that cleaner.
 - Publishing order: `broodmap-render` (with `casc` feature) can't hit crates.io until broodcasc
