@@ -418,7 +418,6 @@ fn collect_drawables(
             data,
             options,
             image_id,
-            Some(unit.unit_id),
             Drawable {
                 art_image_id: data.resolve_art(image_id),
                 frame,
@@ -459,16 +458,11 @@ fn collect_drawables(
         let Some(image_id) = image_id else {
             continue;
         };
-        // Doodads (pure sprites) have no unit ID, so they only ever qualify for the same-GRP
-        // skip rule in `shadow_image_pre_redirect`; "unit sprite" THG2 entries carry a real unit
-        // ID (their own `id` field, per the chain above) and so also get the subunit rule.
-        let unit_id_for_shadow = (!is_doodad).then_some(sprite.id);
         push_with_shadow(
             &mut drawables,
             data,
             options,
             image_id,
-            unit_id_for_shadow,
             Drawable {
                 art_image_id: data.resolve_art(image_id),
                 // THG2 entries carry no facing or resource data, so they always use frame 0 (the
@@ -489,10 +483,8 @@ fn collect_drawables(
 }
 
 /// Pushes `owner_drawable`, first pushing its shadow underlay (if [`RenderOptions::show_shadows`]
-/// is on and [`GameData::shadow_image_pre_redirect`]'s bounded scan from `pre_redirect_image_id`
-/// finds one) immediately before it. `unit_id` is the drawable's own unit ID where one exists
-/// (placed units and THG2 unit-sprites; `None` for THG2 doodad sprites), enabling the scan's
-/// subunit-skip rule — see that function's docs.
+/// is on and [`GameData::shadow_image_pre_redirect`] finds one for `pre_redirect_image_id`)
+/// immediately before it.
 ///
 /// Ordering note: this is genuine per-drawable ordering, not a global "shadows first" pass. The
 /// shadow is given the exact same `(layer, y, x)` as its owner, and [`Vec::sort_by_key`] (used by
@@ -505,12 +497,10 @@ fn push_with_shadow(
     data: &GameData,
     options: &RenderOptions,
     pre_redirect_image_id: u16,
-    unit_id: Option<u16>,
     owner_drawable: Drawable,
 ) {
     if options.show_shadows
-        && let Some(shadow_pre_redirect) =
-            data.shadow_image_pre_redirect(pre_redirect_image_id, unit_id)
+        && let Some(shadow_pre_redirect) = data.shadow_image_pre_redirect(pre_redirect_image_id)
     {
         drawables.push(Drawable {
             art_image_id: data.resolve_art(shadow_pre_redirect),
@@ -1452,7 +1442,9 @@ fn draw_start_location_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gamedata::tests::{build_tbl, synthetic_parts, synthetic_source};
+    use crate::gamedata::tests::{
+        build_tbl, plant_shadow_record, synthetic_parts, synthetic_source,
+    };
     use crate::source::{DatKind, MemorySource};
     use crate::tier::ArtStyle;
     use broodmap::chk::placed_units::{UnitInstanceId, UnitState};
@@ -1535,13 +1527,18 @@ mod tests {
         GameData::load(&synthetic_source(synthetic_parts(0, 0, 0, 0, None))).unwrap()
     }
 
-    /// Game data where unit/sprite ID 0 resolves to `main_image_id`, with `images.dat`'s
-    /// `render_style` column at `main_image_id + 1` set to `shadow_render_style` -- the shadow
-    /// tests' one knob.
-    fn game_data_with_shadow_render_style(main_image_id: u16, shadow_render_style: u8) -> GameData {
+    /// Game data where unit/sprite ID 0 resolves to `main_image_id`, with an `images.rel` type-8
+    /// record making `shadow_image_id` its shadow and `images.dat`'s `render_style` column at
+    /// `shadow_image_id` set to `shadow_render_style` -- the shadow tests' knobs. `shadow_image_id`
+    /// need not be `main_image_id + 1`: the mapping is exact table data now, not positional.
+    fn game_data_with_shadow(
+        main_image_id: u16,
+        shadow_image_id: u16,
+        shadow_render_style: u8,
+    ) -> GameData {
         let mut parts = synthetic_parts(0, 0, 0, main_image_id, None);
-        let shadow_id = main_image_id as usize + 1;
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_id] = shadow_render_style;
+        plant_shadow_record(&mut parts.4, shadow_image_id, main_image_id);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_image_id as usize] = shadow_render_style;
         GameData::load(&synthetic_source(parts)).unwrap()
     }
 
@@ -1779,8 +1776,8 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn shadow_emitted_when_plus_one_is_render_style_shadow() {
-        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+    fn shadow_emitted_when_the_rel_table_has_a_mapping() {
+        let data = game_data_with_shadow(5, 6, RENDER_STYLE_SHADOW);
         let units = [unit(0, Some(11), 10, 20)];
         let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
 
@@ -1796,7 +1793,7 @@ mod tests {
         assert!(!drawn[1].is_shadow);
         assert_eq!(
             drawn[0].art_image_id, 6,
-            "shadow art is the +1 (post-redirect) image"
+            "shadow art is the id images.rel names"
         );
         assert_eq!(drawn[1].art_image_id, 5);
         // Same position, frame and flip as the owner.
@@ -1807,9 +1804,30 @@ mod tests {
     }
 
     #[test]
-    fn no_shadow_when_plus_one_is_not_render_style_shadow() {
-        // render_style 9 ("use remapping"/teamcolor) is a real draw style, just not Shadow.
-        let data = game_data_with_shadow_render_style(5, 9);
+    fn shadow_can_live_at_an_arbitrary_delta_not_just_plus_one() {
+        // Mirrors real buildings like the protoss nexus (image 179 -> shadow 182): the mapping
+        // is exact table data, not a positional convention, so a shadow far from its owner's ID
+        // must still be found and drawn.
+        let data = game_data_with_shadow(5, 40, RENDER_STYLE_SHADOW);
+        let units = [unit(0, Some(11), 10, 20)];
+        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
+
+        assert_eq!(
+            drawn.len(),
+            2,
+            "expected a shadow plus its owner: {drawn:?}"
+        );
+        assert!(drawn[0].is_shadow);
+        assert_eq!(drawn[0].art_image_id, 40);
+        assert_eq!(drawn[1].art_image_id, 5);
+    }
+
+    #[test]
+    fn no_shadow_when_the_render_style_gate_fails() {
+        // A real images.rel record names image 6 as image 5's shadow, but image 6's images.dat
+        // entry isn't render_style 10 (9, "use remapping"/teamcolor, is a real style, just not
+        // Shadow) -- a rel/dat disagreement, which must fail toward no shadow.
+        let data = game_data_with_shadow(5, 6, 9);
         let units = [unit(0, Some(11), 10, 20)];
         let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
         assert_eq!(drawn.len(), 1, "no shadow should be emitted: {drawn:?}");
@@ -1817,89 +1835,22 @@ mod tests {
     }
 
     #[test]
-    fn no_shadow_when_plus_one_entry_is_missing() {
-        // Image 998 is the last valid images.dat index (999 entries, 0-indexed); +1 (999) is out
-        // of range, so there's no entry to gate on at all.
-        let data = game_data_with_shadow_render_style(998, RENDER_STYLE_SHADOW);
+    fn no_shadow_when_the_rel_table_has_no_mapping() {
+        // No type-8 record at all for image 5: there's nothing to look up.
+        let data = game_data();
         let units = [unit(0, Some(11), 10, 20)];
         let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
         assert_eq!(
             drawn.len(),
             1,
-            "out-of-range +1 must not panic or synthesize a shadow"
+            "no rel mapping must not panic or synthesize a shadow"
         );
         assert!(!drawn[0].is_shadow);
-    }
-
-    #[test]
-    fn geyser_shadow_uses_plus_two_not_plus_one() {
-        // Mirrors the real data (image 344, +1=345 a same-GRP render_style-0 variant, +2=346
-        // "neutral\geyShad.grp" render_style 10): a vespene geyser's shadow lives at +2, not +1.
-        let mut parts = synthetic_parts(UNIT_ID_VESPENE_GEYSER, 0, 0, 10, None);
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0; // +1: a variant, not a shadow
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW; // +2: the real shadow
-        let data = GameData::load(&synthetic_source(parts)).unwrap();
-
-        let units = [unit(UNIT_ID_VESPENE_GEYSER, Some(11), 10, 20)];
-        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
-        assert_eq!(
-            drawn.len(),
-            2,
-            "the geyser should get a shadow at +2: {drawn:?}"
-        );
-        assert!(drawn[0].is_shadow);
-        assert_eq!(
-            drawn[0].art_image_id, 12,
-            "shadow art must be the +2 image, not +1"
-        );
-    }
-
-    #[test]
-    fn non_geyser_units_never_fall_back_to_plus_two() {
-        // Same images.dat layout as the geyser case above (+1 not a shadow, +2 is), but for an
-        // ordinary unit ID: only +1 is ever consulted for anything other than the geyser special
-        // case, so no shadow should be emitted even though +2 is a real one.
-        let mut parts = synthetic_parts(0, 0, 0, 10, None);
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0;
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW;
-        let data = GameData::load(&synthetic_source(parts)).unwrap();
-
-        let units = [unit(0, Some(11), 10, 20)];
-        let drawn = collect_drawables(&units, &[], &data, &options(), Tileset::Jungle);
-        assert_eq!(
-            drawn.len(),
-            1,
-            "ordinary units must not fall back to +2: {drawn:?}"
-        );
-        assert!(!drawn[0].is_shadow);
-    }
-
-    #[test]
-    fn doodad_sprites_never_get_the_geyser_plus_two_special_case() {
-        // Sprite ID 188 coincides with the vespene geyser's *unit* ID, but doodads have no unit
-        // ID at all (THG2 pure-sprite entries), so the special case must never apply to them.
-        let mut parts = synthetic_parts(0, 0, UNIT_ID_VESPENE_GEYSER, 10, None);
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 11] = 0;
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + 12] = RENDER_STYLE_SHADOW;
-        let data = GameData::load(&synthetic_source(parts)).unwrap();
-
-        let drawn = collect_drawables(
-            &[],
-            &[doodad(UNIT_ID_VESPENE_GEYSER)],
-            &data,
-            &options(),
-            Tileset::Jungle,
-        );
-        assert_eq!(
-            drawn.len(),
-            1,
-            "doodads must never use the geyser +2 rule: {drawn:?}"
-        );
     }
 
     #[test]
     fn show_shadows_false_suppresses_shadows_even_when_the_gate_would_pass() {
-        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let data = game_data_with_shadow(5, 6, RENDER_STYLE_SHADOW);
         let units = [unit(0, Some(11), 10, 20)];
         let opts = RenderOptions {
             show_shadows: false,
@@ -1912,7 +1863,7 @@ mod tests {
 
     #[test]
     fn shadows_apply_to_thg2_doodad_and_unit_sprites_too() {
-        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let data = game_data_with_shadow(5, 6, RENDER_STYLE_SHADOW);
 
         // A pure-sprite (doodad) THG2 entry resolves through `sprites.dat` directly, but the
         // synthetic table chain routes both unit ID 0 and sprite ID 0 to image 5 (see
@@ -1940,11 +1891,12 @@ mod tests {
 
     #[test]
     fn start_locations_never_get_a_shadow() {
-        // Give image 588 (the start-location graphic) a real shadow-styled +1 neighbor; the
-        // start-location path must still never emit one.
+        // Give image 588 (the start-location graphic) a real shadow mapping; the start-location
+        // path must still never emit one.
         let mut parts = synthetic_parts(0, 0, 0, 0, None);
-        let shadow_id = IMAGE_ID_START_LOCATION as usize + 1;
-        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_id] = RENDER_STYLE_SHADOW;
+        let shadow_id = IMAGE_ID_START_LOCATION + 1;
+        plant_shadow_record(&mut parts.4, shadow_id, IMAGE_ID_START_LOCATION);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + shadow_id as usize] = RENDER_STYLE_SHADOW;
         let data = GameData::load(&synthetic_source(parts)).unwrap();
 
         let units = [unit(UNIT_ID_START_LOCATION, Some(0), 64, 64)];
@@ -1963,7 +1915,7 @@ mod tests {
 
     #[test]
     fn required_preview_graphics_includes_shadow_anims_only_when_enabled() {
-        let data = game_data_with_shadow_render_style(5, RENDER_STYLE_SHADOW);
+        let data = game_data_with_shadow(5, 6, RENDER_STYLE_SHADOW);
         let units = [unit(0, Some(11), 10, 20)];
         let opts = RenderOptions {
             art_style: ArtStyle::Remastered,

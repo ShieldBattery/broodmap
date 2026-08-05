@@ -362,8 +362,9 @@ fn unit_style_can_differ_from_the_terrain_style() {
 ///
 /// Also probes `mainSD.anim` directly through the public API as a cheap, high-value regression
 /// anchor: image 344 (the vespene geyser's main art) should have one frame per tileset (8), and
-/// image 345 (its same-GRP `+1` variant -- see `GameData::shadow_image_pre_redirect`'s docs)
-/// should resolve via the container's own inline reference entry, mirroring `images.rel`'s
+/// image 345 (a same-GRP `render_style`-0 variant of it, not a shadow -- its real shadow is 346,
+/// via `images.rel`'s type-8 table; see `GameData::shadow_image_pre_redirect`'s docs) should
+/// resolve via the container's own inline reference entry, mirroring `images.rel`'s ordinary
 /// redirect for the same pair (verified 131/131 agreement against real data -- see
 /// `broodmap_formats::mainsd`'s module docs).
 #[test]

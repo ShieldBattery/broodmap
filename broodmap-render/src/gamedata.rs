@@ -22,6 +22,7 @@
 //! and `broodmap_formats::grp`'s module docs.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use broodmap_formats::{
     FlingyDat, ImagesDat, ImagesRel, SpritesDat, UnitsDat, parse_flingy_dat, parse_images_dat,
@@ -59,8 +60,9 @@ pub(crate) const UNIT_IDS_CRITTER: [u16; 6] = [89, 90, 93, 94, 95, 96];
 const SPECIAL_ABILITY_FLAG_BUILDING: u32 = 0x0000_0001;
 
 /// `images.dat`'s raw `render_style` code for BW's "shadow" draw function (see
-/// [`broodmap_formats::ImageEntry::render_style`]'s docs). Used by [`GameData::shadow_image_pre_redirect`]
-/// to gate the shadow-image heuristic.
+/// [`broodmap_formats::ImageEntry::render_style`]'s docs). Used by
+/// [`GameData::shadow_image_pre_redirect`] as a belt-and-suspenders gate on the `images.rel`
+/// shadow table (see [`GameData::build_shadow_images`]).
 const RENDER_STYLE_SHADOW: u8 = 10;
 
 /// Builds the [`AssetRequest`] for an image's art at a given tier/pack, applying the Carbot
@@ -111,6 +113,11 @@ pub struct GameData {
     sprites: SpritesDat,
     images: ImagesDat,
     rel: ImagesRel,
+    /// Parent (owner) image ID -> its shadow image ID, inverted from `images.rel`'s type-8
+    /// shadow records at construction time (see [`Self::build_shadow_images`]). Built once and
+    /// reused rather than scanned per lookup since it's derived from a whole-file table that
+    /// doesn't change after load.
+    shadow_images: HashMap<u16, u16>,
     /// Every `images.tbl` entry, decoded and owned up front (`Tbl<'a>` itself borrows from the
     /// source bytes, which don't outlive a single `load` call, so this can't just hold a `Tbl`).
     /// Indexed 0-based, matching `Tbl::get`; [`Self::grp_path`] applies `images.dat`'s 1-based
@@ -132,12 +139,17 @@ impl GameData {
         let rel = source.read(&AssetRequest::ImagesRel)?;
         let images_tbl = source.read(&AssetRequest::ImagesTbl)?;
 
+        let images = parse_images_dat(images.as_ref());
+        let rel = parse_images_rel(rel.as_ref());
+        let shadow_images = build_shadow_images(&rel, &images);
+
         Ok(GameData {
             units: parse_units_dat(units.as_ref()),
             flingy: parse_flingy_dat(flingy.as_ref()),
             sprites: parse_sprites_dat(sprites.as_ref()),
-            images: parse_images_dat(images.as_ref()),
-            rel: parse_images_rel(rel.as_ref()),
+            images,
+            rel,
+            shadow_images,
             images_tbl: parse_tbl_owned(images_tbl.as_ref()),
         })
     }
@@ -154,12 +166,14 @@ impl GameData {
         rel: ImagesRel,
         images_tbl: Vec<String>,
     ) -> GameData {
+        let shadow_images = build_shadow_images(&rel, &images);
         GameData {
             units,
             flingy,
             sprites,
             images,
             rel,
+            shadow_images,
             images_tbl,
         }
     }
@@ -224,44 +238,37 @@ impl GameData {
     ///
     /// In the real game, a drawable's shadow is a separate image attached by an iscript `imgul`
     /// ("image underlay") opcode -- a VM this library deliberately does not implement or run (see
-    /// `docs/render-design.md`'s Non-goals). Instead, this applies a data-only heuristic in its
-    /// place: a shadow conventionally lives at `main_pre_redirect + 1`, gated on that slot's
-    /// `images.dat` entry being flagged with BW's "shadow" draw style (`render_style == 10`).
-    /// This was verified against a real SC:R install (228 units + 517 THG2 sprite IDs) and
-    /// cross-checked against neobrood's generated iscript disassembly as a development-time
-    /// oracle -- see `docs/render-design.md`'s "Shadows" note for the numbers.
+    /// `docs/render-design.md`'s Non-goals). Instead of running iscript, this looks the shadow up
+    /// directly: `images.rel` carries an exact, data-driven parent -> shadow mapping (its type-8
+    /// records; see [`broodmap_formats::ImagesRel::shadow_parent`]'s docs), inverted once at
+    /// construction time into [`Self::shadow_images`] (see [`build_shadow_images`]). A handful of
+    /// parents (12, in a real install) have two shadow records -- e.g. obscure neutral pickups
+    /// with `*Shad`/`*Sha2` GRP variants -- and [`build_shadow_images`] deterministically keeps
+    /// the lowest shadow image ID among them.
     ///
-    /// One case gets a hardcoded offset instead of the general `+1` rule: the vespene geyser
-    /// (`unit_id == `[`UNIT_ID_VESPENE_GEYSER`]) uses `+2`, because `+1` there is a same-GRP art
-    /// variant of the geyser itself (`render_style` other than 10), not a shadow -- verified
-    /// against a real install (image 344's `+1`, 345, is a render_style-0 variant; its real
-    /// shadow is 346, `neutral\geyShad.grp`, render_style 10). This mirrors the existing
-    /// resource-specific stand-ins for iscript behavior this library doesn't run (mineral frame
-    /// by amount, geyser frame by tileset — see `select_unit_frame`), rather than a general
-    /// mechanism: units whose own turret/overlay image pushes their real shadow to `+2` are not
-    /// covered and simply get no shadow (an accepted gap -- see `docs/render-design.md`'s
-    /// "Shadows" note).
+    /// `main_pre_redirect` must be the image ID *before* the `images.rel` art redirect (the same
+    /// ID that indexes `images.dat`'s other rendering metadata -- see
+    /// [`Self::unit_image_pre_redirect`]'s docs), since that's the ID the shadow table is keyed
+    /// by. If that direct lookup misses, this falls back to looking up the *redirected* image
+    /// instead (`self.rel.resolve(main_pre_redirect)`), so a unit whose own main image is itself
+    /// redirected to different art still finds its shadow. Either way, the returned ID is itself
+    /// pre-redirect w.r.t. art resolution -- callers apply [`Self::resolve_art`] to it, mirroring
+    /// how the main image's art is resolved (see [`crate::overlay::push_with_shadow`]).
     ///
-    /// `main_pre_redirect` must be the image ID *before* the `images.rel` redirect (the same ID
-    /// that indexes `images.dat`'s other rendering metadata -- see
-    /// [`Self::unit_image_pre_redirect`]'s docs), since that's what the render-style gate is
-    /// checked against. The redirect is then applied to the shadow slot itself (mirroring how the
-    /// main image's art is resolved) to get the ID whose `.anim` actually holds the shadow art.
-    ///
-    /// `unit_id` is the drawable's own unit ID where one exists (placed units and THG2
-    /// unit-sprites); `None` for THG2 doodad sprites, which have no unit ID and so never match
-    /// the geyser special case.
-    pub(crate) fn shadow_image_pre_redirect(
-        &self,
-        main_pre_redirect: u16,
-        unit_id: Option<u16>,
-    ) -> Option<u16> {
-        let offset: u16 = if unit_id == Some(UNIT_ID_VESPENE_GEYSER) {
-            2
-        } else {
-            1
-        };
-        let shadow_id = main_pre_redirect.checked_add(offset)?;
+    /// As a belt-and-suspenders check against a hostile or malformed `images.rel`/`images.dat`
+    /// pair disagreeing with each other, the resulting shadow ID's `images.dat` entry must have
+    /// `render_style == 10` (BW's "shadow" draw style) or this returns `None` -- the safe
+    /// direction for a disagreement to fail toward. On real data every entry in the table passes
+    /// this gate (230/230), so it's a no-op there.
+    pub(crate) fn shadow_image_pre_redirect(&self, main_pre_redirect: u16) -> Option<u16> {
+        let shadow_id = self
+            .shadow_images
+            .get(&main_pre_redirect)
+            .or_else(|| {
+                let resolved = self.rel.resolve(main_pre_redirect);
+                self.shadow_images.get(&resolved)
+            })
+            .copied()?;
         self.images
             .entry(shadow_id)
             .filter(|e| e.render_style == RENDER_STYLE_SHADOW)
@@ -286,6 +293,26 @@ impl GameData {
         let index = usize::try_from(entry.grp - 1).ok()?;
         self.images_tbl.get(index).map(String::as_str)
     }
+}
+
+/// Inverts `rel`'s type-8 shadow records (shadow ID -> parent ID) into a parent -> shadow lookup,
+/// gated against `images` for hostile/malformed input: a record whose parent ID doesn't resolve
+/// to a real `images.dat` entry, or whose parent ID is its own shadow ID (a self-reference), is
+/// skipped entirely -- real `images.rel` files never do either, but the bytes are untrusted. When
+/// a parent has more than one shadow record (12, in a real install), the lowest shadow ID wins,
+/// applied via `Entry::or_insert`/`min` regardless of record order.
+fn build_shadow_images(rel: &ImagesRel, images: &ImagesDat) -> HashMap<u16, u16> {
+    let mut shadow_images: HashMap<u16, u16> = HashMap::new();
+    for (shadow_id, parent_id) in rel.shadow_pairs() {
+        if parent_id == shadow_id || images.entry(parent_id).is_none() {
+            continue;
+        }
+        shadow_images
+            .entry(parent_id)
+            .and_modify(|existing| *existing = (*existing).min(shadow_id))
+            .or_insert(shadow_id);
+    }
+    shadow_images
 }
 
 /// Eagerly decodes every entry of a `.tbl` file (here, always `images.tbl`) into an owned
@@ -374,6 +401,21 @@ pub(crate) mod tests {
         let tbl = build_tbl(&[]);
 
         (units, flingy, sprites, images, rel, tbl)
+    }
+
+    /// `images.rel`'s type value for a shadow-image record (`broodmap_formats::rel`'s private
+    /// `SHADOW_TYPE`, mirrored here the same way `synthetic_parts` mirrors `REDIRECT_FLAG` as a
+    /// literal `0x200`).
+    const SHADOW_REL_TYPE: u32 = 8;
+
+    /// Plants an `images.rel` type-8 (shadow) record directly into raw `rel` bytes (index 4 of a
+    /// [`DatBytes`], the same tuple [`synthetic_parts`] returns): `shadow_id`'s record marks it
+    /// as `parent_id`'s shadow. Callers poke `synthetic_parts`' `.4` field with this the same way
+    /// existing tests poke `.3` (images.dat) directly for `render_style`.
+    pub(crate) fn plant_shadow_record(rel: &mut [u8], shadow_id: u16, parent_id: u16) {
+        let off = shadow_id as usize * 8;
+        rel[off..off + 4].copy_from_slice(&SHADOW_REL_TYPE.to_le_bytes());
+        rel[off + 4..off + 8].copy_from_slice(&(parent_id as u32).to_le_bytes());
     }
 
     pub(crate) fn synthetic_source(parts: DatBytes) -> MemorySource {
@@ -485,21 +527,147 @@ pub(crate) mod tests {
         }
     }
 
-    /// Verifies the shadow-image heuristic (used by the overlay's shadow rendering, see
-    /// `crate::overlay`) against real data: a drawable's shadow art is conventionally
-    /// `image_id + 1` (the PRE-`images.rel`-redirect ID, since that's what indexes `images.dat`'s
-    /// rendering metadata — see [`GameData::unit_image_pre_redirect`]'s docs), gated on
-    /// `images.dat[main + 1].render_style == 10` (BW's "shadow" draw function). There's no
-    /// iscript VM here to confirm this by actually running `imgul` opcodes, so this is the
-    /// substitute: it walks every unit ID (0..228) and every THG2 "pure sprite" ID (0..517,
-    /// doodads like trees) through the resolution chain and reports how often the `+1` slot is
-    /// actually flagged as a shadow.
+    /// Byte offset of `images.dat`'s `render_style` column: the `grp` u32 column plus the four
+    /// single-byte columns ahead of it (`has_directional_frames`, `clickable`,
+    /// `use_full_iscript`, `always_visible`), for 999 images -- see
+    /// `broodmap_formats::dat`'s `IMAGES_COLUMN_SIZES`, whose own test independently pins this
+    /// same offset at 7992; `broodmap_render::overlay`'s tests derive it the same way.
+    const IMAGES_RENDER_STYLE_COLUMN: usize = 999 * 4 + 999 * 4;
+
+    /// Sets `images.dat[image_id]`'s `render_style` column directly on raw bytes (index 3 of a
+    /// [`DatBytes`]).
+    fn set_render_style(images: &mut [u8], image_id: u16, render_style: u8) {
+        images[IMAGES_RENDER_STYLE_COLUMN + image_id as usize] = render_style;
+    }
+
+    #[test]
+    fn shadow_image_pre_redirect_maps_a_parent_to_its_shadow_at_an_arbitrary_delta() {
+        // Mirrors the real protoss nexus (image 179 -> shadow 182, not +1): a shadow can sit
+        // anywhere images.rel says it does, not just at parent + 1.
+        let mut parts = synthetic_parts(0, 0, 0, 179, None);
+        plant_shadow_record(&mut parts.4, 182, 179);
+        set_render_style(&mut parts.3, 182, RENDER_STYLE_SHADOW);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(data.shadow_image_pre_redirect(179), Some(182));
+    }
+
+    #[test]
+    fn shadow_image_pre_redirect_rejects_a_rel_dat_mismatch() {
+        // A type-8 record names 182 as 179's shadow, but 182's images.dat entry isn't
+        // render_style 10 -- a hostile/malformed rel-vs-dat disagreement, which must fail toward
+        // no shadow rather than trusting the rel table blindly.
+        let mut parts = synthetic_parts(0, 0, 0, 179, None);
+        plant_shadow_record(&mut parts.4, 182, 179);
+        // render_style defaults to 0 (not RENDER_STYLE_SHADOW) -- no need to set it explicitly.
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(data.shadow_image_pre_redirect(179), None);
+    }
+
+    #[test]
+    fn shadow_image_pre_redirect_picks_the_lowest_shadow_id_among_duplicates() {
+        // Two shadow records for the same parent (like the 12 real multi-shadow parents):
+        // planted out of ID order, to prove the tiebreak isn't just "last one wins".
+        let mut parts = synthetic_parts(0, 0, 0, 50, None);
+        plant_shadow_record(&mut parts.4, 60, 50);
+        plant_shadow_record(&mut parts.4, 55, 50);
+        set_render_style(&mut parts.3, 60, RENDER_STYLE_SHADOW);
+        set_render_style(&mut parts.3, 55, RENDER_STYLE_SHADOW);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(
+            data.shadow_image_pre_redirect(50),
+            Some(55),
+            "the lower shadow ID must win"
+        );
+    }
+
+    #[test]
+    fn shadow_image_pre_redirect_skips_a_hostile_self_referencing_record() {
+        // A record whose ref_image is its own index: real images.rel never does this, but the
+        // bytes are untrusted, so it must be dropped when building the inverse map rather than
+        // resolving an image as its own shadow.
+        let mut parts = synthetic_parts(0, 0, 0, 5, None);
+        plant_shadow_record(&mut parts.4, 5, 5);
+        set_render_style(&mut parts.3, 5, RENDER_STYLE_SHADOW);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(data.shadow_image_pre_redirect(5), None);
+    }
+
+    #[test]
+    fn shadow_image_pre_redirect_falls_back_through_the_rel_redirect() {
+        // Main image 100 is itself redirected (via the ordinary 0x200 redirect flag) to art
+        // image 200; the shadow table only has an entry for 200, not 100. The direct lookup on
+        // 100 misses, so this must retry through `rel.resolve(100) == 200`.
+        let mut parts = synthetic_parts(0, 0, 0, 100, Some((100, 200)));
+        plant_shadow_record(&mut parts.4, 201, 200);
+        set_render_style(&mut parts.3, 201, RENDER_STYLE_SHADOW);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(
+            data.shadow_image_pre_redirect(100),
+            Some(201),
+            "a redirected main image should still find its shadow via the redirect target"
+        );
+    }
+
+    /// Verifies the `images.rel` shadow table against real data: the set of type-8 record
+    /// indices (shadow images) must equal the set of `images.dat` `render_style == 10` images
+    /// exactly, confirming [`ImagesRel::shadow_parent`]'s and [`build_shadow_images`]'s gate is
+    /// a no-op on real data (matching [`GameData::shadow_image_pre_redirect`]'s docs).
     ///
     /// Gated on `BROODMAP_TEST_SCR_DIR` like `tests/real_assets.rs`; run with:
-    /// `BROODMAP_TEST_SCR_DIR='C:\Program Files (x86)\StarCraft' cargo test -p broodmap-render --features casc shadow_plus_one_convention -- --nocapture`
+    /// `BROODMAP_TEST_SCR_DIR='C:\Program Files (x86)\StarCraft' cargo test -p broodmap-render --features casc shadow_type_records_match_render_style -- --nocapture`
     #[cfg(feature = "casc")]
     #[test]
-    fn shadow_plus_one_convention_holds_broadly() {
+    fn shadow_type_records_match_render_style_shadow_images() {
+        let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+            eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+            return;
+        };
+        let source = crate::source::CascSource::open(dir)
+            .expect("BROODMAP_TEST_SCR_DIR should be a valid SC:R install");
+        let rel = parse_images_rel(source.read(&AssetRequest::ImagesRel).unwrap().as_ref());
+        let images = parse_images_dat(
+            source
+                .read(&AssetRequest::Dat(DatKind::Images))
+                .unwrap()
+                .as_ref(),
+        );
+
+        let type_8: std::collections::HashSet<u16> = rel.shadow_pairs().map(|(id, _)| id).collect();
+        let render_style_10: std::collections::HashSet<u16> = (0u16..999)
+            .filter(|&id| {
+                images
+                    .entry(id)
+                    .is_some_and(|e| e.render_style == RENDER_STYLE_SHADOW)
+            })
+            .collect();
+
+        eprintln!(
+            "type-8 records: {}, render_style==10 images: {}",
+            type_8.len(),
+            render_style_10.len()
+        );
+        assert_eq!(
+            type_8, render_style_10,
+            "the type-8 record set must equal the render_style==10 image set exactly"
+        );
+    }
+
+    /// Verifies the new exact `images.rel`-driven shadow lookup against real data: it must
+    /// resolve strictly more coverage than the old `+1` heuristic (which the replaced test
+    /// measured at ~59.6% of units), including buildings the old heuristic largely missed (e.g.
+    /// the protoss nexus), and the vespene geyser must resolve straight from the table with no
+    /// special case.
+    ///
+    /// Gated on `BROODMAP_TEST_SCR_DIR` like the rest of this module's real-data tests; run with:
+    /// `BROODMAP_TEST_SCR_DIR='C:\Program Files (x86)\StarCraft' cargo test -p broodmap-render --features casc shadow_table_covers_more -- --nocapture`
+    #[cfg(feature = "casc")]
+    #[test]
+    fn shadow_table_covers_more_than_the_old_plus_one_heuristic() {
         let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
             eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
             return;
@@ -510,124 +678,68 @@ pub(crate) mod tests {
 
         let mut total = 0u32;
         let mut with_shadow = 0u32;
-        let mut building_total = 0u32;
-        let mut building_with_shadow = 0u32;
-        let mut critter_total = 0u32;
-        let mut critter_with_shadow = 0u32;
-        let mut resource_total = 0u32;
-        let mut resource_with_shadow = 0u32;
-        let mut plain_total = 0u32;
-        let mut plain_with_shadow = 0u32;
-        let mut exceptions: Vec<String> = Vec::new();
+        let mut old_plus_one_with_shadow = 0u32;
         for unit_id in 0u16..228 {
             let Some(main_pre_redirect) = data.unit_image_pre_redirect(unit_id) else {
                 continue;
             };
             total += 1;
-            let shadow_id = main_pre_redirect + 1;
-            let render_style = data.images_dat().entry(shadow_id).map(|e| e.render_style);
-            let has_shadow = render_style == Some(10);
-
-            let is_building = data.is_building(unit_id);
-            let is_critter = is_critter(unit_id);
-            let is_resource = is_resource(unit_id);
-            if is_building {
-                building_total += 1;
-                building_with_shadow += has_shadow as u32;
-            } else if is_critter {
-                critter_total += 1;
-                critter_with_shadow += has_shadow as u32;
-            } else if is_resource {
-                resource_total += 1;
-                resource_with_shadow += has_shadow as u32;
-            } else {
-                plain_total += 1;
-                plain_with_shadow += has_shadow as u32;
-            }
-
-            if has_shadow {
+            if data.shadow_image_pre_redirect(main_pre_redirect).is_some() {
                 with_shadow += 1;
-            } else {
-                exceptions.push(format!(
-                    "unit {unit_id} (building={is_building} critter={is_critter} resource={is_resource}) \
-                     image {main_pre_redirect}, +1={shadow_id} render_style {render_style:?}"
-                ));
+            }
+            let old_plus_one = data
+                .images_dat()
+                .entry(main_pre_redirect + 1)
+                .map(|e| e.render_style)
+                == Some(RENDER_STYLE_SHADOW);
+            if old_plus_one {
+                old_plus_one_with_shadow += 1;
             }
         }
+        let coverage = 100.0 * with_shadow as f64 / total.max(1) as f64;
+        let old_coverage = 100.0 * old_plus_one_with_shadow as f64 / total.max(1) as f64;
         eprintln!(
-            "units overall: {with_shadow}/{total} ({:.1}%) resolve a +1 shadow (render_style == 10)",
-            100.0 * with_shadow as f64 / total.max(1) as f64
-        );
-        eprintln!(
-            "  plain units:  {plain_with_shadow}/{plain_total} ({:.1}%)",
-            100.0 * plain_with_shadow as f64 / plain_total.max(1) as f64
-        );
-        eprintln!(
-            "  buildings:    {building_with_shadow}/{building_total} ({:.1}%)",
-            100.0 * building_with_shadow as f64 / building_total.max(1) as f64
-        );
-        eprintln!(
-            "  critters:     {critter_with_shadow}/{critter_total} ({:.1}%)",
-            100.0 * critter_with_shadow as f64 / critter_total.max(1) as f64
-        );
-        eprintln!(
-            "  resources:    {resource_with_shadow}/{resource_total} ({:.1}%)",
-            100.0 * resource_with_shadow as f64 / resource_total.max(1) as f64
-        );
-        eprintln!(
-            "all unit exceptions ({}): {exceptions:#?}",
-            exceptions.len()
-        );
-
-        let mut sprite_total = 0u32;
-        let mut sprite_with_shadow = 0u32;
-        let mut sprite_exceptions: Vec<String> = Vec::new();
-        for sprite_id in 0u16..517 {
-            let Some(main_pre_redirect) = data.sprite_image_pre_redirect(sprite_id) else {
-                continue;
-            };
-            sprite_total += 1;
-            let shadow_id = main_pre_redirect + 1;
-            let render_style = data.images_dat().entry(shadow_id).map(|e| e.render_style);
-            if render_style == Some(10) {
-                sprite_with_shadow += 1;
-            } else if sprite_exceptions.len() < 60 {
-                sprite_exceptions.push(format!(
-                    "sprite {sprite_id} (image {main_pre_redirect}, +1={shadow_id} render_style {render_style:?})"
-                ));
-            }
-        }
-        eprintln!(
-            "sprites: {sprite_with_shadow}/{sprite_total} ({:.1}%) resolve a +1 shadow",
-            100.0 * sprite_with_shadow as f64 / sprite_total.max(1) as f64
-        );
-        eprintln!("sprite exceptions (up to 60): {sprite_exceptions:#?}");
-
-        // Regression guard, not a hardcoded golden count (the exact split was measured manually
-        // when this heuristic was chosen and cross-checked against a real iscript disassembly —
-        // see `docs/render-design.md`'s "Shadows" note): critters and plain (non-building) units
-        // should keep resolving a `+1` shadow for a solid majority. Buildings and THG2 sprites
-        // legitimately sit much lower (many buildings don't use this convention at all; see the
-        // docs note), so they aren't asserted here — only that a future asset change didn't
-        // collapse the parts of the heuristic that carry the most weight in a typical preview.
-        assert!(
-            critter_with_shadow as f64 / critter_total.max(1) as f64 > 0.9,
-            "critters should almost always resolve a +1 shadow"
+            "units: {with_shadow}/{total} ({coverage:.1}%) resolve a shadow via images.rel, \
+             vs {old_plus_one_with_shadow}/{total} ({old_coverage:.1}%) under the old +1 heuristic"
         );
         assert!(
-            plain_with_shadow as f64 / plain_total.max(1) as f64 > 0.5,
-            "non-building units should resolve a +1 shadow more often than not"
+            coverage > old_coverage,
+            "the exact table must cover at least as much as the old +1 heuristic (old {old_coverage:.1}%, new {coverage:.1}%)"
+        );
+        assert!(
+            coverage > 59.6,
+            "the exact table should exceed the old heuristic's measured ~59.6% unit coverage, got {coverage:.1}%"
+        );
+
+        // Buildings are the headline improvement: the protoss nexus (unit 154) never resolved a
+        // +1 shadow (its real shadow is 179 -> 182, not +1) but must resolve through the table.
+        let nexus_main = data
+            .unit_image_pre_redirect(154)
+            .expect("the protoss nexus should resolve a main image");
+        assert!(
+            data.shadow_image_pre_redirect(nexus_main).is_some(),
+            "the protoss nexus (image {nexus_main}) should now resolve a shadow"
+        );
+
+        // The vespene geyser resolves straight from the table -- no +2 special case anymore.
+        let geyser_main = data
+            .unit_image_pre_redirect(UNIT_ID_VESPENE_GEYSER)
+            .expect("the vespene geyser should resolve a main image");
+        eprintln!("geyser main image: {geyser_main}");
+        assert_eq!(
+            data.shadow_image_pre_redirect(geyser_main),
+            Some(geyser_main + 2),
+            "the geyser's shadow should still land on +2 ({}), now via the table, not a special case",
+            geyser_main + 2
         );
     }
 
-    /// Targeted real-data check for the vespene geyser special case in
-    /// [`GameData::shadow_image_pre_redirect`]: image 344's `+1` (345) is a same-GRP art variant,
-    /// not a shadow, and its real shadow (`neutral\geyShad.grp`, `render_style == 10`) is at
-    /// `+2` (346). Gated on `BROODMAP_TEST_SCR_DIR` like the rest of this module's real-data
-    /// tests.
+    /// Targeted real-data check mirroring the design doc's numbers directly: image 344 (the
+    /// vespene geyser's main art) resolves its shadow to 346 (`neutral\geyShad.grp`) straight
+    /// from the `images.rel` table -- no unit-ID special case involved.
     #[cfg(feature = "casc")]
     #[test]
-    fn geyser_shadow_resolves_to_the_real_plus_two_image() {
+    fn geyser_shadow_resolves_via_the_table_with_no_special_case() {
         let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
             eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
             return;
@@ -636,28 +748,7 @@ pub(crate) mod tests {
             .expect("BROODMAP_TEST_SCR_DIR should be a valid SC:R install");
         let data = GameData::load(&source).expect("the .dat tables should load");
 
-        let main = data
-            .unit_image_pre_redirect(UNIT_ID_VESPENE_GEYSER)
-            .expect("the vespene geyser should resolve a main image");
-        eprintln!("geyser main image: {main}");
-
-        // +1 is a same-GRP variant, not a shadow.
-        let plus_one = data.images_dat().entry(main + 1);
-        assert_ne!(
-            plus_one.map(|e| e.render_style),
-            Some(RENDER_STYLE_SHADOW),
-            "the geyser's +1 image ({}) should be a variant, not a shadow",
-            main + 1
-        );
-
-        // shadow_image_pre_redirect must skip it and land on +2.
-        let shadow = data.shadow_image_pre_redirect(main, Some(UNIT_ID_VESPENE_GEYSER));
-        assert_eq!(
-            shadow,
-            Some(main + 2),
-            "the geyser's shadow should resolve to +2 ({}), not +1",
-            main + 2
-        );
+        assert_eq!(data.shadow_image_pre_redirect(344), Some(346));
     }
 
     #[test]

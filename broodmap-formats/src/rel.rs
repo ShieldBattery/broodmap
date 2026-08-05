@@ -20,6 +20,26 @@ const REDIRECT_FLAG: u32 = 0x200;
 /// Sentinel `ref_image` value meaning "no redirect target".
 const NO_REF: u32 = 0xFFFF_FFFF;
 
+/// `rel_type` value marking a record as a shadow-image entry: image ID `i`'s record has
+/// `rel_type == SHADOW_TYPE` exactly (a plain type code, not a flag bit like [`REDIRECT_FLAG`])
+/// iff `i` is a shadow image, and that record's `ref_image` names the image it's the shadow
+/// *for* (the "owner"/parent image).
+///
+/// Verified against a real SC:R install: the set of `rel_type == SHADOW_TYPE` record indices
+/// equals the set of `images.dat` `render_style == 10` ("shadow" draw style) images exactly (230
+/// of each). 218 distinct parents are named across those 230 records; 12 parents have two shadow
+/// records (obscure neutral pickups with `*Shad`/`*Sha2` GRP variants, plus a couple of doodads
+/// whose shadow GRP is listed under two image IDs) — consumers wanting a single shadow per
+/// parent should pick the lowest shadow ID among duplicates, matching what's verified live.
+/// [`Self::shadow_parent`] and [`Self::shadow_pairs`] expose this table; inverting it (owner ->
+/// shadow rather than shadow -> owner) is left to callers, e.g.
+/// `broodmap_render::gamedata::GameData`, which builds and gates that inverse lookup.
+///
+/// This type code never participates in [`Self::resolve`]'s art redirect: it isn't the
+/// [`REDIRECT_FLAG`] bit, so a shadow record simply resolves to itself, same as any other
+/// non-redirecting record.
+const SHADOW_TYPE: u32 = 8;
+
 /// A single `images.rel` record.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Record {
@@ -73,6 +93,35 @@ impl ImagesRel {
             }) if rel_type & REDIRECT_FLAG != 0 => u16::try_from(ref_image).unwrap_or(image_id),
             _ => image_id,
         }
+    }
+
+    /// If `image_id`'s record marks it as a shadow image (`rel_type == `[`SHADOW_TYPE`] exactly),
+    /// returns the ID of the image it's a shadow *for* (its `ref_image`) -- `None` if the record
+    /// isn't a shadow record, there's no record at all, or `ref_image` doesn't fit in a `u16`
+    /// (mirrors [`Self::resolve`]'s handling of an oversized `ref_image`: never truncated,
+    /// treated as absent instead).
+    pub fn shadow_parent(&self, image_id: u16) -> Option<u16> {
+        match self.records.get(image_id as usize) {
+            Some(&Record {
+                rel_type: SHADOW_TYPE,
+                ref_image: Some(ref_image),
+            }) => u16::try_from(ref_image).ok(),
+            _ => None,
+        }
+    }
+
+    /// Every `(shadow_id, parent_id)` pair the table encodes -- i.e. every image ID for which
+    /// [`Self::shadow_parent`] returns `Some`, paired with that return value. Callers building a
+    /// parent -> shadow lookup (there is no single "the" shadow per parent in the raw data --
+    /// see [`SHADOW_TYPE`]'s docs on the 12 parents with two records) iterate this and pick
+    /// per-parent, e.g. the lowest `shadow_id`.
+    pub fn shadow_pairs(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        (0..self.records.len())
+            .filter_map(|i| u16::try_from(i).ok())
+            .filter_map(|shadow_id| {
+                self.shadow_parent(shadow_id)
+                    .map(|parent_id| (shadow_id, parent_id))
+            })
     }
 }
 
@@ -177,5 +226,72 @@ mod tests {
         let data = record(REDIRECT_FLAG, u16::MAX as u32).to_vec();
         let rel = parse_images_rel(&data);
         assert_eq!(rel.resolve(0), u16::MAX);
+    }
+
+    #[test]
+    fn shadow_type_record_reports_its_parent() {
+        let mut data = Vec::new();
+        data.extend(record(0, 0)); // image 0: not a shadow
+        data.extend(record(SHADOW_TYPE, 0)); // image 1: shadow of image 0
+
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.shadow_parent(0), None);
+        assert_eq!(rel.shadow_parent(1), Some(0));
+    }
+
+    #[test]
+    fn shadow_type_record_does_not_redirect_via_resolve() {
+        // SHADOW_TYPE (8) doesn't have the REDIRECT_FLAG (0x200) bit set, so `resolve` must treat
+        // a shadow record the same as any other non-redirecting record: unchanged.
+        let data = record(SHADOW_TYPE, 0).to_vec();
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.resolve(0), 0);
+    }
+
+    #[test]
+    fn non_shadow_rel_type_is_not_a_shadow_parent_even_with_a_ref_image() {
+        let data = record(REDIRECT_FLAG, 5).to_vec();
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.shadow_parent(0), None);
+    }
+
+    #[test]
+    fn shadow_parent_is_none_when_there_is_no_record() {
+        let rel = parse_images_rel(&[]);
+        assert_eq!(rel.shadow_parent(0), None);
+    }
+
+    #[test]
+    fn shadow_parent_ref_image_that_does_not_fit_in_u16_is_none() {
+        let data = record(SHADOW_TYPE, 0x1_0000).to_vec();
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.shadow_parent(0), None);
+    }
+
+    #[test]
+    fn shadow_parent_sentinel_ref_image_is_none() {
+        let data = record(SHADOW_TYPE, NO_REF).to_vec();
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.shadow_parent(0), None);
+    }
+
+    #[test]
+    fn shadow_pairs_yields_every_shadow_record_and_only_those() {
+        let mut data = Vec::new();
+        data.extend(record(0, 0)); // image 0: not a shadow
+        data.extend(record(SHADOW_TYPE, 0)); // image 1: shadow of image 0
+        data.extend(record(REDIRECT_FLAG, 3)); // image 2: a redirect, not a shadow
+        data.extend(record(SHADOW_TYPE, 0)); // image 3: also a shadow of image 0
+
+        let rel = parse_images_rel(&data);
+        let pairs: Vec<_> = rel.shadow_pairs().collect();
+        assert_eq!(pairs, vec![(1, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn shadow_pairs_is_empty_for_a_table_with_no_shadow_records() {
+        let data = record(REDIRECT_FLAG, 1).to_vec();
+        let rel = parse_images_rel(&data);
+        assert_eq!(rel.shadow_pairs().count(), 0);
     }
 }
