@@ -68,13 +68,13 @@ const LOGICAL_PX_PER_TILE: f32 = 32.0;
 const UNITS_PER_LOGICAL_PX: f32 = 4.0;
 
 /// The color used for units owned by a non-player slot (neutral, rescuable, ...): SC:R's cyan.
-const NEUTRAL_COLOR: [u8; 3] = [0, 228, 252];
+pub(crate) const NEUTRAL_COLOR: [u8; 3] = [0, 228, 252];
 
 /// Start-location placement box (logical pixels) used only when `units.dat` isn't available —
 /// i.e. an [`crate::ArtStyle::Original`] unit layer, where the `.dat` tables are deliberately
 /// not part of the prefetch set. This is `units.dat`'s own value for unit 214 (4x3 tiles); when
 /// the table *is* loaded, the value is read from it rather than from here.
-const FALLBACK_START_LOCATION_BOX: (u32, u32) = (128, 96);
+pub(crate) const FALLBACK_START_LOCATION_BOX: (u32, u32) = (128, 96);
 
 /// Upper bound (logical px, per axis) on the start-location box used to size the color-block
 /// token. `units.dat`'s placebox is untrusted (a custom asset source controls its bytes), and it
@@ -82,7 +82,7 @@ const FALLBACK_START_LOCATION_BOX: (u32, u32) = (128, 96);
 /// earlier, logical-space belt-and-suspenders clamp so a hostile/corrupted placebox (up to the
 /// raw `i16` range) can't drive that sizing math with an absurd value in the first place. Real
 /// start locations are 128x96; this is generous enough to never affect a legitimate render.
-const MAX_START_LOCATION_BOX_LOGICAL_PX: u32 = 1024;
+pub(crate) const MAX_START_LOCATION_BOX_LOGICAL_PX: u32 = 1024;
 
 /// Knuth's multiplicative-hash constant, used to turn a unit's instance ID into a stable
 /// "random" facing so that renders of the same map are byte-identical.
@@ -450,7 +450,14 @@ fn collect_drawables(
             // just "not one of the 8 real player slots" — the same rule as a placed unit's
             // `owner == None || owner >= 8`.
             let is_neutral = sprite.owner as usize >= 8;
-            if !unit_id_passes_class_filters(sprite.id, is_neutral, data, options) {
+            if !unit_id_passes_class_filters(
+                sprite.id,
+                is_neutral,
+                data,
+                options.show_critters,
+                options.show_resources,
+                options.show_neutral_buildings,
+            ) {
                 continue;
             }
             data.unit_image_pre_redirect(sprite.id)
@@ -529,32 +536,41 @@ fn unit_passes_filters(unit: &PlacedUnit, data: &GameData, options: &RenderOptio
     if options.unit_filter == UnitFilter::Melee && !is_neutral {
         return false;
     }
-    unit_id_passes_class_filters(unit.unit_id, is_neutral, data, options)
+    unit_id_passes_class_filters(
+        unit.unit_id,
+        is_neutral,
+        data,
+        options.show_critters,
+        options.show_resources,
+        options.show_neutral_buildings,
+    )
 }
 
 /// The unit-class toggles (critters, resources, neutral buildings), shared by `UNIT` entries and
 /// THG2 unit sprites. `is_neutral` is the caller's own owner check (a placed unit's `Option<u8>`
 /// owner and a THG2 sprite's plain `u8` owner mean "neutral" slightly differently, so it's
 /// resolved by the caller rather than here).
-fn unit_id_passes_class_filters(
+///
+/// Takes the three toggles directly (rather than `&RenderOptions`) so `crate::minimap` — whose
+/// `MinimapOptions` doesn't expose a matching per-class toggle set — can reuse this exact logic
+/// with its own fixed choices (see that module's docs) instead of duplicating it.
+pub(crate) fn unit_id_passes_class_filters(
     unit_id: u16,
     is_neutral: bool,
     data: &GameData,
-    options: &RenderOptions,
+    show_critters: bool,
+    show_resources: bool,
+    show_neutral_buildings: bool,
 ) -> bool {
-    if !options.show_critters && is_critter(unit_id) {
+    if !show_critters && is_critter(unit_id) {
         return false;
     }
-    if !options.show_resources && is_resource(unit_id) {
+    if !show_resources && is_resource(unit_id) {
         return false;
     }
     // Resources are exempt even if a corrupted units.dat somehow flagged one as a Building: they
     // have their own dedicated toggle above, and this one must never interact with it.
-    if !options.show_neutral_buildings
-        && is_neutral
-        && !is_resource(unit_id)
-        && data.is_building(unit_id)
-    {
+    if !show_neutral_buildings && is_neutral && !is_resource(unit_id) && data.is_building(unit_id) {
         return false;
     }
     true
@@ -630,7 +646,7 @@ fn mineral_frame(resource_amount: Option<u32>) -> usize {
 
 /// The RGB a drawable's team color resolves to: the player's own color for the 8 real slots,
 /// SC:R's neutral cyan for anything else (neutral, rescuable, unowned).
-fn owner_color(owner: u8, player_colors: &PlayerColors) -> [u8; 3] {
+pub(crate) fn owner_color(owner: u8, player_colors: &PlayerColors) -> [u8; 3] {
     match player_colors.colors.get(owner as usize) {
         Some(color) => resolve_color(color, owner),
         None => NEUTRAL_COLOR,
@@ -1331,7 +1347,7 @@ const FALLBACK_HQ_BOUNDS: (i32, i32, i32, i32) = (49, 32, 49, 32);
 /// The *smallest* box is the right preview semantics: a unit overlapping it is destroyed at
 /// game start no matter which race spawns there, and mapmakers keep race-dependent placement
 /// out of the in-between zone precisely so the map behaves the same for everyone.
-fn hq_clear_bounds(data: &GameData) -> (i32, i32, i32, i32) {
+pub(crate) fn hq_clear_bounds(data: &GameData) -> (i32, i32, i32, i32) {
     let mut smallest: Option<(i32, i32, i32, i32)> = None;
     for id in HQ_UNIT_IDS {
         let Some(entry) = data.units_dat().entry(id) else {
@@ -1357,7 +1373,7 @@ fn hq_clear_bounds(data: &GameData) -> (i32, i32, i32, i32) {
 
 /// Whether a placed unit's own collision box (its `units.dat` bounds around its position — a
 /// bare point when the table has no entry for it) overlaps any melee start-area clearing rect.
-fn overlaps_any_start_area(
+pub(crate) fn overlaps_any_start_area(
     unit: &PlacedUnit,
     data: &GameData,
     clear_rects: &[(i32, i32, i32, i32)],
@@ -1391,7 +1407,7 @@ fn overlaps_any_start_area(
 
 /// The start location's footprint in logical pixels: its `units.dat` placement box, falling
 /// back to the well-known 128x96 when the table is absent or degenerate.
-fn start_location_box(data: Option<&GameData>) -> (u32, u32) {
+pub(crate) fn start_location_box(data: Option<&GameData>) -> (u32, u32) {
     data.and_then(|data| data.units_dat().entry(UNIT_ID_START_LOCATION))
         .map(|entry| {
             (

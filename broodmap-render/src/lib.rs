@@ -34,6 +34,7 @@ mod bc;
 mod error;
 mod gamedata;
 mod image;
+mod minimap;
 mod options;
 mod overlay;
 mod resample;
@@ -47,6 +48,9 @@ pub use gamedata::GameData;
 #[cfg(feature = "png")]
 pub use image::PngEncodeError;
 pub use image::RgbaImage;
+pub use minimap::{
+    MinimapOptions, RESOURCE_MINIMAP_COLOR, build_minimap_table, render_chk_minimap, render_minimap,
+};
 pub use options::{
     DEFAULT_MAX_OUTPUT_PIXELS, RenderOptions, StartLocations, UnitFilter, required_preview_assets,
     required_terrain_assets,

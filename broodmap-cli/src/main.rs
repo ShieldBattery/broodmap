@@ -5,8 +5,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use broodmap::extract_chk_from_map;
 use broodmap_render::{
-    ArtStyle, CascSource, DirSource, Preview, RenderOptions, RgbaImage, StartLocations, UnitFilter,
-    render_chk_preview, render_terrain,
+    ArtStyle, CascSource, DirSource, GameData, MinimapOptions, Preview, RenderOptions, RgbaImage,
+    StartLocations, UnitFilter, build_minimap_table, render_chk_minimap, render_chk_preview,
+    render_terrain,
 };
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
@@ -28,6 +29,17 @@ enum Command {
     /// Renders a map preview (terrain plus units, resources and doodads) to a PNG image using
     /// StarCraft: Remastered assets.
     Render(RenderArgs),
+    /// Renders a zero-asset minimap (a preset color per terrain tile, baked from real SC:R
+    /// assets at build time, plus unit/resource/start-location dots) to a PNG image. Needs no
+    /// SC:R assets by default; pass `--install`/`--assets-dir` only to size unit dots from
+    /// `units.dat` and refine melee filtering (see `--help`).
+    Minimap(MinimapArgs),
+    /// Regenerates the 8 committed per-tileset minimap color tables
+    /// (`broodmap-render/src/minimap/tables/*.bin`) from a real StarCraft: Remastered install.
+    /// Dev-time only -- the committed output is what `minimap`/the library's zero-asset renderer
+    /// actually ships with.
+    #[command(hide = true)]
+    GenMinimapTables(GenMinimapTablesArgs),
 }
 
 #[derive(clap::Args)]
@@ -100,6 +112,66 @@ struct RenderArgs {
     terrain_only: bool,
 }
 
+#[derive(clap::Args)]
+struct MinimapArgs {
+    /// Path to a .scm/.scx map file.
+    map: PathBuf,
+
+    /// Output PNG path.
+    #[arg(long, default_value = "minimap.png")]
+    out: PathBuf,
+
+    /// Output pixels per map tile. The library default (`MinimapOptions::px_per_tile`) is 1 --
+    /// BW's own native minimap resolution -- but that's too small to eyeball on a modern
+    /// display, so the CLI defaults higher.
+    #[arg(long, default_value_t = 4)]
+    scale: u32,
+
+    /// Show everything the map placed, as placed, instead of applying melee rules (dropping
+    /// preplaced player-owned units and clearing start-area spawns).
+    #[arg(long)]
+    as_placed: bool,
+
+    /// Don't substitute creep-group colors for creep-flagged tiles.
+    #[arg(long)]
+    no_creep: bool,
+
+    /// How start locations are drawn. `sprite` behaves exactly like `block` here -- there's no
+    /// art in this zero-asset render path.
+    #[arg(long, value_enum, default_value_t = StartLocationsArg::Block)]
+    start_locations: StartLocationsArg,
+
+    /// StarCraft: Remastered install directory, read ONLY to load `units.dat` (for dot sizing
+    /// and melee's start-area clearing) -- unlike `render`, this is optional. With neither this
+    /// nor `--assets-dir`, the minimap still renders in full, just with 1x1-tile dots and no
+    /// start-area clearing (the zero-asset promise).
+    #[arg(long)]
+    install: Option<PathBuf>,
+
+    /// Read the `.dat` tables from a plain directory of extracted files instead of a CASC
+    /// install.
+    #[arg(long)]
+    assets_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct GenMinimapTablesArgs {
+    /// StarCraft: Remastered install directory (containing `.build.info`).
+    #[arg(long, default_value = DEFAULT_INSTALL_DIR)]
+    install: PathBuf,
+
+    /// Output directory for the 8 generated `<tileset>.bin` blobs.
+    #[arg(long, default_value = "broodmap-render/src/minimap/tables")]
+    out: PathBuf,
+}
+
+/// The filename stems of the 8 tilesets, matching `AssetRequest`'s tileset stems
+/// (`broodmap-render/src/source.rs`) and the classic asset files' own naming
+/// (`TileSet/<stem>.cv5`/`.vx4ex`/`.vr4`/`.wpe`).
+const TILESET_STEMS: [&str; 8] = [
+    "badlands", "platform", "install", "ashworld", "jungle", "desert", "ice", "twilight",
+];
+
 #[derive(Copy, Clone, ValueEnum)]
 enum StartLocationsArg {
     /// A solid block in the owning player's color (the map-preview convention).
@@ -145,6 +217,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Render(args) => render(args),
+        Command::Minimap(args) => minimap(args),
+        Command::GenMinimapTables(args) => gen_minimap_tables(args),
     }
 }
 
@@ -223,6 +297,110 @@ fn render(args: RenderArgs) -> Result<()> {
         preview.image.width,
         preview.image.height
     );
+
+    Ok(())
+}
+
+/// Renders a zero-asset minimap. Unlike `render`, the source (`--install`/`--assets-dir`) is
+/// entirely optional: with neither given, this loads no `GameData` at all and still produces a
+/// complete minimap (see `MinimapOptions`'s docs on what's lost without it -- dot sizing and
+/// melee's start-area clearing, nothing else).
+fn minimap(args: MinimapArgs) -> Result<()> {
+    let map_bytes = std::fs::read(&args.map)
+        .with_context(|| format!("failed to read map file {}", args.map.display()))?;
+
+    let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
+        .with_context(|| format!("failed to parse map file {}", args.map.display()))?;
+
+    let options = MinimapOptions {
+        px_per_tile: args.scale,
+        show_creep: !args.no_creep,
+        start_locations: args.start_locations.into(),
+        unit_filter: if args.as_placed {
+            UnitFilter::AsPlaced
+        } else {
+            UnitFilter::Melee
+        },
+        ..Default::default()
+    };
+
+    let data = if let Some(assets_dir) = &args.assets_dir {
+        let source = DirSource::new(assets_dir);
+        Some(GameData::load(&source).context("failed to load game data tables")?)
+    } else if let Some(install) = &args.install {
+        let source = CascSource::open(install).with_context(|| {
+            format!(
+                "failed to open StarCraft: Remastered install at {}",
+                install.display()
+            )
+        })?;
+        Some(GameData::load(&source).context("failed to load game data tables")?)
+    } else {
+        None
+    };
+
+    let preview = render_chk_minimap(&chk, data.as_ref(), &options);
+
+    for warning in &preview.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let png_bytes = preview
+        .image
+        .encode_png()
+        .context("failed to encode minimap as PNG")?;
+    std::fs::write(&args.out, png_bytes)
+        .with_context(|| format!("failed to write output file {}", args.out.display()))?;
+
+    println!(
+        "Wrote {} ({}x{})",
+        args.out.display(),
+        preview.image.width,
+        preview.image.height
+    );
+
+    Ok(())
+}
+
+/// Regenerates the 8 committed per-tileset minimap color tables from a real SC:R install (see
+/// `broodmap_render::build_minimap_table`'s docs for the algorithm/blob layout). Reads the
+/// classic `TileSet/<stem>.cv5`/`.vx4ex`/`.vr4`/`.wpe` files directly via `broodcasc::Storage`
+/// (rather than through `broodmap_render::AssetRequest`, which has no variant for these --
+/// they're dev-time-only inputs, never read at render time).
+fn gen_minimap_tables(args: GenMinimapTablesArgs) -> Result<()> {
+    let storage = broodcasc::Storage::open(&args.install).with_context(|| {
+        format!(
+            "failed to open StarCraft: Remastered install at {}",
+            args.install.display()
+        )
+    })?;
+
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("failed to create output directory {}", args.out.display()))?;
+
+    for stem in TILESET_STEMS {
+        let cv5 = storage
+            .read_file(&format!("TileSet/{stem}.cv5"))
+            .with_context(|| format!("failed to read TileSet/{stem}.cv5"))?;
+        let vx4ex = storage
+            .read_file(&format!("TileSet/{stem}.vx4ex"))
+            .with_context(|| format!("failed to read TileSet/{stem}.vx4ex"))?;
+        let vr4 = storage
+            .read_file(&format!("TileSet/{stem}.vr4"))
+            .with_context(|| format!("failed to read TileSet/{stem}.vr4"))?;
+        let wpe = storage
+            .read_file(&format!("TileSet/{stem}.wpe"))
+            .with_context(|| format!("failed to read TileSet/{stem}.wpe"))?;
+
+        let table = build_minimap_table(&cv5, &vx4ex, &vr4, &wpe)
+            .with_context(|| format!("failed to build the minimap table for {stem}"))?;
+
+        let out_path = args.out.join(format!("{stem}.bin"));
+        std::fs::write(&out_path, &table)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+
+        println!("{stem}: {} bytes -> {}", table.len(), out_path.display());
+    }
 
     Ok(())
 }

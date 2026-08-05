@@ -9,7 +9,7 @@
 
 use thiserror::Error;
 
-use broodmap_formats::DdsVr4Error;
+use broodmap_formats::{DdsVr4Error, WpeError};
 
 use crate::source::SourceError;
 
@@ -20,4 +20,9 @@ pub enum RenderError {
     Source(#[from] SourceError),
     #[error("failed to parse tileset megatile texture container: {0}")]
     DdsVr4(#[from] DdsVr4Error),
+    /// The only way [`crate::build_minimap_table`] can fail: a `.wpe` too short to hold a full
+    /// 256-entry palette. Every other minimap-table lookup failure (missing CV5 group, an
+    /// out-of-range megatile/minitile id) degrades permissively to palette index 0 instead.
+    #[error("failed to parse tileset palette: {0}")]
+    Wpe(#[from] WpeError),
 }

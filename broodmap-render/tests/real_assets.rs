@@ -13,8 +13,9 @@ use broodmap::extract_chk_from_map;
 use broodmap_formats::{MainSdAnim, parse_grp_header};
 use broodmap_render::{
     ArtStyle, AssetRequest, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
-    render_chk_preview, render_terrain, required_preview_assets, required_preview_assets_for_chk,
-    required_preview_graphics, required_preview_graphics_for_chk, required_terrain_assets,
+    build_minimap_table, render_chk_preview, render_terrain, required_preview_assets,
+    required_preview_assets_for_chk, required_preview_graphics, required_preview_graphics_for_chk,
+    required_terrain_assets,
 };
 
 fn scr_source() -> Option<CascSource> {
@@ -428,4 +429,48 @@ fn original_style_renders_sd_units() {
     let marine_grp = parse_grp_header(&marine_grp_bytes).expect("marine.grp header should parse");
     assert_eq!(marine_grp.frame_count, 229);
     assert_eq!((marine_grp.width, marine_grp.height), (64, 64));
+}
+
+/// Drift guard for the committed minimap tables (`broodmap-render/src/minimap/tables/*.bin`):
+/// re-derives Jungle's table from the real install's classic `.cv5`/`.vx4ex`/`.vr4`/`.wpe` files
+/// via `build_minimap_table` and byte-compares it against the committed `jungle.bin`. A mismatch
+/// means the committed tables are stale -- regenerate them with `cargo run -p broodmap-cli --
+/// gen-minimap-tables` and commit the result.
+///
+/// Reads the classic tileset files directly through `broodcasc::Storage` rather than
+/// `broodmap_render::CascSource`/`AssetRequest`: those files are dev-time-only inputs to the
+/// minimap table generator (never read at render time), so `AssetRequest` has no variant for
+/// them -- see `broodmap_render::build_minimap_table`'s docs.
+#[test]
+fn committed_jungle_minimap_table_matches_a_fresh_generation() {
+    let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+        eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+        return;
+    };
+    let storage = broodcasc::Storage::open(dir)
+        .expect("BROODMAP_TEST_SCR_DIR should be a valid SC:R install");
+
+    let cv5 = storage
+        .read_file("TileSet/jungle.cv5")
+        .expect("TileSet/jungle.cv5 should be readable");
+    let vx4ex = storage
+        .read_file("TileSet/jungle.vx4ex")
+        .expect("TileSet/jungle.vx4ex should be readable");
+    let vr4 = storage
+        .read_file("TileSet/jungle.vr4")
+        .expect("TileSet/jungle.vr4 should be readable");
+    let wpe = storage
+        .read_file("TileSet/jungle.wpe")
+        .expect("TileSet/jungle.wpe should be readable");
+
+    let fresh = build_minimap_table(&cv5, &vx4ex, &vr4, &wpe)
+        .expect("a real install's assets should build a minimap table");
+
+    let committed = include_bytes!("../src/minimap/tables/jungle.bin");
+    assert_eq!(
+        fresh.as_slice(),
+        committed.as_slice(),
+        "committed jungle.bin has drifted from a fresh `gen-minimap-tables` run -- regenerate \
+         and commit the 8 tables"
+    );
 }
