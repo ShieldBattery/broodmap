@@ -260,9 +260,15 @@ Keyed by what is needed, not by path — all game-data knowledge stays in the re
 sources are dumb byte fetchers. `AssetRequest` is `Eq + Hash` with a stable string form for
 keying caches/URLs. Provided implementations:
 
-- `CascSource` (feature `casc`): wraps `broodcasc::Storage` or `CdnStorage` (both expose the
-  same read surface). Local install and CDN come along together. Non-default feature; publishing
-  is gated on broodcasc reaching crates.io.
+- `CascSource` (feature `casc`): wraps `broodcasc::Storage` — a local SC:R install. Generic over
+  broodcasc's `StorageProvider` for custom I/O.
+- `CdnSource` (same `casc` feature): wraps `broodcasc::CdnStorage` — Blizzard's CDN, no install
+  required. broodcasc splits local and CDN storage into two types with one read surface, and the
+  render crate mirrors that split. It stays HTTP-library-free: the caller opens the `CdnStorage`
+  over any `broodcasc::cdn::CdnTransport` (broodcasc's `cdn-http` feature has a ureq transport;
+  its `fs` feature adds a persistent `CachingTransport`, which the CLI's `--cdn` flag uses with a
+  cache under the system temp dir — the CDN bootstrap alone is tens of MB of metadata).
+  Non-default feature; publishing is gated on broodcasc reaching crates.io.
 - `DirSource` (feature `fs`): plain directory of extracted files (CascView trees, test
   fixtures).
 - `MemorySource`: prefilled map of `AssetRequest -> bytes`. The primary WASM pattern — the trait

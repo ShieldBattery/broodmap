@@ -10,7 +10,8 @@ broodmap-render = { version = "0.1.0", path = "../broodmap-render", features = [
 # Used directly (not just through broodmap-render's CascSource) by the hidden
 # `gen-minimap-tables` subcommand, which reads classic VX4EX/VR4/WPE tileset files that have no
 # `AssetRequest` variant (they're dev-time-only inputs to the minimap table generator, never read
-# at render time) -- same pinned revision broodmap-render's `casc` feature uses.
-broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0" }
+# at render time) -- same pinned revision broodmap-render's `casc` feature uses. `cdn-http`
+# supplies the ureq transport (plus the fs-feature CachingTransport) behind `--cdn`.
+broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0", features = ["cdn-http"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

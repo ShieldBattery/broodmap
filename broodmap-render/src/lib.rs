@@ -64,10 +64,10 @@ pub use source::{AssetRequest, DatKind, MemorySource, SourceError, TilesetDataSo
 pub use terrain::render_terrain;
 pub use tier::{ArtPack, ArtStyle, AssetTier};
 
-#[cfg(feature = "casc")]
-pub use source::CascSource;
 #[cfg(feature = "fs")]
 pub use source::DirSource;
+#[cfg(feature = "casc")]
+pub use source::{CascSource, CdnSource};
 
 // The BC decoders (`bc`), box-downscaler (`image::scale_rgba`) and terrain resampler
 // (`resample`) are deliberately NOT public:

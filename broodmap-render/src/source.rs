@@ -331,6 +331,40 @@ impl<P: broodcasc::io::StorageProvider> TilesetDataSource for CascSource<P> {
     }
 }
 
+/// A [`TilesetDataSource`] backed by Blizzard's CDN via `broodcasc` — no local install
+/// required. The CDN counterpart of [`CascSource`]: broodcasc splits local and CDN storage
+/// into two types with the same read surface, and this crate mirrors that split.
+///
+/// This crate stays HTTP-library-free (and the `cdn` core of broodcasc is WASM-capable):
+/// callers open the `broodcasc::CdnStorage` themselves with whatever
+/// `broodcasc::cdn::CdnTransport` fits their environment. broodcasc's `cdn-http` feature
+/// provides a ready-made ureq transport, and its `fs` feature adds a persistent
+/// `CachingTransport` wrapper that is well worth using — opening a CDN storage fetches tens
+/// of MB of metadata (configs, archive indexes, the encoding table, the root catalog) before
+/// the first asset read.
+#[cfg(feature = "casc")]
+pub struct CdnSource<T: broodcasc::cdn::CdnTransport> {
+    storage: broodcasc::CdnStorage<T>,
+}
+
+#[cfg(feature = "casc")]
+impl<T: broodcasc::cdn::CdnTransport> CdnSource<T> {
+    /// Wraps an already-opened `broodcasc::CdnStorage`.
+    pub fn new(storage: broodcasc::CdnStorage<T>) -> Self {
+        Self { storage }
+    }
+}
+
+#[cfg(feature = "casc")]
+impl<T: broodcasc::cdn::CdnTransport> TilesetDataSource for CdnSource<T> {
+    fn read(&self, req: &AssetRequest) -> Result<std::sync::Arc<[u8]>, SourceError> {
+        self.storage
+            .read_file(&req.casc_path())
+            .map(Into::into)
+            .map_err(map_casc_error)
+    }
+}
+
 #[cfg(feature = "casc")]
 fn map_casc_error(err: broodcasc::CascError) -> SourceError {
     match err {

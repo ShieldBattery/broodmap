@@ -3,16 +3,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use broodcasc::CdnStorage;
+use broodcasc::cdn::{CachingTransport, HttpTransport};
 use broodmap::extract_chk_from_map;
 use broodmap_render::{
-    ArtStyle, CascSource, DirSource, GameData, MinimapOptions, Preview, RenderOptions, RgbaImage,
-    StartLocations, UnitFilter, build_minimap_table, compress_minimap_table, render_chk_minimap,
-    render_chk_preview, render_terrain,
+    ArtStyle, CascSource, CdnSource, DirSource, GameData, MinimapOptions, Preview, RenderOptions,
+    RgbaImage, StartLocations, UnitFilter, build_minimap_table, compress_minimap_table,
+    render_chk_minimap, render_chk_preview, render_terrain,
 };
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
 /// given.
 const DEFAULT_INSTALL_DIR: &str = r"C:\Program Files (x86)\StarCraft";
+
+/// SC:R's product code in Blizzard's TACT discovery endpoints (`patch.battle.net`).
+const CDN_PRODUCT: &str = "s1";
 
 #[derive(Parser)]
 #[command(
@@ -31,8 +36,8 @@ enum Command {
     Render(RenderArgs),
     /// Renders a zero-asset minimap (a preset color per terrain tile, baked from real SC:R
     /// assets at build time, plus unit/resource/start-location dots) to a PNG image. Needs no
-    /// SC:R assets by default; pass `--install`/`--assets-dir` only to size unit dots from
-    /// `units.dat` and refine melee filtering (see `--help`).
+    /// SC:R assets by default; pass `--install`/`--assets-dir`/`--cdn` only to size unit dots
+    /// from `units.dat` and refine melee filtering (see `--help`).
     Minimap(MinimapArgs),
     /// Regenerates the 8 committed per-tileset minimap color tables
     /// (`broodmap-render/src/minimap/tables/*.bin`) from a real StarCraft: Remastered install.
@@ -60,6 +65,9 @@ struct RenderArgs {
     /// Read assets from a plain directory of extracted files instead of a CASC install.
     #[arg(long)]
     assets_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    cdn_args: CdnArgs,
 
     /// Maximum output dimension, in pixels.
     #[arg(long, default_value_t = 1024)]
@@ -139,9 +147,9 @@ struct MinimapArgs {
     start_locations: StartLocationsArg,
 
     /// StarCraft: Remastered install directory, read ONLY to load `units.dat` (for dot sizing
-    /// and melee's start-area clearing) -- unlike `render`, this is optional. With neither this
-    /// nor `--assets-dir`, the minimap still renders in full, just with 1x1-tile dots and no
-    /// start-area clearing (the zero-asset promise).
+    /// and melee's start-area clearing) -- unlike `render`, this is optional. With none of this,
+    /// `--assets-dir` or `--cdn`, the minimap still renders in full, just with 1x1-tile dots and
+    /// no start-area clearing (the zero-asset promise).
     #[arg(long)]
     install: Option<PathBuf>,
 
@@ -149,6 +157,50 @@ struct MinimapArgs {
     /// install.
     #[arg(long)]
     assets_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    cdn_args: CdnArgs,
+}
+
+/// The `--cdn` flag family, shared by `render` and `minimap`. `--cdn-region`/`--cdn-cache` only
+/// make sense alongside `--cdn` itself (clap's `requires` doesn't count `--cdn-region`'s default
+/// value as a use, so plain `--cdn` works).
+#[derive(clap::Args)]
+struct CdnArgs {
+    /// Read assets from Blizzard's CDN instead of a local install -- no SC:R install needed.
+    /// Downloads are cached persistently (see `--cdn-cache`), but the first run fetches tens of
+    /// MB of CASC metadata before the first asset byte.
+    #[arg(long, conflicts_with_all = ["assets_dir", "install"])]
+    cdn: bool,
+
+    /// CDN region to download from (e.g. us, eu, kr).
+    #[arg(long, default_value = "us", requires = "cdn")]
+    cdn_region: String,
+
+    /// Directory for the persistent CDN download cache. Defaults to `broodmap-cdn-cache` under
+    /// the system temp directory.
+    #[arg(long, requires = "cdn")]
+    cdn_cache: Option<PathBuf>,
+}
+
+impl CdnArgs {
+    /// Opens a [`CdnSource`] over an HTTP transport with a persistent on-disk cache, per the
+    /// flags. Only call when `self.cdn` is set.
+    fn open_source(&self) -> Result<CdnSource<CachingTransport<HttpTransport>>> {
+        let cache_dir = self
+            .cdn_cache
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("broodmap-cdn-cache"));
+        let transport = CachingTransport::new(HttpTransport::new(), cache_dir);
+        let storage =
+            CdnStorage::open(CDN_PRODUCT, &self.cdn_region, transport).with_context(|| {
+                format!(
+                    "failed to open Blizzard's {} CDN for product {CDN_PRODUCT}",
+                    self.cdn_region
+                )
+            })?;
+        Ok(CdnSource::new(storage))
+    }
 }
 
 #[derive(clap::Args)]
@@ -267,6 +319,8 @@ fn render(args: RenderArgs) -> Result<()> {
 
     let preview = if let Some(assets_dir) = &args.assets_dir {
         render(&DirSource::new(assets_dir))?
+    } else if args.cdn_args.cdn {
+        render(&args.cdn_args.open_source()?)?
     } else {
         let source = CascSource::open(&args.install).with_context(|| {
             format!(
@@ -298,8 +352,8 @@ fn render(args: RenderArgs) -> Result<()> {
     Ok(())
 }
 
-/// Renders a zero-asset minimap. Unlike `render`, the source (`--install`/`--assets-dir`) is
-/// entirely optional: with neither given, this loads no `GameData` at all and still produces a
+/// Renders a zero-asset minimap. Unlike `render`, the source (`--install`/`--assets-dir`/
+/// `--cdn`) is entirely optional: with none given, this loads no `GameData` at all and still produces a
 /// complete minimap (see `MinimapOptions`'s docs on what's lost without it -- dot sizing and
 /// melee's start-area clearing, nothing else).
 fn minimap(args: MinimapArgs) -> Result<()> {
@@ -322,6 +376,9 @@ fn minimap(args: MinimapArgs) -> Result<()> {
 
     let data = if let Some(assets_dir) = &args.assets_dir {
         let source = DirSource::new(assets_dir);
+        Some(GameData::load(&source).context("failed to load game data tables")?)
+    } else if args.cdn_args.cdn {
+        let source = args.cdn_args.open_source()?;
         Some(GameData::load(&source).context("failed to load game data tables")?)
     } else if let Some(install) = &args.install {
         let source = CascSource::open(install).with_context(|| {

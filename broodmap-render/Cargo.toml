@@ -10,8 +10,10 @@ description = "Render StarCraft: Brood War map previews using Remastered assets"
 default = ["fs"]
 # DirSource: read extracted assets from a plain directory via std::fs
 fs = []
-# CascSource: read assets from a SC:R install or Blizzard's CDN via broodcasc
-casc = ["dep:broodcasc"]
+# CascSource/CdnSource: read assets from a SC:R install or Blizzard's CDN via broodcasc.
+# broodcasc/cdn is named explicitly so CdnSource survives a dependent turning broodcasc's
+# default features off.
+casc = ["dep:broodcasc", "broodcasc/cdn"]
 # PNG encoding of rendered images
 png = ["dep:png"]
 
