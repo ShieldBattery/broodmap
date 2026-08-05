@@ -7,6 +7,7 @@
 
 /// A quality tier of pre-rendered SC:R terrain/sprite art.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AssetTier {
     /// Original 1.16.1-resolution art, re-packaged for Remastered. 32px tiles.
     Sd,
@@ -40,6 +41,7 @@ impl AssetTier {
 /// The asset pack an art style's graphics come from, matching the CASC directory layout: the
 /// standard art, or the "StarCraft: Cartooned" art under `Carbot/` subdirectories.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ArtPack {
     /// The standard art (original or Remastered).
     #[default]

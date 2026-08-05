@@ -12,6 +12,7 @@ use crate::tier::{ArtPack, AssetTier};
 /// Which of BW's `.dat` stat tables an [`AssetRequest::Dat`] refers to. All of them live under
 /// `arr/` in the CASC catalog.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DatKind {
     /// `arr/units.dat` — per-unit-type stats (including the flingy each unit uses).
     Units,
@@ -42,13 +43,18 @@ impl DatKind {
 /// implement `Hash` itself, so this hashes its (stable, explicitly-numbered) discriminant
 /// instead.
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum AssetRequest {
     /// A tileset's CV5 tile-group table (shared by every tier and art pack).
-    Cv5(Tileset),
+    Cv5(#[cfg_attr(feature = "serde", serde(with = "crate::plan::tileset_serde"))] Tileset),
     /// A tileset's pre-rendered megatile textures at a given quality tier, from a given art
     /// pack.
-    TilesetDds(Tileset, AssetTier, ArtPack),
+    TilesetDds(
+        #[cfg_attr(feature = "serde", serde(with = "crate::plan::tileset_serde"))] Tileset,
+        AssetTier,
+        ArtPack,
+    ),
     /// One of BW's `.dat` stat tables (`arr/units.dat` and friends), needed to resolve a placed
     /// unit or THG2 sprite to the image whose art should be drawn.
     Dat(DatKind),

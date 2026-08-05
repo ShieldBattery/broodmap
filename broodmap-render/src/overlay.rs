@@ -45,8 +45,9 @@ use crate::gamedata::{
 };
 use crate::image::{RgbaImage, scale_rgba_premultiplied};
 use crate::options::{RenderOptions, StartLocations, UnitFilter, resolve_tier, resolve_unit_tier};
+use crate::plan::{PlannedBlock, PlannedSprite, RenderPlan, SdCanvasSource, TerrainPlan};
 use crate::source::{AssetRequest, DatKind, TilesetDataSource};
-use crate::terrain::render_terrain;
+use crate::terrain::{MAX_TERRAIN_DIM, megatile_grid, rasterize_terrain};
 use crate::tier::{ArtPack, AssetTier};
 
 /// Upper bound on the width/height we'll decode an `.anim` layer atlas at. Real HD atlases top
@@ -130,6 +131,10 @@ pub fn render_preview(
 }
 
 /// [`render_preview`], additionally reporting anything the render skipped for non-fatal reasons.
+///
+/// This is literally [`plan_preview`] followed by [`execute_plan`] — the plan is the render's
+/// single source of truth, so a serialized plan handed to an external executor describes
+/// exactly what this draws.
 pub fn render_preview_with_warnings(
     terrain: &TerrainTileIds,
     tileset: Tileset,
@@ -139,51 +144,265 @@ pub fn render_preview_with_warnings(
     source: &dyn TilesetDataSource,
     options: &RenderOptions,
 ) -> Result<Preview, RenderError> {
-    let mut image = render_terrain(terrain, tileset, source, options)?;
-    let warnings = Vec::new();
+    let plan = plan_preview(
+        terrain,
+        tileset,
+        units,
+        sprites,
+        player_colors,
+        source,
+        options,
+    )?;
+    let image = execute_plan(&plan, source)?;
+    Ok(Preview {
+        image,
+        warnings: Vec::new(),
+    })
+}
 
-    if image.width == 0 || image.height == 0 {
-        return Ok(Preview { image, warnings });
+/// The decide half of a preview render: resolves everything requiring game knowledge — tile IDs
+/// to megatiles, units/sprites through the `.dat` chain to images/frames, filters, painter
+/// order, player colors, SD canvas sources — into a [`RenderPlan`]. See `crate::plan`'s module
+/// docs for the executor contract.
+///
+/// Reads only *decide-phase* assets from `source`: the tileset's CV5 and (when the map has any
+/// units or sprites) the `.dat`/`.rel`/`.tbl` tables — exactly round 1 of the prefetch API. The
+/// pixel assets the plan's `manifest` names are read at execute time, not here.
+///
+/// The `.dat`/`.rel` tables are a hard dependency of the unit layer (every art style, Original
+/// included, now that it draws from `mainSD.anim`): a map with units/sprites but no tables is a
+/// genuine error. A map with no units and no sprites at all can't resolve anything through them
+/// either way, so a terrain-only source (no `.dat` tables present) must still plan successfully
+/// — nothing here would ever read them.
+pub fn plan_preview(
+    terrain: &TerrainTileIds,
+    tileset: Tileset,
+    units: &[PlacedUnit],
+    sprites: &[Sprite],
+    player_colors: &PlayerColors,
+    source: &dyn TilesetDataSource,
+    options: &RenderOptions,
+) -> Result<RenderPlan, RenderError> {
+    let map_w = terrain.width.min(MAX_TERRAIN_DIM) as u32;
+    let map_h = terrain.height.min(MAX_TERRAIN_DIM) as u32;
+    let (terrain_tier, terrain_pack, ppt) = resolve_tier(options, map_w, map_h);
+    let (unit_tier, unit_pack) = resolve_unit_tier(options, ppt);
+
+    // A zero-dimension map plans (and renders) as an empty image; nothing is read at all.
+    if map_w == 0 || map_h == 0 {
+        return Ok(RenderPlan {
+            width: 0,
+            height: 0,
+            px_per_tile: ppt,
+            terrain: TerrainPlan {
+                tileset,
+                tier: terrain_tier,
+                pack: terrain_pack,
+                width: 0,
+                height: 0,
+                megatiles: Vec::new(),
+            },
+            unit_tier,
+            unit_pack,
+            sprites: Vec::new(),
+            sd_canvases: Vec::new(),
+            blocks: Vec::new(),
+            manifest: Vec::new(),
+        });
     }
 
-    let (_, _, ppt) = resolve_tier(options, terrain.width as u32, terrain.height as u32);
-    let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
+    let cv5_bytes = source.read(&AssetRequest::Cv5(tileset))?;
+    let megatiles = megatile_grid(terrain, cv5_bytes.as_ref(), map_w, map_h);
 
-    // The `.dat`/`.rel` tables are a hard dependency of the unit layer (every art style,
-    // Original included, now that it draws from `mainSD.anim`): a map with units/sprites but no
-    // tables is a genuine error. A map with no units and no sprites at all can't resolve
-    // anything through them either way, so a terrain-only source (no `.dat` tables present) must
-    // still render successfully — nothing here would ever read them.
     let needs_game_data = !units.is_empty() || !sprites.is_empty();
     let data = needs_game_data
         .then(|| GameData::load(source))
         .transpose()?;
 
+    let mut planned_sprites = Vec::new();
+    let mut sd_canvases: Vec<SdCanvasSource> = Vec::new();
     if let Some(data) = data.as_ref() {
-        let (tier, pack) = resolve_unit_tier(options, ppt);
         let drawables = collect_drawables(units, sprites, data, options, tileset);
+        for drawable in &drawables {
+            planned_sprites.push(PlannedSprite {
+                image_id: drawable.art_image_id,
+                frame: drawable.frame as u32,
+                flip: drawable.flip,
+                x: drawable.x,
+                y: drawable.y,
+                tint: (!drawable.is_shadow).then(|| owner_color(drawable.owner, player_colors)),
+                is_shadow: drawable.is_shadow,
+            });
+        }
+        if unit_tier == AssetTier::Sd {
+            for drawable in &drawables {
+                if sd_canvases
+                    .iter()
+                    .any(|canvas| canvas.image_id == drawable.art_image_id)
+                {
+                    continue;
+                }
+                if let Some(path) = data.grp_path(drawable.art_image_id) {
+                    sd_canvases.push(SdCanvasSource {
+                        image_id: drawable.art_image_id,
+                        grp_path: path.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut blocks = Vec::new();
+    if options.start_locations == StartLocations::ColorBlock {
+        let (box_w, box_h) = start_location_box(data.as_ref());
+        let box_w = box_w.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
+        let box_h = box_h.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
+        for unit in units.iter().filter(|u| u.unit_id == UNIT_ID_START_LOCATION) {
+            blocks.push(PlannedBlock {
+                x: unit.x as i32,
+                y: unit.y as i32,
+                width: box_w,
+                height: box_h,
+                color: owner_color(unit.owner.unwrap_or(u8::MAX), player_colors),
+            });
+        }
+    }
+
+    // The draw-phase read set: the terrain texture, each distinct sprite image's art (all SD
+    // images fold into the one `MainSdAnim` via `anim_request`), and each SD canvas GRP. A
+    // superset of what a given execution actually reads — off-image sprites are culled at draw
+    // time without fetching — which is exactly what a prefetching executor wants.
+    let mut manifest = vec![AssetRequest::TilesetDds(
+        tileset,
+        terrain_tier,
+        terrain_pack,
+    )];
+    for sprite in &planned_sprites {
+        let req = anim_request(sprite.image_id, unit_tier, unit_pack);
+        if !manifest.contains(&req) {
+            manifest.push(req);
+        }
+    }
+    for canvas in &sd_canvases {
+        let req = AssetRequest::Grp {
+            path: canvas.grp_path.clone(),
+        };
+        if !manifest.contains(&req) {
+            manifest.push(req);
+        }
+    }
+
+    Ok(RenderPlan {
+        width: map_w * ppt,
+        height: map_h * ppt,
+        px_per_tile: ppt,
+        terrain: TerrainPlan {
+            tileset,
+            tier: terrain_tier,
+            pack: terrain_pack,
+            width: map_w,
+            height: map_h,
+            megatiles,
+        },
+        unit_tier,
+        unit_pack,
+        sprites: planned_sprites,
+        sd_canvases,
+        blocks,
+        manifest,
+    })
+}
+
+/// [`plan_preview`] straight from a parsed [`Chk`], mirroring [`render_chk_preview`]'s input
+/// handling (a missing `UNIT`/`THG2` chunk is just an empty list; a map with no readable
+/// terrain plans as an empty 0x0 render).
+pub fn plan_chk_preview(
+    chk: &Chk,
+    source: &dyn TilesetDataSource,
+    options: &RenderOptions,
+) -> Result<RenderPlan, RenderError> {
+    static NO_UNITS: &[PlacedUnit] = &[];
+    static NO_SPRITES: &[Sprite] = &[];
+    let (units, sprites, empty_terrain);
+    let terrain = match chk.terrain() {
+        Ok(terrain) => terrain,
+        Err(_) => {
+            empty_terrain = TerrainTileIds {
+                width: 0,
+                height: 0,
+                tiles: Vec::new(),
+            };
+            &empty_terrain
+        }
+    };
+    units = chk.placed_units().map(Vec::as_slice).unwrap_or(NO_UNITS);
+    sprites = chk.sprites().map(Vec::as_slice).unwrap_or(NO_SPRITES);
+    plan_preview(
+        terrain,
+        chk.tileset(),
+        units,
+        sprites,
+        chk.player_colors(),
+        source,
+        options,
+    )
+}
+
+/// The draw half of a preview render: rasterizes a [`RenderPlan`] with the built-in CPU
+/// compositor, reading only the pixel assets the plan's manifest names. This is what
+/// [`render_preview`] itself runs after [`plan_preview`].
+///
+/// A plan is plain (possibly deserialized, possibly hostile) data, so its fields are treated as
+/// untrusted: the terrain grid dimensions are clamped to the CHK format's 256-tile maximum and
+/// `px_per_tile` to the largest real tier's 128, bounding the output buffer by construction.
+/// The declared `width`/`height` are informational — output dimensions are derived from the
+/// (clamped) tile grid, so a plan whose fields disagree draws the consistent interpretation
+/// rather than erroring. Missing/undecodable art degrades exactly like the direct render path:
+/// per drawable, never a failure; only the terrain texture itself is a hard error.
+pub fn execute_plan(
+    plan: &RenderPlan,
+    source: &dyn TilesetDataSource,
+) -> Result<RgbaImage, RenderError> {
+    let map_w = plan.terrain.width.min(MAX_TERRAIN_DIM as u32);
+    let map_h = plan.terrain.height.min(MAX_TERRAIN_DIM as u32);
+    let ppt = plan.px_per_tile.clamp(1, AssetTier::Hd.tile_px());
+    if map_w == 0 || map_h == 0 {
+        return Ok(RgbaImage {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+        });
+    }
+
+    let mut image = rasterize_terrain(
+        &plan.terrain.megatiles,
+        map_w,
+        map_h,
+        plan.terrain.tileset,
+        plan.terrain.tier,
+        plan.terrain.pack,
+        ppt,
+        source,
+    )?;
+
+    let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
+    // An empty sprite list skips the overlay entirely (in particular, the SD `mainSD.anim`
+    // bundle is never fetched), matching the direct render path's behavior for unit-less maps.
+    if !plan.sprites.is_empty() {
         draw_overlay(
             &mut image,
-            &drawables,
-            player_colors,
+            &plan.sprites,
+            &plan.sd_canvases,
             source,
-            tier,
-            pack,
+            plan.unit_tier,
+            plan.unit_pack,
             zoom,
-            data,
         );
     }
 
-    draw_start_location_blocks(
-        &mut image,
-        units,
-        player_colors,
-        data.as_ref(),
-        options,
-        zoom,
-    );
+    draw_planned_blocks(&mut image, &plan.blocks, zoom);
 
-    Ok(Preview { image, warnings })
+    Ok(image)
 }
 
 /// Renders a map preview straight from a parsed [`Chk`].
@@ -860,41 +1079,45 @@ fn rect_intersects_image(x: i32, y: i32, w: u32, h: u32, image_w: u32, image_h: 
     x < image_w as i32 && y < image_h as i32 && x1 > 0 && y1 > 0
 }
 
-/// Fetches art for every distinct image among `drawables`, builds the output tiles, and blits
-/// them onto `image` in `drawables`' (already painter-sorted) order.
+/// Fetches art for every distinct image among `sprites`, builds the output tiles, and blits
+/// them onto `image` in `sprites`' (already painter-sorted) order.
 ///
 /// Art is loaded one image at a time and its atlases dropped before moving on, so peak memory is
 /// one decoded atlas plus the (small, output-resolution) tiles — never every atlas at once. A
-/// drawable unambiguously off the output image never triggers its `.anim`'s fetch at all (see
+/// sprite unambiguously off the output image never triggers its `.anim`'s fetch at all (see
 /// [`could_possibly_be_visible`]), and one whose exact placement rect clips entirely off the
 /// image is dropped before its tile is built (see [`rect_intersects_image`]).
-#[allow(clippy::too_many_arguments)]
 fn draw_overlay(
     image: &mut RgbaImage,
-    drawables: &[Drawable],
-    player_colors: &PlayerColors,
+    sprites: &[PlannedSprite],
+    sd_canvases: &[SdCanvasSource],
     source: &dyn TilesetDataSource,
     tier: AssetTier,
     pack: ArtPack,
     zoom: f32,
-    data: &GameData,
 ) {
     let (image_w, image_h) = (image.width, image.height);
 
-    // Group drawable indices by image so each `.anim` is fetched, parsed and decoded once. A
-    // drawable that's definitely off-image (by position alone, before any art is known) never
+    // Group sprite indices by image so each `.anim` is fetched, parsed and decoded once. A
+    // sprite that's definitely off-image (by position alone, before any art is known) never
     // even enters this map, so its image is never fetched if nothing else needs it.
     let mut by_image: HashMap<u16, Vec<usize>> = HashMap::new();
-    for (i, drawable) in drawables.iter().enumerate() {
-        if !could_possibly_be_visible(drawable.x, drawable.y, image_w, image_h, zoom) {
+    for (i, sprite) in sprites.iter().enumerate() {
+        if !could_possibly_be_visible(sprite.x, sprite.y, image_w, image_h, zoom) {
             continue;
         }
-        by_image.entry(drawable.art_image_id).or_default().push(i);
+        by_image.entry(sprite.image_id).or_default().push(i);
     }
+
+    // The plan's image -> GRP-path table (SD canvas resolution), as a lookup map.
+    let canvas_paths: HashMap<u16, &str> = sd_canvases
+        .iter()
+        .map(|canvas| (canvas.image_id, canvas.grp_path.as_str()))
+        .collect();
 
     let mut tiles: HashMap<TileKey, Tile> = HashMap::new();
     let mut cache_bytes: usize = 0;
-    let mut placements: Vec<Option<Placement>> = (0..drawables.len()).map(|_| None).collect();
+    let mut placements: Vec<Option<Placement>> = (0..sprites.len()).map(|_| None).collect();
 
     // SD art is one bundled ~38 MB file, unlike HD/HD2's one-file-per-image layout, so it's
     // fetched and parsed once here rather than once per distinct image inside the loop below.
@@ -933,7 +1156,7 @@ fn draw_overlay(
 
         let (canvas_w, canvas_h) = anim.canvas_size();
         let (canvas_w, canvas_h) = if tier == AssetTier::Sd {
-            sd_grp_canvas(data, source, art_image_id).unwrap_or((canvas_w, canvas_h))
+            sd_grp_canvas(&canvas_paths, source, art_image_id).unwrap_or((canvas_w, canvas_h))
         } else {
             (canvas_w, canvas_h)
         };
@@ -944,8 +1167,8 @@ fn draw_overlay(
         let texel_scale = (anim.scale() as f32).max(1.0);
 
         for &i in &indices {
-            let drawable = &drawables[i];
-            let frame_index = drawable.frame.min(frame_count - 1);
+            let drawable = &sprites[i];
+            let frame_index = (drawable.frame as usize).min(frame_count - 1);
             let Some(frame) = anim.frame(frame_index).copied() else {
                 continue;
             };
@@ -972,7 +1195,10 @@ fn draw_overlay(
                 continue;
             }
 
-            let color = owner_color(drawable.owner, player_colors);
+            // `tint` is `None` only for shadows in a plan this crate built, but a deserialized
+            // plan can say anything — the sentinel makes an untinted non-shadow draw exactly
+            // like art with no teamcolor layer.
+            let color = drawable.tint.unwrap_or(NO_TEAMCOLOR_SENTINEL);
             let key = TileKey {
                 art_image_id,
                 frame: frame_index,
@@ -1056,20 +1282,20 @@ fn effective_canvas(canvas: u16, offset: i16, size: u16) -> u16 {
     (2 * offset as i32 + size as i32).clamp(0, u16::MAX as i32) as u16
 }
 
-/// Resolves the SD canvas override (see `broodmap_formats::grp`'s module docs): `images.dat`'s
-/// `grp` column (via `art_image_id`, [`GameData::grp_path`]) names a classic GRP in
-/// `images.tbl`, whose 6-byte header's width/height (SD pixels) replace `mainSD.anim`'s
-/// always-zero declared canvas -- converted to 4K units (1 SD px = 4 4K units, the same
-/// normalization [`broodmap_formats::mainsd`] applies to frame data). `None` if any step fails
-/// (no `grp` entry, the asset isn't fetchable, or its header doesn't parse), in which case the
-/// caller falls back to `anim.canvas_size()` and [`effective_canvas`]'s content-centering, i.e.
-/// exactly the pre-fix behavior.
+/// Resolves the SD canvas override (see `broodmap_formats::grp`'s module docs): the plan's
+/// `sd_canvases` table (built from `images.dat`'s `grp` column through `images.tbl` at plan
+/// time) names a classic GRP, whose 6-byte header's width/height (SD pixels) replace
+/// `mainSD.anim`'s always-zero declared canvas -- converted to 4K units (1 SD px = 4 4K units,
+/// the same normalization [`broodmap_formats::mainsd`] applies to frame data). `None` if any
+/// step fails (no table entry, the asset isn't fetchable, or its header doesn't parse), in
+/// which case the caller falls back to `anim.canvas_size()` and [`effective_canvas`]'s
+/// content-centering, i.e. exactly the pre-fix behavior.
 fn sd_grp_canvas(
-    data: &GameData,
+    canvas_paths: &HashMap<u16, &str>,
     source: &dyn TilesetDataSource,
     art_image_id: u16,
 ) -> Option<(u16, u16)> {
-    let path = data.grp_path(art_image_id)?;
+    let path = canvas_paths.get(&art_image_id)?;
     let bytes = source
         .read(&AssetRequest::Grp {
             path: path.to_string(),
@@ -1510,38 +1736,24 @@ pub(crate) fn start_location_box(data: Option<&GameData>) -> (u32, u32) {
         .unwrap_or(FALLBACK_START_LOCATION_BOX)
 }
 
-/// Draws the start-location color blocks: a polished "player token" (rounded, gradient-filled,
-/// bezel-stroked — see [`crate::token`]) in each owner's color, sized to the start location's
-/// `units.dat` placement box, centred on the placed position, over everything else.
-fn draw_start_location_blocks(
-    image: &mut RgbaImage,
-    units: &[PlacedUnit],
-    player_colors: &PlayerColors,
-    data: Option<&GameData>,
-    options: &RenderOptions,
-    zoom: f32,
-) {
-    if options.start_locations != StartLocations::ColorBlock {
-        return;
-    }
-
-    let (box_w, box_h) = start_location_box(data);
-    let box_w = box_w.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
-    let box_h = box_h.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
-
-    for unit in units.iter().filter(|u| u.unit_id == UNIT_ID_START_LOCATION) {
-        let color = owner_color(unit.owner.unwrap_or(u8::MAX), player_colors);
-        let left = ((unit.x as f32 - box_w as f32 / 2.0) * zoom).round() as i32;
-        let top = ((unit.y as f32 - box_h as f32 / 2.0) * zoom).round() as i32;
-        let right = ((unit.x as f32 + box_w as f32 / 2.0) * zoom).round() as i32;
-        let bottom = ((unit.y as f32 + box_h as f32 / 2.0) * zoom).round() as i32;
+/// Draws a plan's start-location color blocks: a polished "player token" (rounded,
+/// gradient-filled, bezel-stroked — see [`crate::token`]) in each block's color, centred on its
+/// logical-pixel position, over everything else.
+fn draw_planned_blocks(image: &mut RgbaImage, blocks: &[PlannedBlock], zoom: f32) {
+    for block in blocks {
+        let box_w = block.width.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
+        let box_h = block.height.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
+        let left = ((block.x as f32 - box_w as f32 / 2.0) * zoom).round() as i32;
+        let top = ((block.y as f32 - box_h as f32 / 2.0) * zoom).round() as i32;
+        let right = ((block.x as f32 + box_w as f32 / 2.0) * zoom).round() as i32;
+        let bottom = ((block.y as f32 + box_h as f32 / 2.0) * zoom).round() as i32;
         crate::token::draw_player_token(
             image,
             left,
             top,
             right.max(left + 1),
             bottom.max(top + 1),
-            color,
+            block.color,
         );
     }
 }
@@ -2506,6 +2718,162 @@ mod tests {
         assert_eq!(pixel(67, 68), blue, "one pixel below the sprite");
     }
 
+    /// The plan is the render: planning then executing must produce byte-identical output to
+    /// `render_preview` (implemented as exactly that split), the plan's manifest must cover
+    /// every asset the execution reads, and a serde round-trip must not change the result.
+    #[test]
+    fn plan_execute_matches_render_preview_and_manifest_covers_reads() {
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        let terrain = square_terrain(4);
+        let opts = RenderOptions {
+            art_style: ArtStyle::Remastered,
+            max_dimension: Some(128),
+            ..Default::default()
+        };
+        let frame = AnimFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 0,
+            offset_y: 0,
+            width: 32,
+            height: 32,
+        };
+        let mut source = preview_source(AssetTier::Hd2, 0x001F, synthetic_parts(5, 0, 0, 0, None));
+        source.insert(
+            AssetRequest::Anim {
+                image_id: 0,
+                tier: AssetTier::Hd2,
+                pack: ArtPack::Standard,
+            },
+            anim_bytes(2, (32, 32), frame, &solid_bc1_dds(16, 16, 0xF800)),
+        );
+        let units = [unit(5, Some(11), 64, 64)];
+
+        let direct = render_preview(
+            &terrain,
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &source,
+            &opts,
+        )
+        .unwrap();
+
+        let plan = plan_preview(
+            &terrain,
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &source,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!((plan.width, plan.height, plan.px_per_tile), (128, 128, 32));
+        assert_eq!(plan.terrain.megatiles.len(), 16);
+        assert!(!plan.sprites.is_empty());
+
+        struct CountingSource<'a> {
+            inner: &'a MemorySource,
+            reads: RefCell<Vec<AssetRequest>>,
+        }
+        impl TilesetDataSource for CountingSource<'_> {
+            fn read(&self, req: &AssetRequest) -> Result<Arc<[u8]>, crate::source::SourceError> {
+                self.reads.borrow_mut().push(req.clone());
+                self.inner.read(req)
+            }
+        }
+        let counting = CountingSource {
+            inner: &source,
+            reads: RefCell::new(Vec::new()),
+        };
+        let executed = execute_plan(&plan, &counting).unwrap();
+        assert_eq!(direct, executed, "plan-then-execute must be the render");
+        for read in counting.reads.borrow().iter() {
+            assert!(
+                plan.manifest.contains(read),
+                "execute read {read:?}, which the manifest doesn't name"
+            );
+        }
+    }
+
+    /// Plans survive serialization: a JSON round-trip reproduces the plan exactly (and therefore
+    /// the same pixels).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn plan_serde_roundtrip_is_lossless() {
+        let terrain = square_terrain(2);
+        let opts = RenderOptions {
+            art_style: ArtStyle::Original,
+            max_dimension: Some(64),
+            ..Default::default()
+        };
+        let source = preview_source(AssetTier::Sd, 0x001F, synthetic_parts(5, 0, 0, 0, None));
+        let units = [
+            unit(5, Some(11), 32, 32),
+            unit(UNIT_ID_START_LOCATION, Some(0), 48, 48),
+        ];
+
+        let plan = plan_preview(
+            &terrain,
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &source,
+            &opts,
+        )
+        .unwrap();
+        // Exercise every serialized corner: sprites, blocks, an SD unit tier, and the manifest's
+        // Tileset-carrying requests.
+        assert!(!plan.blocks.is_empty());
+        assert_eq!(plan.unit_tier, AssetTier::Sd);
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let restored: RenderPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, restored);
+        assert_eq!(
+            execute_plan(&plan, &source).unwrap(),
+            execute_plan(&restored, &source).unwrap()
+        );
+    }
+
+    /// A plan is plain data, so a deserialized one can claim anything: absurd grid dimensions
+    /// and `px_per_tile` must clamp to the format ceilings (256 tiles, 128 px/tile) instead of
+    /// driving allocations or panicking, and a megatile grid shorter than the claimed dimensions
+    /// must render (as megatile 0) rather than indexing out of bounds.
+    #[test]
+    fn hostile_plan_fields_are_clamped_not_trusted() {
+        let source = preview_source(AssetTier::Sd, 0x001F, synthetic_parts(5, 0, 0, 0, None));
+
+        let plan = RenderPlan {
+            width: u32::MAX,
+            height: u32::MAX,
+            px_per_tile: u32::MAX,
+            terrain: TerrainPlan {
+                tileset: Tileset::Jungle,
+                tier: AssetTier::Sd,
+                pack: ArtPack::Standard,
+                width: 2,
+                height: 2,
+                megatiles: Vec::new(), // 4 short of the claimed 2x2
+            },
+            unit_tier: AssetTier::Sd,
+            unit_pack: ArtPack::Standard,
+            sprites: Vec::new(),
+            sd_canvases: Vec::new(),
+            blocks: Vec::new(),
+            manifest: Vec::new(),
+        };
+
+        let image = execute_plan(&plan, &source).unwrap();
+        // 2x2 tiles at the 128 px/tile ceiling; the declared width/height are ignored.
+        assert_eq!((image.width, image.height), (256, 256));
+    }
+
     /// An `ArtStyle::Original` render draws unit art out of a synthetic `mainSD.anim` bundle, the
     /// same way [`end_to_end_placement_lands_on_the_expected_output_pixels`] proves it for HD2.
     /// SD's frame table lives in its own texel space (see `broodmap_formats::mainsd`'s module
@@ -3028,40 +3396,37 @@ mod tests {
             height: 128,
             data: vec![0u8; 128 * 128 * 4],
         };
-        let drawables = [
-            Drawable {
-                art_image_id: 0,
+        let sprites = [
+            PlannedSprite {
+                image_id: 0,
                 frame: 0,
                 flip: false,
                 x: 64,
                 y: 64,
-                owner: 0,
-                layer: 0,
+                tint: Some([255, 0, 0]),
                 is_shadow: false,
             },
             // Placed absurdly far away: at zoom 1 this is tens of thousands of px off a 128x128
             // image, so no legitimate frame could ever reach back onto it.
-            Drawable {
-                art_image_id: 1,
+            PlannedSprite {
+                image_id: 1,
                 frame: 0,
                 flip: false,
                 x: 60_000,
                 y: 60_000,
-                owner: 0,
-                layer: 0,
+                tint: Some([255, 0, 0]),
                 is_shadow: false,
             },
         ];
 
         draw_overlay(
             &mut image,
-            &drawables,
-            &PlayerColors::default(),
+            &sprites,
+            &[],
             &counting,
             AssetTier::Hd2,
             ArtPack::Standard,
             1.0,
-            &game_data(),
         );
 
         let requested_ids: Vec<u16> = counting

@@ -22,6 +22,7 @@ use crate::image::{RgbaImage, scale_rgba};
 use crate::options::{RenderOptions, resolve_tier};
 use crate::resample::{NativeRows, resample_linear};
 use crate::source::{AssetRequest, TilesetDataSource};
+use crate::tier::{ArtPack, AssetTier};
 
 /// Upper bound on the width/height (in pixels) we'll attempt to decode a single megatile frame
 /// at, regardless of what a (possibly malformed) DDS header claims. Real SC:R megatile frames
@@ -47,7 +48,7 @@ const MAX_TILE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// trusting it to drive allocation sizes or loop bounds. A map beyond this renders as its
 /// 256x256-clamped corner: permissive, and documented, like every other malformed-input case in
 /// this crate.
-const MAX_TERRAIN_DIM: usize = 256;
+pub(crate) const MAX_TERRAIN_DIM: usize = 256;
 
 /// Renders a map's terrain to a single RGBA image.
 ///
@@ -81,14 +82,22 @@ pub fn render_terrain(
     let (tier, pack, ppt) = resolve_tier(options, map_w, map_h);
 
     let cv5_bytes = source.read(&AssetRequest::Cv5(tileset))?;
-    let cv5 = parse_cv5(cv5_bytes.as_ref());
+    let megatiles = megatile_grid(terrain, cv5_bytes.as_ref(), map_w, map_h);
 
-    let dds_vr4_bytes = source.read(&AssetRequest::TilesetDds(tileset, tier, pack))?;
-    let dds_vr4 = DdsVr4::parse(dds_vr4_bytes.as_ref())?;
+    rasterize_terrain(&megatiles, map_w, map_h, tileset, tier, pack, ppt, source)
+}
 
-    // Resolve the CHK's tile IDs to megatile IDs up front (at most 256*256 `u16`s, post-clamp).
-    // This is the only thing the CV5 is needed for, and having it as a flat grid keeps the strip
-    // compositor free of tile-lookup concerns.
+/// The decide half of the terrain render: resolves the CHK's tile IDs to a flat megatile-ID
+/// grid (at most 256*256 `u16`s, post-clamp) through the CV5's tile groups. This is the only
+/// thing the CV5 is needed for, and having it as a flat grid keeps the strip compositor free of
+/// tile-lookup concerns — it's also exactly the grid a [`crate::RenderPlan`] carries.
+pub(crate) fn megatile_grid(
+    terrain: &TerrainTileIds,
+    cv5_bytes: &[u8],
+    map_w: u32,
+    map_h: u32,
+) -> Vec<u16> {
+    let cv5 = parse_cv5(cv5_bytes);
     let mut megatiles = Vec::with_capacity(map_w as usize * map_h as usize);
     for y in 0..map_h as usize {
         for x in 0..map_w as usize {
@@ -111,12 +120,31 @@ pub fn render_terrain(
             );
         }
     }
+    megatiles
+}
+
+/// The draw half of the terrain render: composites an already-resolved megatile grid at the
+/// art's native size and resamples to `ppt` output pixels per tile. Reads only the tileset's
+/// `.dds.vr4` from `source`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rasterize_terrain(
+    megatiles: &[u16],
+    map_w: u32,
+    map_h: u32,
+    tileset: Tileset,
+    tier: AssetTier,
+    pack: ArtPack,
+    ppt: u32,
+    source: &dyn TilesetDataSource,
+) -> Result<RgbaImage, RenderError> {
+    let dds_vr4_bytes = source.read(&AssetRequest::TilesetDds(tileset, tier, pack))?;
+    let dds_vr4 = DdsVr4::parse(dds_vr4_bytes.as_ref())?;
 
     let native_px = native_tile_px(&dds_vr4, tier.tile_px(), ppt);
     let out_w = map_w * ppt;
     let out_h = map_h * ppt;
 
-    let mut compositor = StripCompositor::new(&megatiles, map_w, &dds_vr4, native_px);
+    let mut compositor = StripCompositor::new(megatiles, map_w, &dds_vr4, native_px);
 
     let data = if native_px == ppt {
         // Native-resolution render: the composite *is* the output, byte for byte what a straight

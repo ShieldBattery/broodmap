@@ -16,6 +16,9 @@ fs = []
 casc = ["dep:broodcasc", "broodcasc/cdn"]
 # PNG encoding of rendered images
 png = ["dep:png"]
+# Serialize/Deserialize impls for the render plan (RenderPlan and friends, AssetRequest) — the
+# WASM/JS boundary format for external plan executors. WASM-clean.
+serde = ["dep:serde"]
 
 [dependencies]
 broodmap = { version = "0.1.0", path = "../broodmap" }
@@ -24,6 +27,8 @@ thiserror = "2.0"
 miniz_oxide = "0.8"
 broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0", optional = true }
 png = { version = "0.18", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 assert_ok = "1.0"
+serde_json = "1"

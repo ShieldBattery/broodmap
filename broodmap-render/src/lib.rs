@@ -37,6 +37,7 @@ mod image;
 mod minimap;
 mod options;
 mod overlay;
+mod plan;
 mod resample;
 mod source;
 mod terrain;
@@ -57,10 +58,11 @@ pub use options::{
     required_terrain_assets,
 };
 pub use overlay::{
-    Preview, render_chk_preview, render_preview, render_preview_with_warnings,
-    required_preview_assets_for_chk, required_preview_graphics, required_preview_graphics_for_chk,
-    required_style_assets,
+    Preview, execute_plan, plan_chk_preview, plan_preview, render_chk_preview, render_preview,
+    render_preview_with_warnings, required_preview_assets_for_chk, required_preview_graphics,
+    required_preview_graphics_for_chk, required_style_assets,
 };
+pub use plan::{PlannedBlock, PlannedSprite, RenderPlan, SdCanvasSource, TerrainPlan};
 pub use source::{AssetRequest, DatKind, MemorySource, SourceError, TilesetDataSource};
 pub use terrain::render_terrain;
 pub use tier::{ArtPack, ArtStyle, AssetTier};

@@ -314,14 +314,26 @@ both rounds for callers that already have a parsed `Chk`, so they can't drift fr
 
 ### Render plan (decide vs. draw)
 
-The compositor's intermediate representation is public: a tile layer (megatile ID grid), an
-ordered sprite list (`{ image_ref, frame, x, y, flip, tint }`), and a texture manifest keyed by
-`AssetRequest`. Plain structs, `serde` behind a feature for the JS boundary.
+Shipped (phase 4): the compositor's intermediate representation is public. `plan_preview` (and
+`plan_chk_preview`) resolves everything requiring game knowledge — CHK tile IDs through CV5 to a
+megatile grid, units/sprites through the `.dat` chain to image/frame/flip, filters, painter
+order, player colors, the SD image -> classic-GRP canvas-source table, start-location blocks —
+into a `RenderPlan`: a `TerrainPlan` (megatile ID grid + tileset/tier/pack), an ordered
+`PlannedSprite` list (`{ image_id, frame, flip, x, y, tint, is_shadow }`, list order == painter
+order), `sd_canvases`, `blocks`, and a texture manifest of `AssetRequest`s naming the entire
+draw-phase read set. `execute_plan` is the built-in CPU executor, and
+`render_preview_with_warnings` is *literally* plan-then-execute, so the plan can't drift from
+the render (verified byte-identical across all three styles on real maps). Planning reads only
+round-1 assets (CV5 + tables); executing reads only the manifest. Plan types are plain data
+with `serde` impls behind the `serde` feature (WASM-clean; `Tileset` serializes as its stable
+CHK discriminant), and an executor treats a deserialized plan as untrusted — grid dims clamp to
+256, `px_per_tile` to 128, short megatile grids draw as megatile 0.
 
 - The built-in CPU rasterizer is one executor of the plan (BC decode -> RGBA blit).
 - A browser GPU consumer is another: WASM emits plan + raw BC payloads, JS uploads compressed
-  textures and draws quads. Mobile browsers (no BC support) fall back to CPU decode + RGBA
-  upload, executing the same plan.
+  textures and draws quads (frame placement follows the `.anim` frame tables plus the canvas
+  rules — `plan.rs`'s module docs state the executor contract). Mobile browsers (no BC support)
+  fall back to CPU decode + RGBA upload, executing the same plan.
 - A TS server uses the CPU path end-to-end to PNG. Electron picks per context.
 
 ### RenderOptions
