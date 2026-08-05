@@ -33,7 +33,8 @@ use broodmap::chk::sprites::{Sprite, SpriteFlags};
 use broodmap::chk::terrain::TerrainTileIds;
 use broodmap::chk::tileset::Tileset;
 use broodmap_formats::{
-    Anim, AnimFrame, AnimLayer, DdsFormat, MainSdAnim, parse_dds, parse_teamcolor_mask,
+    Anim, AnimFrame, AnimLayer, DdsFormat, MainSdAnim, parse_dds, parse_grp_header,
+    parse_teamcolor_mask,
 };
 
 use crate::bc::{decode_bc1, decode_bc3};
@@ -169,6 +170,7 @@ pub fn render_preview_with_warnings(
             tier,
             pack,
             zoom,
+            data,
         );
     }
 
@@ -276,7 +278,10 @@ pub fn required_preview_graphics_for_chk(
 /// same filtering the renderer applies is applied here, so assets for units that `options`
 /// filters out are never requested. For an SD (`ArtStyle::Original`) unit layer, every image
 /// dedupes through [`crate::gamedata::anim_request`] to the single
-/// [`AssetRequest::MainSdAnim`] request, since all SD art lives in one bundled file.
+/// [`AssetRequest::MainSdAnim`] request, since all SD art lives in one bundled file -- plus, for
+/// every distinct resolved image that names a classic GRP (`GameData::grp_path`), an
+/// [`AssetRequest::Grp`] for it (deduplicated by path, `MainSdAnim` always listed first), mirroring
+/// the per-image GRP header fetch `crate::overlay::draw_overlay`'s SD branch does at render time.
 ///
 /// `map_w`/`map_h` (in tiles) are needed to derive the same effective resolution — and therefore
 /// the same asset tier — the render itself will pick.
@@ -302,6 +307,20 @@ pub fn required_preview_graphics(
             seen.push(req);
         }
     }
+
+    if tier == AssetTier::Sd {
+        for drawable in &drawables {
+            if let Some(path) = data.grp_path(drawable.art_image_id) {
+                let req = AssetRequest::Grp {
+                    path: path.to_string(),
+                };
+                if !seen.contains(&req) {
+                    seen.push(req);
+                }
+            }
+        }
+    }
+
     seen
 }
 
@@ -761,6 +780,7 @@ fn draw_overlay(
     tier: AssetTier,
     pack: ArtPack,
     zoom: f32,
+    data: &GameData,
 ) {
     let (image_w, image_h) = (image.width, image.height);
 
@@ -815,6 +835,11 @@ fn draw_overlay(
         let has_teamcolor = teamcolor.is_some();
 
         let (canvas_w, canvas_h) = anim.canvas_size();
+        let (canvas_w, canvas_h) = if tier == AssetTier::Sd {
+            sd_grp_canvas(data, source, art_image_id).unwrap_or((canvas_w, canvas_h))
+        } else {
+            (canvas_w, canvas_h)
+        };
         let frame_count = anim.frame_count();
         if frame_count == 0 {
             continue;
@@ -932,6 +957,32 @@ fn effective_canvas(canvas: u16, offset: i16, size: u16) -> u16 {
         return canvas;
     }
     (2 * offset as i32 + size as i32).clamp(0, u16::MAX as i32) as u16
+}
+
+/// Resolves the SD canvas override (see `broodmap_formats::grp`'s module docs): `images.dat`'s
+/// `grp` column (via `art_image_id`, [`GameData::grp_path`]) names a classic GRP in
+/// `images.tbl`, whose 6-byte header's width/height (SD pixels) replace `mainSD.anim`'s
+/// always-zero declared canvas -- converted to 4K units (1 SD px = 4 4K units, the same
+/// normalization [`broodmap_formats::mainsd`] applies to frame data). `None` if any step fails
+/// (no `grp` entry, the asset isn't fetchable, or its header doesn't parse), in which case the
+/// caller falls back to `anim.canvas_size()` and [`effective_canvas`]'s content-centering, i.e.
+/// exactly the pre-fix behavior.
+fn sd_grp_canvas(
+    data: &GameData,
+    source: &dyn TilesetDataSource,
+    art_image_id: u16,
+) -> Option<(u16, u16)> {
+    let path = data.grp_path(art_image_id)?;
+    let bytes = source
+        .read(&AssetRequest::Grp {
+            path: path.to_string(),
+        })
+        .ok()?;
+    let header = parse_grp_header(bytes.as_ref()).ok()?;
+    Some((
+        header.width.saturating_mul(4),
+        header.height.saturating_mul(4),
+    ))
 }
 
 /// A frame's horizontal offset within its canvas (4K units), mirrored about the canvas centre
@@ -1401,7 +1452,7 @@ fn draw_start_location_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gamedata::tests::{synthetic_parts, synthetic_source};
+    use crate::gamedata::tests::{build_tbl, synthetic_parts, synthetic_source};
     use crate::source::{DatKind, MemorySource};
     use crate::tier::ArtStyle;
     use broodmap::chk::placed_units::{UnitInstanceId, UnitState};
@@ -2263,6 +2314,17 @@ mod tests {
         data
     }
 
+    /// A classic GRP file's 6-byte header only (see `broodmap_formats::grp`'s module docs) --
+    /// enough for [`parse_grp_header`] to resolve the SD canvas override; no frame table or pixel
+    /// data is needed since this crate never reads past the header.
+    fn grp_header_bytes(frame_count: u16, width: u16, height: u16) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&frame_count.to_le_bytes());
+        data.extend_from_slice(&width.to_le_bytes());
+        data.extend_from_slice(&height.to_le_bytes());
+        data
+    }
+
     /// A one-group CV5 plus a one-frame `.dds.vr4` of a solid color.
     fn terrain_assets(color565: u16) -> (Vec<u8>, Vec<u8>) {
         let mut cv5 = Vec::with_capacity(52);
@@ -2285,14 +2347,14 @@ mod tests {
         (cv5, dds_vr4)
     }
 
-    /// Builds a source with terrain assets at `tier` plus the five `.dat`/`.rel` tables.
+    /// Builds a source with terrain assets at `tier` plus the six `.dat`/`.rel`/`.tbl` tables.
     fn preview_source(
         tier: AssetTier,
         terrain_color: u16,
         dats: crate::gamedata::tests::DatBytes,
     ) -> MemorySource {
         let (cv5, dds_vr4) = terrain_assets(terrain_color);
-        let (units, flingy, sprites, images, rel) = dats;
+        let (units, flingy, sprites, images, rel, tbl) = dats;
         [
             (AssetRequest::Cv5(Tileset::Jungle), cv5),
             (
@@ -2304,6 +2366,7 @@ mod tests {
             (AssetRequest::Dat(DatKind::Sprites), sprites),
             (AssetRequest::Dat(DatKind::Images), images),
             (AssetRequest::ImagesRel, rel),
+            (AssetRequest::ImagesTbl, tbl),
         ]
         .into_iter()
         .collect()
@@ -2444,6 +2507,116 @@ mod tests {
         assert_eq!(pixel(60, 59), blue, "one pixel above the sprite");
         assert_eq!(pixel(68, 67), blue, "one pixel right of the sprite");
         assert_eq!(pixel(67, 68), blue, "one pixel below the sprite");
+    }
+
+    /// The SD canvas override (see `broodmap_formats::grp`'s module docs and
+    /// [`sd_grp_canvas`]): when `images.dat`/`images.tbl` resolve a classic GRP for the drawn
+    /// image and its header is fetchable, the GRP's real width/height replace `mainSD.anim`'s
+    /// always-zero canvas -- and unlike [`effective_canvas`]'s content-centering fallback (which
+    /// mathematically always re-centers on the frame's own bounding box, discarding its offset --
+    /// see that function's docs), the real canvas actually respects the frame's offset, so
+    /// placement shifts. Without a resolvable `AssetRequest::Grp`, the render must still succeed
+    /// and fall back to exactly today's (offset-discarding) placement.
+    #[test]
+    fn sd_grp_header_overrides_the_canvas_and_shifts_placement() {
+        let terrain = square_terrain(4);
+        let opts = RenderOptions {
+            art_style: ArtStyle::Original,
+            max_dimension: Some(128), // 4 tiles => 32 px/tile => zoom 1
+            ..Default::default()
+        };
+
+        // Raw SD-texel-space frame (offset (1, 1), 8x8): `MainSdAnim::entry` normalizes every
+        // field x4 into 4K units before `draw_overlay` ever sees it.
+        let frame = AnimFrame {
+            texture_x: 0,
+            texture_y: 0,
+            offset_x: 1,
+            offset_y: 1,
+            width: 8,
+            height: 8,
+        };
+        let bundle = mainsd_bytes(&solid_bc1_dds(8, 8, 0xF800), None, frame);
+
+        // images.dat's `grp` column (image 0, 1-based) points at images.tbl entry 0.
+        let mut dats = synthetic_parts(5, 0, 0, 0, None);
+        dats.3[0..4].copy_from_slice(&1u32.to_le_bytes());
+        dats.5 = build_tbl(&["test.grp"]);
+
+        let mut with_grp = preview_source(AssetTier::Sd, 0x001F, dats.clone());
+        with_grp.insert(AssetRequest::MainSdAnim, bundle.clone());
+        // A 20x16 SD-pixel GRP header -- larger, and off-centre relative to, the frame's own
+        // 8x8 extent, so the override provably changes placement rather than coincidentally
+        // agreeing with the fallback.
+        with_grp.insert(
+            AssetRequest::Grp {
+                path: "test.grp".to_string(),
+            },
+            grp_header_bytes(1, 20, 16),
+        );
+
+        // No `AssetRequest::Grp` asset at all: `grp_path` still resolves a path, but the fetch
+        // itself misses, so `sd_grp_canvas` must fall back cleanly (not fail the whole render).
+        let mut fallback = preview_source(AssetTier::Sd, 0x001F, dats);
+        fallback.insert(AssetRequest::MainSdAnim, bundle);
+
+        let units = [unit(5, Some(11), 64, 64)];
+        let render = |source: &MemorySource| {
+            render_preview(
+                &terrain,
+                Tileset::Jungle,
+                &units,
+                &[],
+                &PlayerColors::default(),
+                source,
+                &opts,
+            )
+            .unwrap()
+        };
+        let with_grp_image = render(&with_grp);
+        let fallback_image = render(&fallback);
+
+        assert_ne!(
+            with_grp_image.data, fallback_image.data,
+            "a resolvable GRP header must actually change where the sprite lands"
+        );
+
+        let pixel = |image: &RgbaImage, x: u32, y: u32| -> [u8; 4] {
+            let o = (y as usize * 128 + x as usize) * 4;
+            image.data[o..o + 4].try_into().unwrap()
+        };
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        // Fallback: `effective_canvas`'s content-centering discards the frame's offset entirely
+        // (it always re-centres on the frame's own width/height -- see that function's docs), so
+        // this matches the offset-free placement math already proven by
+        // `sd_render_draws_unit_art_from_the_bundled_mainsd_anim`: an 8x8 sprite centred on
+        // (64, 64), top-left at (60, 60).
+        assert_eq!(
+            pixel(&fallback_image, 60, 60),
+            red,
+            "fallback: top-left corner at the offset-free position"
+        );
+        assert_eq!(
+            pixel(&fallback_image, 55, 57),
+            blue,
+            "fallback: not shifted"
+        );
+
+        // Override: canvas (4K units) is (80, 64) from the 20x16 GRP header; frame_origin's
+        // centring math (`offset - canvas/2`) at zoom 1 gives x = 64 + (4 - 40)/4 = 55,
+        // y = 64 + (4 - 32)/4 = 57 -- an 8x8 tile covering x 55..=62, y 57..=64.
+        assert_eq!(
+            pixel(&with_grp_image, 55, 57),
+            red,
+            "override: top-left corner shifted by the real GRP-derived canvas"
+        );
+        assert_eq!(
+            pixel(&with_grp_image, 67, 67),
+            blue,
+            "override: the fallback's bottom-right corner is no longer covered"
+        );
     }
 
     /// The SD `teamcolor` layer's non-DDS "BMP " mask (see [`parse_teamcolor_mask`]) actually
@@ -2829,6 +3002,7 @@ mod tests {
             AssetTier::Hd2,
             ArtPack::Standard,
             1.0,
+            &game_data(),
         );
 
         let requested_ids: Vec<u16> = counting
@@ -2899,7 +3073,11 @@ mod tests {
         );
 
         // An Original unit layer dedupes every image (0, 176, and the start location's 588
-        // alike) down to the single bundled `mainSD.anim` request.
+        // alike) down to the single bundled `mainSD.anim` request -- and, since `game_data()`'s
+        // fixture leaves every `images.dat` `grp` column zeroed, `grp_path` never resolves, so no
+        // `AssetRequest::Grp` is added either (the "no grp path" half of that coverage; see
+        // `required_preview_graphics_for_sd_includes_grp_requests_where_resolvable` for the
+        // "has a grp path" half).
         let original = RenderOptions {
             unit_style: Some(ArtStyle::Original),
             ..opts
@@ -2907,6 +3085,45 @@ mod tests {
         assert_eq!(
             required_preview_graphics(&units, &[], &data, 64, 64, &original),
             vec![AssetRequest::MainSdAnim]
+        );
+    }
+
+    /// The other half of the SD-prefetch coverage above: when `images.dat`/`images.tbl` do
+    /// resolve a classic GRP for a distinct art image, `required_preview_graphics` must include an
+    /// [`AssetRequest::Grp`] for it (deduplicated, `MainSdAnim` first) -- but only for images that
+    /// actually resolve one, not for every image indiscriminately.
+    #[test]
+    fn required_preview_graphics_for_sd_includes_grp_requests_where_resolvable() {
+        // Every unit/sprite resolves to image 0 (the fixture's convention -- see
+        // `gamedata::tests::synthetic_parts`), which gets a real grp path; the start location's
+        // image (588) is untouched, so its grp column stays zeroed.
+        let mut parts = synthetic_parts(0, 0, 0, 0, None);
+        parts.3[0..4].copy_from_slice(&1u32.to_le_bytes()); // images.dat[0].grp = 1 (1-based)
+        parts.5 = build_tbl(&["terran\\marine.grp"]);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        let units = [
+            unit(0, Some(11), 1, 1),
+            unit(UNIT_ID_START_LOCATION, Some(0), 900, 900),
+        ];
+        let opts = RenderOptions {
+            unit_style: Some(ArtStyle::Original),
+            start_locations: StartLocations::Sprite,
+            max_dimension: Some(1024),
+            unit_filter: UnitFilter::AsPlaced,
+            ..Default::default()
+        };
+
+        let requests = required_preview_graphics(&units, &[], &data, 64, 64, &opts);
+        assert_eq!(
+            requests,
+            vec![
+                AssetRequest::MainSdAnim,
+                AssetRequest::Grp {
+                    path: "terran\\marine.grp".to_string(),
+                },
+            ],
+            "{requests:?}"
         );
     }
 
@@ -2923,8 +3140,13 @@ mod tests {
             ..Default::default()
         };
         let assets = crate::required_preview_assets(Tileset::Jungle, 64, 64, &opts);
-        assert_eq!(assets.len(), 7, "2 terrain + 4 dats + images.rel");
+        assert_eq!(
+            assets.len(),
+            8,
+            "2 terrain + 4 dats + images.rel + images.tbl"
+        );
         assert!(assets.contains(&AssetRequest::ImagesRel));
+        assert!(assets.contains(&AssetRequest::ImagesTbl));
 
         // Previously-omitted case: Original units with start locations hidden/sprite-drawn (no
         // ColorBlock token to size). The tables are still included now — an SD unit layer needs
@@ -2937,7 +3159,7 @@ mod tests {
             };
             assert_eq!(
                 crate::required_preview_assets(Tileset::Jungle, 64, 64, &original).len(),
-                7,
+                8,
                 "{no_color_block:?}"
             );
         }
@@ -2951,7 +3173,7 @@ mod tests {
         };
         assert_eq!(
             crate::required_preview_assets(Tileset::Jungle, 64, 64, &original_colorblock).len(),
-            7,
+            8,
         );
     }
 

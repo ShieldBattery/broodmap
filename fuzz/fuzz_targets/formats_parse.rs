@@ -1,17 +1,19 @@
 #![no_main]
 
 use broodmap_formats::{
-    DdsVr4, Frame, parse_cv5, parse_dds, parse_flingy_dat, parse_images_dat, parse_images_rel,
-    parse_sprites_dat, parse_tbl, parse_units_dat, parse_vf4,
+    DdsVr4, Frame, parse_cv5, parse_dds, parse_flingy_dat, parse_grp_header, parse_images_dat,
+    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat, parse_vf4,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // All four parsers are cheap and permissive (garbage in, garbage/error out, never a panic):
+    // All these parsers are cheap and permissive (garbage in, garbage/error out, never a panic):
     // run each over the same bytes.
     let _ = parse_cv5(data);
     let _ = parse_vf4(data);
     let _ = parse_dds(data);
+    // Classic GRP: header-only parse (see broodmap-formats/src/grp.rs), just as cheap as the rest.
+    let _ = parse_grp_header(data);
 
     let Ok(vr4) = DdsVr4::parse(data) else {
         return;

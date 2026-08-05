@@ -14,6 +14,7 @@ pub mod cv5;
 pub mod dat;
 pub mod dds;
 pub mod dds_vr4;
+pub mod grp;
 pub mod mainsd;
 pub mod rel;
 pub mod tbl;
@@ -27,6 +28,7 @@ pub use dat::{
 };
 pub use dds::{DdsError, DdsFile, DdsFormat, parse_dds};
 pub use dds_vr4::{DdsVr4, DdsVr4Error, Frame, Palette};
+pub use grp::{GrpError, GrpHeader, parse_grp_header};
 pub use mainsd::{MainSdAnim, parse_teamcolor_mask};
 pub use rel::{ImagesRel, parse_images_rel};
 pub use tbl::{Tbl, parse_tbl};

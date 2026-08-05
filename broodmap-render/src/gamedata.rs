@@ -14,10 +14,18 @@
 //! THG2 entries start partway along that chain: "pure sprite" entries (doodads) are `sprites.dat`
 //! IDs, so they skip straight to the `sprites.dat` step, while "unit sprite" entries are unit IDs
 //! and take the full chain (matching how BW and `bw-chk` interpret the THG2 flags).
+//!
+//! A fifth table, `images.tbl` (an image id -> classic-GRP-filename string table), is also loaded
+//! here: it's not part of the unit/sprite resolution chain above, but SD (`ArtStyle::Original`)
+//! renders need it (with `images.dat`'s `grp` column) to locate the classic GRP whose header
+//! supplies the true canvas dimensions `mainSD.anim` itself can't — see [`GameData::grp_path`]
+//! and `broodmap_formats::grp`'s module docs.
+
+use std::borrow::Cow;
 
 use broodmap_formats::{
     FlingyDat, ImagesDat, ImagesRel, SpritesDat, UnitsDat, parse_flingy_dat, parse_images_dat,
-    parse_images_rel, parse_sprites_dat, parse_units_dat,
+    parse_images_rel, parse_sprites_dat, parse_tbl, parse_units_dat,
 };
 
 use crate::error::RenderError;
@@ -103,19 +111,26 @@ pub struct GameData {
     sprites: SpritesDat,
     images: ImagesDat,
     rel: ImagesRel,
+    /// Every `images.tbl` entry, decoded and owned up front (`Tbl<'a>` itself borrows from the
+    /// source bytes, which don't outlive a single `load` call, so this can't just hold a `Tbl`).
+    /// Indexed 0-based, matching `Tbl::get`; [`Self::grp_path`] applies `images.dat`'s 1-based
+    /// `grp` column offset.
+    images_tbl: Vec<String>,
 }
 
 impl GameData {
-    /// Reads and parses all five tables from `source`.
+    /// Reads and parses all six tables from `source`.
     ///
-    /// Unlike individual `.anim` files (whose absence just drops a drawable), these are
-    /// whole-file dependencies of the unit layer: a missing one is a [`RenderError`].
+    /// Unlike individual `.anim`/GRP files (whose absence just drops a drawable or a canvas
+    /// override), these are whole-file dependencies of the unit layer: a missing one is a
+    /// [`RenderError`].
     pub fn load(source: &dyn TilesetDataSource) -> Result<GameData, RenderError> {
         let units = source.read(&AssetRequest::Dat(DatKind::Units))?;
         let flingy = source.read(&AssetRequest::Dat(DatKind::Flingy))?;
         let sprites = source.read(&AssetRequest::Dat(DatKind::Sprites))?;
         let images = source.read(&AssetRequest::Dat(DatKind::Images))?;
         let rel = source.read(&AssetRequest::ImagesRel)?;
+        let images_tbl = source.read(&AssetRequest::ImagesTbl)?;
 
         Ok(GameData {
             units: parse_units_dat(units.as_ref()),
@@ -123,17 +138,21 @@ impl GameData {
             sprites: parse_sprites_dat(sprites.as_ref()),
             images: parse_images_dat(images.as_ref()),
             rel: parse_images_rel(rel.as_ref()),
+            images_tbl: parse_tbl_owned(images_tbl.as_ref()),
         })
     }
 
     /// Builds a [`GameData`] from already-parsed tables, for callers that fetched and parsed the
-    /// bytes themselves (prefetching WASM flows, tests).
+    /// bytes themselves (prefetching WASM flows, tests). `images_tbl` is every entry of
+    /// `images.tbl`, decoded and 0-indexed (e.g. via [`parse_tbl_owned`] over the raw bytes, or
+    /// [`broodmap_formats::Tbl::get`] over every index up to the file's own declared count).
     pub fn from_parts(
         units: UnitsDat,
         flingy: FlingyDat,
         sprites: SpritesDat,
         images: ImagesDat,
         rel: ImagesRel,
+        images_tbl: Vec<String>,
     ) -> GameData {
         GameData {
             units,
@@ -141,6 +160,7 @@ impl GameData {
             sprites,
             images,
             rel,
+            images_tbl,
         }
     }
 
@@ -247,6 +267,41 @@ impl GameData {
             .filter(|e| e.render_style == RENDER_STYLE_SHADOW)
             .map(|_| shadow_id)
     }
+
+    /// Resolves `image_id`'s classic GRP filename (an `images.tbl` string, backslash separators
+    /// and all -- see [`crate::source::AssetRequest::Grp`]), via `images.dat`'s `grp` column: a
+    /// 1-based index into `images.tbl`, `0` meaning "none". `None` if `image_id` is out of range,
+    /// its `grp` column is `0`, or the (0-based, `grp - 1`) index doesn't resolve to a real
+    /// `images.tbl` entry.
+    ///
+    /// Used only by SD (`ArtStyle::Original`) renders, to locate the classic GRP whose header
+    /// supplies the true canvas dimensions `mainSD.anim`'s own (always-zero) declared canvas
+    /// can't -- see `crate::overlay`'s SD canvas override and `broodmap_formats::grp`'s module
+    /// docs for the full story.
+    pub(crate) fn grp_path(&self, image_id: u16) -> Option<&str> {
+        let entry = self.images.entry(image_id)?;
+        if entry.grp == 0 {
+            return None;
+        }
+        let index = usize::try_from(entry.grp - 1).ok()?;
+        self.images_tbl.get(index).map(String::as_str)
+    }
+}
+
+/// Eagerly decodes every entry of a `.tbl` file (here, always `images.tbl`) into an owned
+/// `Vec<String>`, 0-indexed, so [`GameData`] can stay `'static`-owned rather than borrowing from
+/// the source bytes the way `broodmap_formats::Tbl<'a>` does. The entry count comes from the
+/// file's own leading `u16` (see `broodmap_formats::tbl`'s module docs) -- a hostile/huge count is
+/// naturally capped at `u16::MAX` entries, the same bound `Tbl`'s own offset table allocates to.
+pub(crate) fn parse_tbl_owned(data: &[u8]) -> Vec<String> {
+    let count = data
+        .get(0..2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    let tbl = parse_tbl(data);
+    (0..count)
+        .map(|i| tbl.get(i).map(Cow::into_owned).unwrap_or_default())
+        .collect()
 }
 
 #[cfg(test)]
@@ -254,11 +309,34 @@ pub(crate) mod tests {
     use super::*;
     use crate::source::MemorySource;
 
-    /// Raw bytes for the five tables: units, flingy, sprites, images, rel.
-    pub(crate) type DatBytes = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    /// Raw bytes for the six tables: units, flingy, sprites, images, rel, images.tbl.
+    pub(crate) type DatBytes = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
-    /// Builds the five tables such that unit `unit_id` resolves through the given chain, plus an
-    /// optional `images.rel` redirect on the final image.
+    /// Builds a minimal valid `.tbl` byte buffer (see `broodmap_formats::tbl`'s module docs for
+    /// the format) from a list of entries, matching that module's own test helper.
+    pub(crate) fn build_tbl(entries: &[&str]) -> Vec<u8> {
+        let header_size = 2 + entries.len() * 2;
+        let mut offsets = Vec::with_capacity(entries.len());
+        let mut strings_blob = Vec::new();
+        for s in entries {
+            offsets.push((header_size + strings_blob.len()) as u16);
+            strings_blob.extend_from_slice(s.as_bytes());
+            strings_blob.push(0);
+        }
+
+        let mut data = Vec::with_capacity(header_size + strings_blob.len());
+        data.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for offset in offsets {
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        data.extend_from_slice(&strings_blob);
+        data
+    }
+
+    /// Builds the five `.dat`/`.rel` tables such that unit `unit_id` resolves through the given
+    /// chain, plus an optional `images.rel` redirect on the final image, plus an empty (but
+    /// valid) `images.tbl` -- tests that need a real `grp_path` resolution poke the returned
+    /// `images.dat`/`images.tbl` bytes (indices 3 and 5) directly.
     pub(crate) fn synthetic_parts(
         unit_id: u16,
         flingy_id: u8,
@@ -293,17 +371,20 @@ pub(crate) mod tests {
             rel[off + 4..off + 8].copy_from_slice(&(to as u32).to_le_bytes());
         }
 
-        (units, flingy, sprites, images, rel)
+        let tbl = build_tbl(&[]);
+
+        (units, flingy, sprites, images, rel, tbl)
     }
 
     pub(crate) fn synthetic_source(parts: DatBytes) -> MemorySource {
-        let (units, flingy, sprites, images, rel) = parts;
+        let (units, flingy, sprites, images, rel, tbl) = parts;
         [
             (AssetRequest::Dat(DatKind::Units), units),
             (AssetRequest::Dat(DatKind::Flingy), flingy),
             (AssetRequest::Dat(DatKind::Sprites), sprites),
             (AssetRequest::Dat(DatKind::Images), images),
             (AssetRequest::ImagesRel, rel),
+            (AssetRequest::ImagesTbl, tbl),
         ]
         .into_iter()
         .collect()
@@ -354,8 +435,38 @@ pub(crate) mod tests {
             parse_sprites_dat(&parts.2),
             parse_images_dat(&parts.3),
             parse_images_rel(&parts.4),
+            parse_tbl_owned(&parts.5),
         );
         assert_eq!(data.unit_image(7), Some(600));
+    }
+
+    #[test]
+    fn grp_path_resolves_via_the_one_based_grp_column_and_the_tbl() {
+        let mut parts = synthetic_parts(0, 0, 0, 5, None);
+        // images.dat's `grp` column is first (a u32 per image); image 5's grp = 1 (1-based),
+        // pointing at images.tbl entry 0.
+        let grp_off = 5 * 4;
+        parts.3[grp_off..grp_off + 4].copy_from_slice(&1u32.to_le_bytes());
+        parts.5 = build_tbl(&["terran\\marine.grp"]);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(data.grp_path(5), Some("terran\\marine.grp"));
+        // grp == 0 means "none".
+        assert_eq!(data.grp_path(6), None);
+        // Out-of-range image id.
+        assert_eq!(data.grp_path(999), None);
+    }
+
+    #[test]
+    fn grp_path_is_none_when_the_grp_index_does_not_resolve_in_the_tbl() {
+        let mut parts = synthetic_parts(0, 0, 0, 5, None);
+        let grp_off = 5 * 4;
+        // grp = 3 (1-based -> tbl index 2), but the tbl only has one entry.
+        parts.3[grp_off..grp_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        parts.5 = build_tbl(&["terran\\marine.grp"]);
+        let data = GameData::load(&synthetic_source(parts)).unwrap();
+
+        assert_eq!(data.grp_path(5), None);
     }
 
     #[test]

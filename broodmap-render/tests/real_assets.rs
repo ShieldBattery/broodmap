@@ -10,7 +10,7 @@
 #![cfg(feature = "casc")]
 
 use broodmap::extract_chk_from_map;
-use broodmap_formats::MainSdAnim;
+use broodmap_formats::{MainSdAnim, parse_grp_header};
 use broodmap_render::{
     ArtStyle, AssetRequest, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
     render_chk_preview, render_terrain, required_preview_assets, required_preview_assets_for_chk,
@@ -411,4 +411,20 @@ fn original_style_renders_sd_units() {
         bundle.entry(345).is_ok(),
         "image 345 (the geyser's +1 variant) should resolve via the container's own reference"
     );
+
+    // Frame-table-equality regression anchor (see `broodmap_formats::grp`'s module docs): image
+    // 239 (marine's main art) must keep the same frame count as the classic GRP whose header
+    // supplies its SD canvas override -- if this ever drifts, `mainSD.anim`'s frame tables have
+    // stopped being the classic GRP frame tables verbatim, which the SD canvas fix depends on.
+    let marine_main = bundle.entry(239).expect("image 239 should resolve");
+    assert_eq!(marine_main.frame_count(), 229);
+
+    let marine_grp_bytes = source
+        .read(&AssetRequest::Grp {
+            path: "terran\\marine.grp".to_string(),
+        })
+        .expect("terran\\marine.grp should be readable from a real install");
+    let marine_grp = parse_grp_header(&marine_grp_bytes).expect("marine.grp header should parse");
+    assert_eq!(marine_grp.frame_count, 229);
+    assert_eq!((marine_grp.width, marine_grp.height), (64, 64));
 }

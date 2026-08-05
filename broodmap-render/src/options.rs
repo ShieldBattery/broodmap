@@ -210,18 +210,21 @@ pub(crate) fn resolve_unit_tier(options: &RenderOptions, px_per_tile: u32) -> (A
     (tier, style.pack())
 }
 
-/// The round-1 assets a preview render needs: the terrain assets, plus the `.dat`/`.rel` tables
-/// required to resolve placed units and THG2 sprites to image IDs.
+/// The round-1 assets a preview render needs: the terrain assets, plus the `.dat`/`.rel`/`.tbl`
+/// tables required to resolve placed units and THG2 sprites to image IDs (and, for SD renders,
+/// their classic-GRP canvas overrides).
 ///
 /// This is the first half of the two-round prefetch API (see `docs/render-design.md`, "Prefetch
-/// support"): which `.anim`/`mainSD.anim` art a map needs can only be known *after* these tables
-/// are loaded and the CHK's units are resolved through them, which is what
+/// support"): which `.anim`/`mainSD.anim`/GRP art a map needs can only be known *after* these
+/// tables are loaded and the CHK's units are resolved through them, which is what
 /// [`crate::required_preview_graphics`] does.
 ///
 /// The tables are always included: every unit layer (Original included, now that it draws from
 /// `mainSD.anim`) needs them to resolve unit/sprite art, and even a render with no units/sprites
 /// at all still uses `units.dat` to size the [`StartLocations::ColorBlock`] token from its
-/// placebox when that's the active start-location mode — which is the default.
+/// placebox when that's the active start-location mode — which is the default. `images.tbl` is
+/// included unconditionally too, the same as the `.dat` tables — uniformity beats a conditional
+/// load, and the file is small (~20 KB).
 pub fn required_preview_assets(
     tileset: Tileset,
     map_w: u32,
@@ -235,6 +238,7 @@ pub fn required_preview_assets(
         AssetRequest::Dat(DatKind::Sprites),
         AssetRequest::Dat(DatKind::Images),
         AssetRequest::ImagesRel,
+        AssetRequest::ImagesTbl,
     ]);
     assets
 }

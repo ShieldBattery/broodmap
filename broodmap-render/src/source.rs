@@ -72,6 +72,18 @@ pub enum AssetRequest {
     /// art packs, and the image id only indexes *into* this one file rather than selecting a
     /// path.
     MainSdAnim,
+    /// The image-id -> GRP filename table (`arr/images.tbl`), needed (together with
+    /// `images.dat`'s `grp` column) to locate the classic GRP file whose header supplies an SD
+    /// (`ArtStyle::Original`) render's true canvas dimensions — see [`AssetRequest::Grp`] and
+    /// `broodmap_formats::grp`'s module docs for why `mainSD.anim`'s own (always-zero) declared
+    /// canvas can't be used directly.
+    ImagesTbl,
+    /// A classic (pre-Remastered) GRP file, fetched in SD renders solely for its 6-byte header
+    /// (see [`broodmap_formats::parse_grp_header`]) — never its frame table or pixel data, which
+    /// `mainSD.anim` already supplies pre-decoded. `path` is the `images.tbl` string verbatim,
+    /// backslash path separators and all (e.g. `"terran\\marine.grp"`); [`Self::casc_path`]
+    /// converts it to the forward-slash CASC path.
+    Grp { path: String },
 }
 
 impl std::hash::Hash for AssetRequest {
@@ -106,6 +118,13 @@ impl std::hash::Hash for AssetRequest {
             }
             AssetRequest::MainSdAnim => {
                 5u8.hash(state);
+            }
+            AssetRequest::ImagesTbl => {
+                6u8.hash(state);
+            }
+            AssetRequest::Grp { path } => {
+                7u8.hash(state);
+                path.hash(state);
             }
         }
     }
@@ -149,6 +168,8 @@ impl AssetRequest {
                 ),
             },
             AssetRequest::MainSdAnim => "SD/mainSD.anim".to_string(),
+            AssetRequest::ImagesTbl => "arr/images.tbl".to_string(),
+            AssetRequest::Grp { path } => format!("unit/{}", path.replace('\\', "/")),
         }
     }
 }
@@ -404,6 +425,22 @@ mod tests {
         assert_eq!(anim(900, AssetTier::Sd, ArtPack::Carbot), "SD/mainSD.anim");
         assert_eq!(AssetRequest::MainSdAnim.casc_path(), "SD/mainSD.anim");
 
+        assert_eq!(AssetRequest::ImagesTbl.casc_path(), "arr/images.tbl");
+        assert_eq!(
+            AssetRequest::Grp {
+                path: "terran\\marine.grp".to_string(),
+            }
+            .casc_path(),
+            "unit/terran/marine.grp"
+        );
+        assert_eq!(
+            AssetRequest::Grp {
+                path: "neutral\\geyShad.grp".to_string(),
+            }
+            .casc_path(),
+            "unit/neutral/geyShad.grp"
+        );
+
         assert_eq!(
             AssetRequest::Dat(DatKind::Units).casc_path(),
             "arr/units.dat"
@@ -459,6 +496,13 @@ mod tests {
                 pack: ArtPack::Carbot,
             },
             AssetRequest::MainSdAnim,
+            AssetRequest::ImagesTbl,
+            AssetRequest::Grp {
+                path: "terran\\marine.grp".to_string(),
+            },
+            AssetRequest::Grp {
+                path: "neutral\\geyShad.grp".to_string(),
+            },
         ];
 
         let set: HashSet<&AssetRequest> = requests.iter().collect();
