@@ -22,7 +22,11 @@ minimap-style images) from Brood War maps using StarCraft: Remastered assets.
   format parsers.
 - Remastered assets are the primary target, deliberately: no known library today renders map
   previews with Remastered assets, so it is this project's defining feature. `ArtStyle::Original`
-  (SD) support follows, not leads (see phasing).
+  (SD) support follows, not leads (see phasing). (Postscript, phase 3: with the SD path complete,
+  `Original` became the *default* style — at preview output sizes the resampler discards most of
+  the HD art's extra resolution, the original art tiles better on open ground, and the SD asset
+  set is by far the cheapest to fetch. Remastered support remains the differentiating capability;
+  it's just opt-in rather than the default.)
 
 ## Non-goals
 

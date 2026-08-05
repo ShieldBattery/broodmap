@@ -55,7 +55,7 @@ struct RenderArgs {
 
     /// Art style to render. The asset resolution (HD vs. HD2 for the Remastered-family styles)
     /// is picked automatically from `--size`.
-    #[arg(long, value_enum, default_value_t = ArtStyleArg::Remastered)]
+    #[arg(long, value_enum, default_value_t = ArtStyleArg::Original)]
     style: ArtStyleArg,
 
     /// Art style for the unit/sprite layer, if it should differ from `--style` (e.g. Cartooned

@@ -69,9 +69,16 @@ impl ArtPack {
 pub enum ArtStyle {
     /// The original, 1.16.1-style art (re-packaged by Remastered as the `SD` tier — the only
     /// resolution this art exists at).
+    ///
+    /// The default: at preview output sizes the resampler discards most of the HD art's extra
+    /// resolution anyway, the original art tiles better on open ground (the HD megatile
+    /// variants differ less from one another, and the game hides the resulting repetition with
+    /// `.fol` foliage overlays this crate doesn't render), and the SD asset set is by far the
+    /// cheapest to fetch (one bundled `mainSD.anim` for every unit plus a ~7 MB tileset,
+    /// vs. per-image HD/HD2 anims and 15-59 MB tilesets).
+    #[default]
     Original,
     /// Remastered art (HD or HD2, picked from the requested output size).
-    #[default]
     Remastered,
     /// StarCraft: Cartooned art (the `Carbot/` asset pack). Ships the same HD/HD2 sizes as
     /// Remastered, with the tier picked the same way.
