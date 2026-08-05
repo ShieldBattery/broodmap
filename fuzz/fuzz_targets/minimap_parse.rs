@@ -111,7 +111,7 @@ fuzz_target!(|data: &[u8]| {
         });
     }
 
-    let (ppt_byte, _) = take_byte(cursor);
+    let (scale_byte, _) = take_byte(cursor);
 
     let mut colors = [PlayerColor::default(); 8];
     for (i, color) in colors.iter_mut().enumerate() {
@@ -124,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
         broodmap_render::UnitFilter::AsPlaced,
     ] {
         let options = MinimapOptions {
-            px_per_tile: ppt_byte as u32,
+            scale: scale_byte as u32,
             unit_filter,
             ..Default::default()
         };

@@ -370,8 +370,8 @@ fn write_minimap_parse_seed(seeds_root: &Path) {
             .expect("seed minimap table inputs should build successfully");
         assert_eq!(
             table.len(),
-            2 + 16 + 13 + 768,
-            "one CV5 group -> 16 unified tile ids"
+            2 + 16 * 4 + 768,
+            "one CV5 group -> 16 unified tile ids, 4 quadrant bytes each"
         );
     }
 
@@ -396,7 +396,7 @@ fn write_minimap_parse_seed(seeds_root: &Path) {
 
     // Trailing bytes for the render half: a 2x2 terrain grid (matching the checkerboard used
     // elsewhere in this file), 4 unit records and 4 sprite records (8 bytes each, matching the
-    // fuzz target's per-record layout), and a final `px_per_tile` byte.
+    // fuzz target's per-record layout), and a final `scale` byte.
     seed.push(1); // width byte: (1 % 8) + 1 == 2
     seed.push(1); // height byte: (1 % 8) + 1 == 2
     for tile_id in [0u16, 16, 16, 0] {
@@ -416,10 +416,10 @@ fn write_minimap_parse_seed(seeds_root: &Path) {
         seed.push(i as u8); // owner byte
         seed.push(0); // flags byte
     }
-    seed.push(4); // px_per_tile byte
+    seed.push(4); // scale byte
 
     // Sanity check: replay the render half through the real public API (mirroring the fuzz
-    // target's simple 2x2 terrain, no units/sprites, and a small px_per_tile) to make sure a
+    // target's simple 2x2 terrain, no units/sprites, and a small scale) to make sure a
     // structurally similar input renders without issue before committing the seed.
     let terrain = TerrainTileIds {
         width: 2,
@@ -453,7 +453,7 @@ fn write_minimap_parse_seed(seeds_root: &Path) {
         flags: SpriteFlags::empty(),
     }];
     let options = MinimapOptions {
-        px_per_tile: 4,
+        scale: 4,
         ..Default::default()
     };
     let image = render_minimap(
@@ -465,7 +465,8 @@ fn write_minimap_parse_seed(seeds_root: &Path) {
         None,
         &options,
     );
-    assert_eq!((image.width, image.height), (8, 8));
+    // 2x2 map -> M = 2 <= 64 -> native "Quad" mode, base 4x4; scale 4 -> 16x16 output.
+    assert_eq!((image.width, image.height), (16, 16));
 
     write_seed(&dir, "quartered.bin", &seed);
 }

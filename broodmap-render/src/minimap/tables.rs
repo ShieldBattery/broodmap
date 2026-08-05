@@ -3,13 +3,13 @@
 //! subcommand) and embedded via `include_bytes!` so runtime minimap rendering needs no game
 //! assets at all — just these small blobs, compiled into the crate.
 //!
-//! Blob layout (little-endian), matching `build_minimap_table`'s output exactly:
+//! Blob layout (little-endian):
 //!
 //! ```text
-//! [0..2)          u16   num_tile_ids            (= cv5 group count * 16)
-//! [2..2+n)        u8    palette index per CHK *unified* tile id   (n = num_tile_ids)
-//! [2+n..2+n+13)   u8    13 creep palette indices (creep group cv5[1], megatile slots 0..13)
-//! [2+n+13..+768)  u8    256 x [r,g,b] palette (from the tileset's .wpe)
+//! [0..2)          u16   num_tile_ids                 (= cv5 group count * 16)
+//! [2..2+4n)       u8    FOUR quadrant palette indices per tile id, in TL,TR,BL,BR order
+//!                       (minitiles 0,1,4,5, byte 55, flip ignored; missing lookup -> 0)
+//! [2+4n..+768)    u8    256 x [r,g,b] (the tileset's .wpe palette)
 //! ```
 //!
 //! [`table`] parses (and validates the lengths of) one of the embedded blobs; [`parse_table`] is
@@ -28,18 +28,18 @@ const DESERT: &[u8] = include_bytes!("tables/desert.bin");
 const ICE: &[u8] = include_bytes!("tables/ice.bin");
 const TWILIGHT: &[u8] = include_bytes!("tables/twilight.bin");
 
-/// Number of creep palette-index slots in a table blob (`cv5[1]`'s first 13 megatile slots).
-const CREEP_SLOTS: usize = 13;
+/// Quadrant palette indices stored per tile id: TL, TR, BL, BR.
+const QUADRANTS_PER_TILE: usize = 4;
 /// Byte size of the trailing 256-entry `[r, g, b]` palette.
 const PALETTE_BYTES: usize = 768;
 
-/// A parsed minimap color table: a tile id -> palette index map, 13 creep palette indices, and
-/// the 256-entry RGB palette they index into. Borrows from the embedded blob (or, in tests, a
+/// A parsed minimap color table: a tile id -> four quadrant palette indices map, plus the
+/// 256-entry RGB palette they index into. Borrows from the embedded blob (or, in tests, a
 /// synthetic one), so it's cheap to look up per-tileset each render.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MinimapTable<'a> {
-    indices: &'a [u8],
-    creep: &'a [u8; CREEP_SLOTS],
+    /// `QUADRANTS_PER_TILE` (4) palette-index bytes per unified tile id, TL/TR/BL/BR order.
+    quadrants: &'a [u8],
     palette: &'a [u8],
 }
 
@@ -55,29 +55,22 @@ impl<'a> MinimapTable<'a> {
         }
     }
 
-    /// The minimap color for a CHK *unified* tile id (creep flag already stripped — see
-    /// `broodmap::chk::terrain::TileId::id`). An id past the table's range (a tileset whose CV5
-    /// declares fewer groups than the map's tiles reference) resolves to palette index 0's color,
-    /// per `docs/render-design.md`'s degrade-to-index-0 rule.
-    pub(crate) fn tile_color(&self, unified_tile_id: u16) -> [u8; 3] {
-        let index = self
-            .indices
-            .get(unified_tile_id as usize)
-            .copied()
-            .unwrap_or(0);
-        self.color(index)
-    }
-
-    /// The minimap color for creep slot `slot` (0..13, see `crate::minimap`'s creep hash). Out of
-    /// range degrades to palette index 0's color, same as [`Self::tile_color`].
-    pub(crate) fn creep_color(&self, slot: usize) -> [u8; 3] {
-        let index = self.creep.get(slot).copied().unwrap_or(0);
+    /// The minimap color for one quadrant (`0` = TL, `1` = TR, `2` = BL, `3` = BR — see
+    /// `crate::minimap`'s module docs for the sampling rule) of a CHK *unified* tile id (creep
+    /// flag already stripped — see `broodmap::chk::terrain::TileId::id`). An out-of-range tile id
+    /// (a tileset whose CV5 declares fewer groups than the map's tiles reference) resolves to
+    /// palette index 0's color, per `docs/render-design.md`'s degrade-to-index-0 rule; so does an
+    /// out-of-range `quadrant` (never reached by this crate's own callers, which only ever pass
+    /// `0..4`, but kept safe rather than panicking).
+    pub(crate) fn quadrant_color(&self, unified_tile_id: u16, quadrant: usize) -> [u8; 3] {
+        let base = unified_tile_id as usize * QUADRANTS_PER_TILE;
+        let index = self.quadrants.get(base + quadrant).copied().unwrap_or(0);
         self.color(index)
     }
 }
 
 /// The committed minimap color table for `tileset`, or `None` if its embedded blob is malformed
-/// (shorter than its own declared length, or too short to hold a header/creep/palette at all).
+/// (shorter than its own declared length, or too short to hold a header/palette at all).
 pub(crate) fn table(tileset: Tileset) -> Option<MinimapTable<'static>> {
     let bytes = match tileset {
         Tileset::Badlands => BADLANDS,
@@ -96,68 +89,75 @@ pub(crate) fn table(tileset: Tileset) -> Option<MinimapTable<'static>> {
 /// own declared length demands — never a panic, matching every other parser in this workspace.
 pub(crate) fn parse_table(bytes: &[u8]) -> Option<MinimapTable<'_>> {
     let num_tile_ids = u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?) as usize;
-    let indices_end = 2usize.checked_add(num_tile_ids)?;
-    let creep_end = indices_end.checked_add(CREEP_SLOTS)?;
-    let palette_end = creep_end.checked_add(PALETTE_BYTES)?;
+    let quadrants_len = num_tile_ids.checked_mul(QUADRANTS_PER_TILE)?;
+    let quadrants_end = 2usize.checked_add(quadrants_len)?;
+    let palette_end = quadrants_end.checked_add(PALETTE_BYTES)?;
 
-    let indices = bytes.get(2..indices_end)?;
-    let creep: &[u8; CREEP_SLOTS] = bytes.get(indices_end..creep_end)?.try_into().ok()?;
-    let palette = bytes.get(creep_end..palette_end)?;
+    let quadrants = bytes.get(2..quadrants_end)?;
+    let palette = bytes.get(quadrants_end..palette_end)?;
 
-    Some(MinimapTable {
-        indices,
-        creep,
-        palette,
-    })
+    Some(MinimapTable { quadrants, palette })
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    /// Builds a synthetic table blob for tests: `num_tile_ids` indices (all set to `fill_index`),
-    /// 13 creep indices (all `creep_index`), and a 256-entry palette where palette index `i`
-    /// resolves to `[i, i, i]` (so a test can assert on a specific gray level to prove which
-    /// index actually got sampled).
-    pub(crate) fn synthetic_table_bytes(
-        num_tile_ids: u16,
-        fill_index: u8,
-        creep_index: u8,
-    ) -> Vec<u8> {
+    /// Builds a synthetic table blob from explicit per-tile quadrant indices (TL, TR, BL, BR),
+    /// with an identity palette (palette index `i` resolves to `[i, i, i]`) so a test can assert
+    /// on a specific gray level to prove which index actually got sampled.
+    pub(crate) fn synthetic_table_bytes_with_quadrants(entries: &[[u8; 4]]) -> Vec<u8> {
+        let num_tile_ids = entries.len() as u16;
         let mut data = Vec::new();
         data.extend_from_slice(&num_tile_ids.to_le_bytes());
-        data.extend(std::iter::repeat_n(fill_index, num_tile_ids as usize));
-        data.extend([creep_index; CREEP_SLOTS]);
+        for q in entries {
+            data.extend_from_slice(q);
+        }
         for i in 0..=u8::MAX {
             data.extend([i, i, i]);
         }
         data
     }
 
+    /// [`synthetic_table_bytes_with_quadrants`], with every quadrant of every tile id set to the
+    /// same `fill_index` — the common case for tests that don't care about quadrant-vs-quadrant
+    /// differences.
+    pub(crate) fn synthetic_table_bytes(num_tile_ids: u16, fill_index: u8) -> Vec<u8> {
+        synthetic_table_bytes_with_quadrants(&vec![[fill_index; 4]; num_tile_ids as usize])
+    }
+
     #[test]
     fn parses_a_well_formed_blob() {
-        let bytes = synthetic_table_bytes(4, 7, 9);
+        let bytes = synthetic_table_bytes(4, 7);
         let table = parse_table(&bytes).unwrap();
-        assert_eq!(table.tile_color(0), [7, 7, 7]);
-        assert_eq!(table.tile_color(3), [7, 7, 7]);
-        assert_eq!(table.creep_color(0), [9, 9, 9]);
+        assert_eq!(table.quadrant_color(0, 0), [7, 7, 7]);
+        assert_eq!(table.quadrant_color(3, 3), [7, 7, 7]);
         assert_eq!(table.color(200), [200, 200, 200]);
     }
 
     #[test]
+    fn quadrants_can_differ_within_a_tile() {
+        let bytes = synthetic_table_bytes_with_quadrants(&[[1, 2, 3, 4]]);
+        let table = parse_table(&bytes).unwrap();
+        assert_eq!(table.quadrant_color(0, 0), [1, 1, 1]);
+        assert_eq!(table.quadrant_color(0, 1), [2, 2, 2]);
+        assert_eq!(table.quadrant_color(0, 2), [3, 3, 3]);
+        assert_eq!(table.quadrant_color(0, 3), [4, 4, 4]);
+    }
+
+    #[test]
     fn out_of_range_tile_id_degrades_to_index_0() {
-        let bytes = synthetic_table_bytes(4, 7, 9);
+        let bytes = synthetic_table_bytes(4, 7);
         let table = parse_table(&bytes).unwrap();
         // Index 0's palette entry is [0, 0, 0] by `synthetic_table_bytes`'s construction.
-        assert_eq!(table.tile_color(999), [0, 0, 0]);
-        assert_eq!(table.creep_color(999), [0, 0, 0]);
+        assert_eq!(table.quadrant_color(999, 0), [0, 0, 0]);
     }
 
     #[test]
     fn truncated_blob_is_none() {
         assert!(parse_table(&[]).is_none());
         assert!(parse_table(&[4, 0]).is_none()); // claims 4 tile ids, has none
-        let mut bytes = synthetic_table_bytes(4, 7, 9);
+        let mut bytes = synthetic_table_bytes(4, 7);
         bytes.truncate(bytes.len() - 1);
         assert!(parse_table(&bytes).is_none());
     }
@@ -167,6 +167,25 @@ pub(crate) mod tests {
         // Before `gen-minimap-tables` has been run against a real install, the committed .bin
         // files are empty placeholders -- must degrade to `None`, never panic.
         assert!(parse_table(&[]).is_none());
+    }
+
+    #[test]
+    fn blob_with_fewer_than_four_bytes_per_tile_is_none() {
+        // A blob that only stores 1 byte per tile id (plus 13 unrelated trailing bytes and the
+        // palette) instead of the required 4: shorter than the header's declared `num_tile_ids`
+        // demands, so it must fail to parse rather than reading past its own quadrant section.
+        // (At `num_tile_ids <= 4` the size difference from a real table is small enough that
+        // this kind of blob could coincidentally still satisfy the length check; this uses a
+        // tile count large enough that can never happen, matching every real committed table.)
+        let num_tile_ids: u16 = 100;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&num_tile_ids.to_le_bytes());
+        bytes.extend(std::iter::repeat_n(7u8, num_tile_ids as usize)); // 1 byte per tile id
+        bytes.extend([9u8; 13]); // unrelated trailing bytes
+        for i in 0..=u8::MAX {
+            bytes.extend([i, i, i]);
+        }
+        assert!(parse_table(&bytes).is_none());
     }
 
     /// All 8 committed tables must parse and have a sane (nonzero) tile count once
@@ -188,11 +207,11 @@ pub(crate) mod tests {
             let Some(table) = table(tileset) else {
                 panic!(
                     "{tileset:?}: committed minimap table is missing/malformed -- run \
-                     `cargo run -p broodmap-cli -- gen-minimap-tables`"
+                     `cargo run -p broodmap-cli -- gen-minimap-tables` against a real install"
                 );
             };
             assert!(
-                !table.indices.is_empty(),
+                !table.quadrants.is_empty(),
                 "{tileset:?}: committed minimap table has zero tile ids"
             );
         }

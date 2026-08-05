@@ -121,9 +121,10 @@ struct MinimapArgs {
     #[arg(long, default_value = "minimap.png")]
     out: PathBuf,
 
-    /// Output pixels per map tile. The library default (`MinimapOptions::px_per_tile`) is 1 --
-    /// BW's own native minimap resolution -- but that's too small to eyeball on a modern
-    /// display, so the CLI defaults higher.
+    /// Integer upscale of the native minimap image (`MinimapOptions::scale`). BW's own minimap
+    /// is a small native texture (<= 128px per side) that the UI magnifies; the library default
+    /// is 1 (no upscale, the native size), but that's too small to eyeball on a modern display,
+    /// so the CLI defaults higher.
     #[arg(long, default_value_t = 4)]
     scale: u32,
 
@@ -131,10 +132,6 @@ struct MinimapArgs {
     /// preplaced player-owned units and clearing start-area spawns).
     #[arg(long)]
     as_placed: bool,
-
-    /// Don't substitute creep-group colors for creep-flagged tiles.
-    #[arg(long)]
-    no_creep: bool,
 
     /// How start locations are drawn. `sprite` behaves exactly like `block` here -- there's no
     /// art in this zero-asset render path.
@@ -313,8 +310,7 @@ fn minimap(args: MinimapArgs) -> Result<()> {
         .with_context(|| format!("failed to parse map file {}", args.map.display()))?;
 
     let options = MinimapOptions {
-        px_per_tile: args.scale,
-        show_creep: !args.no_creep,
+        scale: args.scale,
         start_locations: args.start_locations.into(),
         unit_filter: if args.as_placed {
             UnitFilter::AsPlaced
