@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use broodmap::extract_chk_from_map;
 use broodmap_render::{
     ArtStyle, CascSource, DirSource, GameData, MinimapOptions, Preview, RenderOptions, RgbaImage,
-    StartLocations, UnitFilter, build_minimap_table, render_chk_minimap, render_chk_preview,
-    render_terrain,
+    StartLocations, UnitFilter, build_minimap_table, compress_minimap_table, render_chk_minimap,
+    render_chk_preview, render_terrain,
 };
 
 /// Default SC:R install directory used when neither `--assets-dir` nor a custom install path is
@@ -390,12 +390,18 @@ fn gen_minimap_tables(args: GenMinimapTablesArgs) -> Result<()> {
 
         let table = build_minimap_table(&cv5, &vx4ex, &vr4, &wpe)
             .with_context(|| format!("failed to build the minimap table for {stem}"))?;
+        let blob = compress_minimap_table(&table);
 
         let out_path = args.out.join(format!("{stem}.bin"));
-        std::fs::write(&out_path, &table)
+        std::fs::write(&out_path, &blob)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
 
-        println!("{stem}: {} bytes -> {}", table.len(), out_path.display());
+        println!(
+            "{stem}: {} bytes ({} raw) -> {}",
+            blob.len(),
+            table.len(),
+            out_path.display()
+        );
     }
 
     Ok(())

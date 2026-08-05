@@ -13,9 +13,9 @@ use broodmap::extract_chk_from_map;
 use broodmap_formats::{MainSdAnim, parse_grp_header};
 use broodmap_render::{
     ArtStyle, AssetRequest, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
-    build_minimap_table, render_chk_preview, render_terrain, required_preview_assets,
-    required_preview_assets_for_chk, required_preview_graphics, required_preview_graphics_for_chk,
-    required_terrain_assets,
+    build_minimap_table, compress_minimap_table, render_chk_preview, render_terrain,
+    required_preview_assets, required_preview_assets_for_chk, required_preview_graphics,
+    required_preview_graphics_for_chk, required_terrain_assets,
 };
 
 fn scr_source() -> Option<CascSource> {
@@ -465,10 +465,11 @@ fn committed_jungle_minimap_table_matches_a_fresh_generation() {
 
     let fresh = build_minimap_table(&cv5, &vx4ex, &vr4, &wpe)
         .expect("a real install's assets should build a minimap table");
+    let fresh_blob = compress_minimap_table(&fresh);
 
     let committed = include_bytes!("../src/minimap/tables/jungle.bin");
     assert_eq!(
-        fresh.as_slice(),
+        fresh_blob.as_slice(),
         committed.as_slice(),
         "committed jungle.bin has drifted from a fresh `gen-minimap-tables` run -- regenerate \
          and commit the 8 tables"

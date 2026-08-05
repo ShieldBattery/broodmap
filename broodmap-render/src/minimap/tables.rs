@@ -3,7 +3,10 @@
 //! subcommand) and embedded via `include_bytes!` so runtime minimap rendering needs no game
 //! assets at all — just these small blobs, compiled into the crate.
 //!
-//! Blob layout (little-endian):
+//! The embedded `.bin` files are DEFLATE-compressed (the raw blobs are mostly repeated palette
+//! indices, so this shrinks them roughly ninefold). [`table`] inflates a tileset's blob on first
+//! use and caches the result, so only the tilesets a program actually renders are ever
+//! decompressed. The inflated bytes have this layout (little-endian):
 //!
 //! ```text
 //! [0..2)          u16   num_tile_ids                 (= cv5 group count * 16)
@@ -12,12 +15,15 @@
 //! [2+4n..+768)    u8    256 x [r,g,b] (the tileset's .wpe palette)
 //! ```
 //!
-//! [`table`] parses (and validates the lengths of) one of the embedded blobs; [`parse_table`] is
-//! the no-panic core so a malformed/truncated blob (which shouldn't happen for the committed
-//! files, but this stays permissive per `AGENTS.md`) degrades to `None` — `crate::minimap` then
+//! [`parse_table`] is the no-panic core reading that layout, so a malformed blob (a bad DEFLATE
+//! stream or a length shorter than the header demands) degrades to `None` — `crate::minimap` then
 //! renders black terrain for that tileset rather than failing the whole render.
 
+use std::sync::OnceLock;
+
 use broodmap::chk::tileset::Tileset;
+
+use crate::minimap::decompress_minimap_table;
 
 const BADLANDS: &[u8] = include_bytes!("tables/badlands.bin");
 const PLATFORM: &[u8] = include_bytes!("tables/platform.bin");
@@ -70,20 +76,36 @@ impl<'a> MinimapTable<'a> {
 }
 
 /// The committed minimap color table for `tileset`, or `None` if its embedded blob is malformed
-/// (shorter than its own declared length, or too short to hold a header/palette at all).
+/// (an invalid DEFLATE stream, or an inflated length too short to hold the header/palette). The
+/// blob is inflated on first use per tileset and the result cached, so repeat renders of the same
+/// tileset pay the decompression cost once.
 pub(crate) fn table(tileset: Tileset) -> Option<MinimapTable<'static>> {
-    let bytes = match tileset {
-        Tileset::Badlands => BADLANDS,
-        Tileset::SpacePlatform => PLATFORM,
-        Tileset::Installation => INSTALL,
-        Tileset::Ashworld => ASHWORLD,
-        Tileset::Jungle => JUNGLE,
-        Tileset::Desert => DESERT,
-        Tileset::Arctic => ICE,
-        Tileset::Twilight => TWILIGHT,
-    };
-    parse_table(bytes)
+    let (slot, compressed) = compressed_blob(tileset);
+    let inflated = INFLATED[slot]
+        .get_or_init(|| decompress_minimap_table(compressed))
+        .as_deref()?;
+    parse_table(inflated)
 }
+
+/// The compressed blob and its [`INFLATED`] cache slot for each tileset. The slot indices are
+/// private to this pairing (they only key the decompression cache), so they need no relation to
+/// `Tileset`'s own discriminants.
+fn compressed_blob(tileset: Tileset) -> (usize, &'static [u8]) {
+    match tileset {
+        Tileset::Badlands => (0, BADLANDS),
+        Tileset::SpacePlatform => (1, PLATFORM),
+        Tileset::Installation => (2, INSTALL),
+        Tileset::Ashworld => (3, ASHWORLD),
+        Tileset::Jungle => (4, JUNGLE),
+        Tileset::Desert => (5, DESERT),
+        Tileset::Arctic => (6, ICE),
+        Tileset::Twilight => (7, TWILIGHT),
+    }
+}
+
+/// Per-tileset cache of inflated table bytes, filled lazily by [`table`]. `None` in a slot means
+/// that tileset's embedded blob failed to inflate.
+static INFLATED: [OnceLock<Option<Vec<u8>>>; 8] = [const { OnceLock::new() }; 8];
 
 /// Parses a table blob (see the module docs for the layout). `None` for anything shorter than its
 /// own declared length demands — never a panic, matching every other parser in this workspace.

@@ -153,6 +153,7 @@ dependencies = [
  "broodcasc",
  "broodmap",
  "broodmap-formats",
+ "miniz_oxide 0.8.9",
  "png",
  "thiserror",
 ]

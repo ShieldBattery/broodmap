@@ -147,6 +147,27 @@ pub fn build_minimap_table(
     Ok(out)
 }
 
+/// The DEFLATE level used to pack the committed table blobs. Highest level for the smallest
+/// committed size; decompression speed doesn't depend on it, and the level is fixed so the
+/// compressed bytes stay reproducible (the drift guard compares them byte-for-byte).
+const TABLE_DEFLATE_LEVEL: u8 = 10;
+
+/// DEFLATE-compresses a raw table blob (as [`build_minimap_table`] returns) into the form stored
+/// on disk under `src/minimap/tables/*.bin` and embedded via `include_bytes!`. The blobs are
+/// mostly repeated palette indices, so this shrinks them roughly ninefold. Used by the
+/// `gen-minimap-tables` tool to write the committed files and by the drift guard to check them;
+/// [`decompress_minimap_table`] is the inverse applied at load.
+pub fn compress_minimap_table(raw: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(raw, TABLE_DEFLATE_LEVEL)
+}
+
+/// Inflates a committed table blob back to the raw layout [`tables::parse_table`] reads. `None`
+/// if the bytes aren't valid DEFLATE (a corrupted embedded file — treated like any other
+/// malformed table, degrading to no minimap colors rather than panicking).
+pub(crate) fn decompress_minimap_table(compressed: &[u8]) -> Option<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec(compressed).ok()
+}
+
 /// Resolves a CHK unified tile id to its four quadrant (TL/TR/BL/BR) minimap palette indices:
 /// `t >> 4` picks the CV5 group, `t & 15` the megatile within it, then
 /// [`sample_megatile_palette_index`] for each of [`QUADRANT_MINITILE_INDEX`]. A missing group (an

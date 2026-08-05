@@ -49,7 +49,8 @@ pub use gamedata::GameData;
 pub use image::PngEncodeError;
 pub use image::RgbaImage;
 pub use minimap::{
-    MinimapOptions, RESOURCE_MINIMAP_COLOR, build_minimap_table, render_chk_minimap, render_minimap,
+    MinimapOptions, RESOURCE_MINIMAP_COLOR, build_minimap_table, compress_minimap_table,
+    render_chk_minimap, render_minimap,
 };
 pub use options::{
     DEFAULT_MAX_OUTPUT_PIXELS, RenderOptions, StartLocations, UnitFilter, required_preview_assets,
