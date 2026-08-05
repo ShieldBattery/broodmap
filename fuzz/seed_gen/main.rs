@@ -11,6 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use broodmap::Chk;
+use broodmap::chk::placed_units::{PlacedUnit, UnitInstanceId, UnitState};
+use broodmap::chk::player_colors::{PlayerColor, PlayerColors};
+use broodmap::chk::sprites::{Sprite, SpriteFlags};
 use broodmap::chk::terrain::{TerrainTileIds, TileId};
 use broodmap::chk::tileset::Tileset;
 use broodmap::extract_chk_from_map;
@@ -19,7 +22,8 @@ use broodmap_formats::{
     parse_images_rel, parse_sprites_dat, parse_tbl, parse_teamcolor_mask, parse_units_dat,
 };
 use broodmap_render::{
-    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, RenderOptions, render_terrain,
+    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, MinimapOptions, RenderOptions,
+    build_minimap_table, render_minimap, render_terrain,
 };
 
 /// Seeds (and CHKs extracted from map seeds) larger than this are skipped.
@@ -118,6 +122,7 @@ fn main() {
     write_render_terrain_seed(&seeds_root);
     write_anim_parse_seed(&seeds_root);
     write_mainsd_parse_seed(&seeds_root);
+    write_minimap_parse_seed(&seeds_root);
 
     println!("done");
 }
@@ -330,6 +335,139 @@ fn write_render_terrain_seed(seeds_root: &Path) {
         .expect("seed render_terrain input should render successfully");
 
     write_seed(&dir, "checkerboard.bin", &seed);
+}
+
+/// Writes a synthetic (not Blizzard-derived) seed for the `minimap_parse` target: four
+/// equal-length, well-formed quarters (a valid CV5 entry, VX4EX entry, VR4 bitmap, WPE palette --
+/// exactly `build_minimap_table`'s four inputs), followed by trailing bytes for a small terrain
+/// grid plus a few unit/sprite records, matching that target's own byte-splitting scheme.
+fn write_minimap_parse_seed(seeds_root: &Path) {
+    let dir = seeds_root.join("minimap_parse");
+    fs::create_dir_all(&dir).expect("create minimap_parse seed dir");
+
+    // A single CV5 group (group 0) whose megatile 0 points at VX4EX entry 0's minitile[0],
+    // which points at VR4 bitmap 0, whose byte 55 (palette index 5) is colored by the WPE
+    // palette -- exercises the full sampling chain, not just the degrade-to-0 fallback path.
+    let mut mega_tiles = [0u16; 16];
+    mega_tiles[0] = 0;
+    let mut cv5 = make_cv5_entry(0, 0, mega_tiles);
+
+    let mut vx4ex = Vec::new();
+    let raw = 0u32 << 1; // vr4 index 0, no flip
+    vx4ex.extend_from_slice(&raw.to_le_bytes());
+    for _ in 1..16 {
+        vx4ex.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    let mut vr4 = [0u8; 64];
+    vr4[55] = 5;
+
+    let mut wpe = vec![0u8; 1024];
+    wpe[5 * 4..5 * 4 + 3].copy_from_slice(&[10, 20, 30]);
+
+    {
+        let table = build_minimap_table(&cv5, &vx4ex, &vr4, &wpe)
+            .expect("seed minimap table inputs should build successfully");
+        assert_eq!(
+            table.len(),
+            2 + 16 + 13 + 768,
+            "one CV5 group -> 16 unified tile ids"
+        );
+    }
+
+    // Pad the four quarters to equal length (matching `write_render_terrain_seed`'s pattern) so
+    // the fuzz target's `data.len() / 4` split lands exactly on each boundary -- every parser
+    // involved ignores trailing bytes, so this doesn't change what any of them parse.
+    let target_len = [cv5.len(), vx4ex.len(), vr4.len(), wpe.len()]
+        .into_iter()
+        .max()
+        .unwrap();
+    let mut vr4 = vr4.to_vec();
+    cv5.resize(target_len, 0);
+    vx4ex.resize(target_len, 0);
+    vr4.resize(target_len, 0);
+    wpe.resize(target_len, 0);
+
+    let mut seed = Vec::new();
+    seed.extend(&cv5);
+    seed.extend(&vx4ex);
+    seed.extend(&vr4);
+    seed.extend(&wpe);
+
+    // Trailing bytes for the render half: a 2x2 terrain grid (matching the checkerboard used
+    // elsewhere in this file), 4 unit records and 4 sprite records (8 bytes each, matching the
+    // fuzz target's per-record layout), and a final `px_per_tile` byte.
+    seed.push(1); // width byte: (1 % 8) + 1 == 2
+    seed.push(1); // height byte: (1 % 8) + 1 == 2
+    for tile_id in [0u16, 16, 16, 0] {
+        seed.extend_from_slice(&tile_id.to_le_bytes());
+    }
+    for i in 0..4u16 {
+        seed.extend_from_slice(&i.to_le_bytes()); // unit_id
+        seed.extend_from_slice(&(i * 32).to_le_bytes()); // x
+        seed.extend_from_slice(&(i * 32).to_le_bytes()); // y
+        seed.push(i as u8); // owner byte
+        seed.push(0); // state byte
+    }
+    for i in 0..4u16 {
+        seed.extend_from_slice(&i.to_le_bytes()); // sprite id
+        seed.extend_from_slice(&(i * 32).to_le_bytes()); // x
+        seed.extend_from_slice(&(i * 32).to_le_bytes()); // y
+        seed.push(i as u8); // owner byte
+        seed.push(0); // flags byte
+    }
+    seed.push(4); // px_per_tile byte
+
+    // Sanity check: replay the render half through the real public API (mirroring the fuzz
+    // target's simple 2x2 terrain, no units/sprites, and a small px_per_tile) to make sure a
+    // structurally similar input renders without issue before committing the seed.
+    let terrain = TerrainTileIds {
+        width: 2,
+        height: 2,
+        tiles: vec![TileId(0), TileId(16), TileId(16), TileId(0)],
+    };
+    let mut colors = [PlayerColor::default(); 8];
+    for (i, color) in colors.iter_mut().enumerate() {
+        *color = PlayerColor::Indexed(i as u8);
+    }
+    let player_colors = PlayerColors { colors };
+    let units = [PlacedUnit {
+        instance_id: UnitInstanceId(0),
+        x: 32,
+        y: 32,
+        unit_id: 0,
+        owner: Some(0),
+        hp_percent: None,
+        shield_percent: None,
+        energy_percent: None,
+        resource_amount: None,
+        hangar_count: None,
+        state: UnitState::empty(),
+        linked_id: None,
+    }];
+    let sprites = [Sprite {
+        id: 0,
+        x: 32,
+        y: 32,
+        owner: 0,
+        flags: SpriteFlags::empty(),
+    }];
+    let options = MinimapOptions {
+        px_per_tile: 4,
+        ..Default::default()
+    };
+    let image = render_minimap(
+        &terrain,
+        Tileset::Jungle,
+        &units,
+        &sprites,
+        &player_colors,
+        None,
+        &options,
+    );
+    assert_eq!((image.width, image.height), (8, 8));
+
+    write_seed(&dir, "quartered.bin", &seed);
 }
 
 /// Builds a single 52-byte CV5 tile-group entry, matching `broodmap-formats/src/cv5.rs`'s layout.
@@ -872,10 +1010,16 @@ fn make_mainsd_seed() -> Vec<u8> {
         data.extend(std::iter::repeat_n(0u8, MAINSD_ENTRY_HEADER_SIZE));
 
         let layer_records_pos = data.len();
-        data.extend(std::iter::repeat_n(0u8, num_layers * MAINSD_LAYER_RECORD_SIZE));
+        data.extend(std::iter::repeat_n(
+            0u8,
+            num_layers * MAINSD_LAYER_RECORD_SIZE,
+        ));
 
         let frame_arr_offset = data.len();
-        data.extend(std::iter::repeat_n(0u8, frames.len() * MAINSD_FRAME_RECORD_SIZE));
+        data.extend(std::iter::repeat_n(
+            0u8,
+            frames.len() * MAINSD_FRAME_RECORD_SIZE,
+        ));
         for (fi, frame) in frames.iter().enumerate() {
             let fo = frame_arr_offset + fi * MAINSD_FRAME_RECORD_SIZE;
             data[fo..fo + 2].copy_from_slice(&frame.texture_x.to_le_bytes());
@@ -935,11 +1079,17 @@ fn write_mainsd_parse_seed(seeds_root: &Path) {
     let sd_bytes = make_mainsd_seed();
     {
         let sd_anim = MainSdAnim::parse(&sd_bytes).expect("seed mainSD.anim should parse");
-        assert_eq!(sd_anim.num_entries(), 2, "seed mainSD.anim should round-trip");
+        assert_eq!(
+            sd_anim.num_entries(),
+            2,
+            "seed mainSD.anim should round-trip"
+        );
 
         let real = sd_anim.entry(0).expect("real entry should resolve");
         assert_eq!(real.frame_count(), 2);
-        let diffuse = real.layer("diffuse").expect("diffuse layer should be present");
+        let diffuse = real
+            .layer("diffuse")
+            .expect("diffuse layer should be present");
         parse_dds(diffuse.data).expect("seed diffuse layer should parse as DDS");
         let teamcolor = real
             .layer("teamcolor")
