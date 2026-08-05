@@ -418,18 +418,26 @@ minimap at a small **native** resolution and the UI magnifies that. Pinned by re
 **Native resolution.** The native image is always `<= 128` px per side, `M = max(map_w, map_h)`
 in tiles:
 
-- **`M <= 64`**: `native_ppt = 2` — every tile becomes a 2x2 native block. The four pixels of
-  that block sample **four distinct minitiles** of the tile's 4x4 minitile grid: TL = minitile
-  `[0]`, TR = `[1]`, BL = `[4]`, BR = `[5]` (the grid's own top-left 2x2 quadrant). This
-  multi-sampling is what avoids a dark-speckle artifact a single-sample-per-tile scheme would
-  produce once upscaled.
-- **`65 <= M <= 128`**: `native_ppt = 1` — one native pixel per tile, minitile `[0]` (TL) only.
-- **`M > 128`**: subsampled — one native pixel per 2x2 *tile* block, taken from the top-left
-  tile's minitile `[0]`. Base dims `ceil(map_w/2) x ceil(map_h/2)`.
+Every tile carries **four quadrant samples** — minitiles `[0]`, `[1]`, `[4]`, `[5]` of its 4x4
+minitile grid (the grid's top-left 2x2). How they feed the native pixels depends on `M`:
+
+- **`M <= 64`**: `native_ppt = 2` — every tile becomes a 2x2 native block showing the four
+  quadrants **distinctly** (TL/TR/BL/BR), so a small map renders at full sample detail.
+- **`65 <= M <= 128`**: `native_ppt = 1` — one native pixel per tile, colored by the **mean** of
+  the tile's four quadrants.
+- **`M > 128`**: subsampled — one native pixel per 2x2 *tile* block, colored by the mean over
+  every quadrant of the (up to four) tiles in the block. Base dims `ceil(map_w/2) x ceil(map_h/2)`.
+
+Averaging once a tile collapses to a single native pixel is a deliberate departure from the game,
+which samples a single quadrant there. At the game's ~128px minimap size a lone dark quadrant
+texel (a crevice/edge pixel in the art) is one invisible pixel; under this crate's magnification
+it would paint a whole tile dark, so the mean is used instead — landing at the same per-tile color
+density the game shows, minus the magnified speckle. (`Original`-default renders of 128-tile
+melee maps like Lost Temple are the case this matters for.)
 
 **Per-minitile sampling.** Look the minitile up in VX4(EX), ignoring the horizontal-flip bit (the
 game's minimap path deliberately doesn't apply it), then sample byte 55 (row 6, col 7) of that
-minitile's 8x8 VR4 bitmap; the resulting palette index, through WPE, is the pixel's color. The
+minitile's 8x8 VR4 bitmap; the resulting palette index, through WPE, is the sample's color. The
 real game also runs the palette index through a small runtime remap LUT that could not be
 recovered (built at runtime, not present in static data); empirically, using the index directly
 (an identity LUT) matches the real minimap closely — a documented, minor, known divergence.

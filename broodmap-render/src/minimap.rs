@@ -18,19 +18,28 @@
 //! at output resolution; it builds a small native "texture" (at most 128px per side) and the UI
 //! magnifies that. The native size depends on `M = max(map_w, map_h)` in tiles:
 //!
-//! - **`M <= 64`**: `native_ppt = 2` — every tile becomes a 2x2 block of native pixels, and the
-//!   four pixels of that block sample four *distinct* minitiles of the tile's 4x4 minitile grid:
-//!   TL = minitile `[0]`, TR = minitile `[1]`, BL = minitile `[4]`, BR = minitile `[5]` (the
-//!   grid's own top-left 2x2 quadrant). This multi-sampling is what removes the dark-speckle
-//!   artifact a naive single-sample-per-tile upscale produces.
-//! - **`65 <= M <= 128`**: `native_ppt = 1` — one native pixel per tile, minitile `[0]` (TL).
-//! - **`M > 128`**: subsampled — one native pixel per 2x2 *tile* block, taken from the top-left
-//!   tile of each block's minitile `[0]`. The native image is always `<= 128` px per side.
+//! Each tile carries four quadrant samples — minitiles `[0]`, `[1]`, `[4]`, `[5]` of its 4x4
+//! minitile grid (the grid's top-left 2x2), each sampled at byte 55 (see below). How those four
+//! feed the native pixels depends on the map's size:
+//!
+//! - **`M <= 64`**: `native_ppt = 2` — every tile becomes a 2x2 block of native pixels showing
+//!   the four quadrants *distinctly* (TL/TR/BL/BR), so a small map renders at full sample detail.
+//! - **`65 <= M <= 128`**: `native_ppt = 1` — one native pixel per tile, colored by the **mean**
+//!   of the tile's four quadrants.
+//! - **`M > 128`**: subsampled — one native pixel per 2x2 *tile* block, colored by the mean over
+//!   every quadrant of the (up to four) tiles in the block. The native image is always `<= 128`
+//!   px per side.
+//!
+//! Averaging once a tile collapses to a single native pixel is a deliberate departure from the
+//! game, which samples a single quadrant there: at the game's own ~128px minimap size a lone dark
+//! quadrant texel (a crevice or edge pixel in the source art) is one invisible pixel, but under
+//! this crate's magnification it would paint a whole tile dark — the mean keeps that from
+//! happening while landing at the same per-tile color density the game shows.
 //!
 //! Per sampled minitile: look it up in VX4(EX) (the horizontal-flip bit is **ignored** — the
 //! game's minimap path deliberately doesn't apply it), then sample byte 55 (row 6, column 7) of
 //! that minitile's 8x8 VR4 bitmap; the resulting palette index, resolved through WPE, is the
-//! pixel's color. The real game also runs the resolved palette index through a small runtime
+//! sample's color. The real game also runs the resolved palette index through a small runtime
 //! remap LUT that could not be recovered (it's built at runtime, not present in static data);
 //! empirically, using the palette index directly (an identity LUT) matches the real minimap
 //! closely, so that's what this crate does — a documented, minor, known divergence.
@@ -263,11 +272,13 @@ impl Default for MinimapOptions {
 /// "BW's minimap algorithm" section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeMode {
-    /// `M <= 64`: every tile becomes a 2x2 native block sampling all four quadrants.
+    /// `M <= 64`: every tile becomes a 2x2 native block sampling all four quadrants distinctly.
     Quad,
-    /// `65 <= M <= 128`: one native pixel per tile, quadrant 0 (TL).
+    /// `65 <= M <= 128`: one native pixel per tile, colored by the mean of the tile's four
+    /// quadrants (so a single dark quadrant texel can't dominate a whole tile once magnified).
     Single,
-    /// `M > 128`: one native pixel per 2x2 *tile* block, quadrant 0 of its top-left tile.
+    /// `M > 128`: one native pixel per 2x2 *tile* block, colored by the mean over every quadrant
+    /// of the (up to four) tiles in that block.
     Subsample,
 }
 
@@ -457,8 +468,7 @@ fn draw_terrain(
         NativeMode::Single => {
             for y in 0..map_h {
                 for x in 0..map_w {
-                    let tile_id = tile_id_at(terrain, x, y);
-                    let color = quadrant_pixel_color(table, tile_id, 0);
+                    let color = averaged_tile_color(table, tile_id_at(terrain, x, y));
                     set_native_pixel(base, x, y, color);
                 }
             }
@@ -466,13 +476,48 @@ fn draw_terrain(
         NativeMode::Subsample => {
             for by in 0..base.height {
                 for bx in 0..base.width {
-                    let tile_id = tile_id_at(terrain, bx * 2, by * 2);
-                    let color = quadrant_pixel_color(table, tile_id, 0);
+                    let mut acc = [0u32; 3];
+                    let mut count = 0u32;
+                    for (tx, ty) in [
+                        (bx * 2, by * 2),
+                        (bx * 2 + 1, by * 2),
+                        (bx * 2, by * 2 + 1),
+                        (bx * 2 + 1, by * 2 + 1),
+                    ] {
+                        if tx < map_w && ty < map_h {
+                            let c = averaged_tile_color(table, tile_id_at(terrain, tx, ty));
+                            for k in 0..3 {
+                                acc[k] += c[k] as u32;
+                            }
+                            count += 1;
+                        }
+                    }
+                    let color = [
+                        acc[0].checked_div(count).unwrap_or(0) as u8,
+                        acc[1].checked_div(count).unwrap_or(0) as u8,
+                        acc[2].checked_div(count).unwrap_or(0) as u8,
+                    ];
                     set_native_pixel(base, bx, by, color);
                 }
             }
         }
     }
+}
+
+/// The mean of a tile's four quadrant colors — the representative color for a tile that collapses
+/// to a single native pixel. Averaging keeps one dark quadrant texel (a crevice or edge pixel in
+/// the source art) from painting a whole tile dark once the native image is magnified, which a
+/// single-quadrant pick can't avoid.
+fn averaged_tile_color(table: &Option<MinimapTable<'_>>, tile_id: u16) -> [u8; 3] {
+    let mut acc = [0u32; 3];
+    for quadrant in 0..QUADRANT_MINITILE_INDEX.len() {
+        let c = quadrant_pixel_color(table, tile_id, quadrant);
+        for k in 0..3 {
+            acc[k] += c[k] as u32;
+        }
+    }
+    let n = QUADRANT_MINITILE_INDEX.len() as u32;
+    [(acc[0] / n) as u8, (acc[1] / n) as u8, (acc[2] / n) as u8]
 }
 
 /// The unified tile id (creep flag already masked off, see [`broodmap::chk::terrain::TileId::id`])
@@ -1018,8 +1063,9 @@ mod tests {
     }
 
     #[test]
-    fn single_mode_uses_only_the_tl_quadrant() {
-        // M = 65 -> Single mode: one native pixel per tile, quadrant 0 (TL) only.
+    fn single_mode_averages_the_four_quadrants() {
+        // M = 65 -> Single mode: one native pixel per tile, colored by the mean of its four
+        // quadrants. (9 + 2 + 3 + 4) / 4 = 4.
         let table_bytes = synthetic_table_bytes_with_quadrants(&[[9, 2, 3, 4]]);
         let table = tables::parse_table(&table_bytes).unwrap();
         let terrain = flat_terrain(65, 1);
@@ -1034,22 +1080,16 @@ mod tests {
             &MinimapOptions::default(),
         );
         assert_eq!((image.width, image.height), (65, 1));
-        assert_eq!(rgb(&image, 0, 0), [9, 9, 9]);
+        assert_eq!(rgb(&image, 0, 0), [4, 4, 4]);
     }
 
     #[test]
-    fn subsample_mode_uses_the_top_left_tile_of_each_2x2_block() {
-        // M = 130 -> Subsample mode: base_w = ceil(130 / 2) = 65. Every even-x tile carries a
-        // distinct quadrant-0 color; odd-x tiles (never sampled) carry a different one, proving
-        // the block's *top-left* tile -- not some average -- is what lands in the native pixel.
-        let mut entries = vec![[0u8; 4]; 130];
-        for (x, entry) in entries.iter_mut().enumerate() {
-            *entry = if x % 2 == 0 {
-                [(x / 2) as u8 + 1, 0, 0, 0]
-            } else {
-                [200, 0, 0, 0] // odd tiles: never sampled, deliberately different
-            };
-        }
+    fn subsample_mode_averages_every_tile_in_the_2x2_block() {
+        // M = 130 -> Subsample mode: base_w = ceil(130 / 2) = 65, one native pixel per 2x2 tile
+        // block. With height 1 each block covers two tiles (2*bx and 2*bx + 1). Give tile t
+        // all-equal quadrants = t, so each tile's own average is t and the block's is
+        // (2*bx + (2*bx + 1)) / 2 = 2*bx.
+        let entries: Vec<[u8; 4]> = (0..130u8).map(|t| [t; 4]).collect();
         let table_bytes = synthetic_table_bytes_with_quadrants(&entries);
         let table = tables::parse_table(&table_bytes).unwrap();
         let terrain = TerrainTileIds {
@@ -1069,12 +1109,13 @@ mod tests {
         );
         assert_eq!((image.width, image.height), (65, 1));
         for bx in 0..65u32 {
-            let expected = bx as u8 + 1;
+            let expected = (2 * bx) as u8;
             assert_eq!(
                 rgb(&image, bx, 0),
                 [expected, expected, expected],
-                "native pixel {bx} should sample tile {}'s TL quadrant",
-                bx * 2
+                "block {bx} should average tiles {} and {}",
+                2 * bx,
+                2 * bx + 1
             );
         }
     }
