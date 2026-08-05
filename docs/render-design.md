@@ -28,7 +28,9 @@ minimap-style images) from Brood War maps using StarCraft: Remastered assets.
 
 - The classic 1.16.1 pipeline (GRP + WPE palettes + VX4/VR4 minitile assembly, tunit.pcx
   remapping). We render exclusively from Remastered asset formats across all quality tiers. The
-  data-source seam leaves the door open if someone wants this later.
+  data-source seam leaves the door open if someone wants this later. (Reading a classic GRP's
+  6-byte *header* for its canvas dimensions — the SD placement anchor, see
+  `broodmap-formats/src/grp.rs` — is metadata lookup, not this pipeline.)
 - Animation: palette cycling, iscript playback, water/lava animation. Static first-frame renders
   only.
 - Parsing or executing `scripts/iscript.bin` in any form, including a VM-free static extraction
@@ -45,8 +47,8 @@ minimap-style images) from Brood War maps using StarCraft: Remastered assets.
 ```
 broodmap           CHK/MPQ parsing (unchanged)
 broodmap-formats   SC:R asset format parsers: CV5, VF4, VX4/VX4EX, VR4, WPE, .dds.vr4,
-                   .anim (HD + SD), .dat (units/sprites/flingy/images), .rel, .tbl, .lo,
-                   DDS container
+                   .anim (HD + SD mainSD), .dat (units/sprites/flingy/images), .rel, .tbl,
+                   .lo, DDS container, classic GRP (header only — SD canvas source)
 broodmap-render    data-source trait, BC decode -> RGBA, render plan, CPU rasterizer,
                    RenderOptions, minimap, encoders
 broodmap-cli       grows a real `render` subcommand (dogfood + manual testing)
@@ -113,7 +115,8 @@ Phase-2 facts pinned from neobrood + a real install (full specs live in the
   a non-sentinel ref means "load this image's art from ref_image's anim instead".
 - Anim paths: `{tier}anim/{pack}main_{id:03}.anim` (tier prefix ""/"HD2/", pack infix
   "Carbot/"; note the pack infix sits INSIDE anim/, unlike tilesets). `images.tbl` is NOT
-  needed for anim resolution — only for classic GRP/LO paths (phase 3+).
+  needed for anim resolution — but SD canvas resolution reads it (with `images.dat`'s grp
+  column) to locate classic GRP headers; see the `mainSD.anim` bullet below.
 - .anim container: 12 B header (magic ANIM, u8 scale, u8 type 1=SD/2=HD, layer/entry counts),
   fixed-size name table to 0x14C, frame-table header (count, ref_id, canvas w/h, table
   offset), per-layer 12 B texture records (absolute offset/size + dims, offset 0 = absent,
@@ -133,8 +136,18 @@ Phase-2 facts pinned from neobrood + a real install (full specs live in the
   table is separately authored in the file's own SD texel space (divisor 1, not 4K units —
   verified via DXT content bounding boxes and atlas coverage); the parser normalizes entries
   x4 into canonical 4K units so consumers treat them exactly like any other `Anim`. Canvas is
-  0x0 for all 999 entries — the `effective_canvas` per-frame fallback (below) is the rule for
-  SD, not the exception.
+  0x0 for all 999 entries; the true anchor turned out to be the **classic GRP header's
+  declared width/height** — `mainSD.anim`'s frame tables are the classic GRP frame tables
+  *verbatim* (byte-identical offsets/sizes across all 547 frames of 7 probed files), and BW
+  anchors a GRP frame at `pos - grp_w/2 + frame_offset`. The SD draw path therefore reads the
+  6-byte GRP header per image (image id -> `images.dat` grp column -> `images.tbl` path ->
+  `unit/...grp` in CASC; `AssetRequest::{ImagesTbl, Grp}`; header-only parser in
+  `broodmap-formats/src/grp.rs` — the classic GRP *pipeline* stays a non-goal) and falls back
+  to per-frame content centering (`effective_canvas`, below) only when the GRP can't be
+  resolved. Without the GRP canvas, shadows draw content-centered — i.e. perfectly hidden
+  behind their owners — which is how this was discovered. This also corrects the earlier note
+  that `images.tbl` was "not needed" for rendering: it wasn't for *anim resolution*, but SD
+  canvas resolution reads it.
 - Teamcolor compositing, pinned empirically in phase 2 (no reference implementation exists):
   the mask is the teamcolor layer's RED/grayscale channel, not alpha — all 155 teamcolor
   layers in the HD2 corpus are BC1 (no meaningful alpha; every diffuse layer is BC3). Blend is
@@ -154,69 +167,51 @@ Phase-2 facts pinned from neobrood + a real install (full specs live in the
 **Shadows.** In the real game, a unit/sprite's shadow is a separate image attached as an underlay
 by an iscript `imgul` opcode — a VM this library deliberately never implements or runs (see
 Non-goals). In its place, `show_shadows` (default on; `RenderOptions::show_shadows`, CLI
-`--no-shadows`) uses a data-only heuristic: a drawable's shadow art is `main_image_id + 1` (the
-PRE-`images.rel`-redirect ID, mirroring how the main image's own rendering metadata is looked
-up), gated on that slot's `images.dat` entry being flagged with BW's "shadow" draw style
-(`render_style == 10`; see `GameData::shadow_image_pre_redirect`). One case gets a hardcoded
-offset instead of `+1`: the vespene geyser (`unit_id == UNIT_ID_VESPENE_GEYSER`) uses `+2`,
-because its `+1` is a same-GRP art variant of the geyser itself (not a shadow) and its real
-shadow (`neutral\geyShad.grp`, verified against a real install) sits one slot further out. This
-mirrors the existing resource-specific stand-ins for iscript behavior this library doesn't run
-(mineral frame by amount, geyser frame by tileset — see `select_unit_frame`) rather than a
-general mechanism: units whose own turret/overlay image pushes their real shadow to `+2` are
-still not covered and simply get no shadow under `--as-placed` (accepted — melee, the default,
-drops preplaced player-owned units anyway, so this only shows up in UMS/`--as-placed` views).
-Applies uniformly to `UNIT`-chunk units, THG2 unit-sprites, and THG2 doodad sprites (the geyser
-special case only ever applies to the first two, since doodads carry no unit ID); start-location
-graphics never get a shadow. A shadow is emitted as its own [`Drawable`] carrying the owner's
-exact position, frame index and flip (shadow anim frame tables mirror their owner's directional
-tables), pushed immediately before the owner into the same painter-order sort key — genuine
-per-drawable ordering (not a global shadows-first pass), relying on `Vec::sort_by_key`'s
-stability to keep it immediately beneath its owner without a separate band. Compositing replaces
-the shadow anim's diffuse RGB with black and scales its alpha by a constant
-(`SHADOW_ALPHA_SCALE`, `overlay.rs`), calibrated visually to 0.5 (within the 0.4-0.6 range
-considered); no team color is ever applied to a shadow, and its tile-cache key is forced onto the
-no-teamcolor sentinel plus its own `is_shadow` bit, so every owner sharing a shadow image/frame/
-flip shares one cached tile. A missing shadow `.anim` (e.g. the Cartooned/Carbot pack, which does
-not ship every shadow image) is a silent per-drawable skip, exactly like a missing main-art anim
-— the owner still draws, just without its shadow.
+`--no-shadows`) uses exact data: `images.rel`'s `rel_type == 8` records mark every shadow image
+and name its parent (owner) image in `ref_image`. `GameData` inverts that table once at load into
+a parent -> shadow lookup (`shadow_image_pre_redirect`; 230 records, 218 distinct parents on a
+real install; the 12 parents with two records — obscure neutral pickups with `*Shad`/`*Sha2`
+variants and doodads listing one shadow GRP under two ids — take the lowest shadow id,
+deterministically). The lookup is tried with the main image's PRE-`images.rel`-redirect ID first
+(the ID that indexes `images.dat`) and falls back through the redirect, and the result is still
+gated on the shadow slot's `images.dat` `render_style == 10` ("shadow" draw style) as a
+belt-and-suspenders check: on real data the gate is a no-op (the type-8 set equals the
+render-style-10 set exactly, 230 = 230), so it exists purely so a hostile/malformed rel-vs-dat
+disagreement fails toward "no shadow" rather than tinting arbitrary art black. Applies uniformly
+to `UNIT`-chunk units, THG2 unit-sprites, and THG2 doodad sprites; start-location graphics never
+get a shadow. A shadow is emitted as its own [`Drawable`] carrying the owner's exact position,
+frame index and flip (shadow anim frame tables mirror their owner's directional tables), pushed
+immediately before the owner into the same painter-order sort key — genuine per-drawable ordering
+(not a global shadows-first pass), relying on `Vec::sort_by_key`'s stability to keep it
+immediately beneath its owner without a separate band. Compositing replaces the shadow anim's
+diffuse RGB with black and scales its alpha by a constant (`SHADOW_ALPHA_SCALE`, `overlay.rs`),
+calibrated visually to 0.5 (within the 0.4-0.6 range considered); no team color is ever applied
+to a shadow, and its tile-cache key is forced onto the no-teamcolor sentinel plus its own
+`is_shadow` bit, so every owner sharing a shadow image/frame/flip shares one cached tile. A
+missing shadow `.anim` (e.g. the Cartooned/Carbot pack, which does not ship every shadow image)
+is a silent per-drawable skip, exactly like a missing main-art anim — the owner still draws, just
+without its shadow. Note the SD interplay: a shadow only *lands* correctly because SD frames are
+anchored on their classic-GRP-header canvas (see the `mainSD.anim` facts above) — without a real
+canvas, shadow and owner both content-center on the same point and the shadow is drawn perfectly
+hidden behind its owner, which is exactly the bug that shipped briefly before the canvas fix.
 
-Verified against a real SC:R install before implementation: walking every unit ID (0..228) and
-THG2 sprite ID (0..517) through the resolution chain, 59.6% of units (81/127 non-building units,
-49/95 buildings, 6/6 critters) resolve a `+1` shadow under the gate. This was cross-checked
-against neobrood's generated iscript disassembly (`src/gamedata/generated/{image,iscript}.rs`,
-via a custom control-flow walker over its `ISCRIPT_ANIMS` tables) as a development-time oracle:
-of 745 resolved unit/sprite image IDs, the gate produces a real, wrong-image false positive in
-only 2 cases (a unit/sprite pair whose Init genuinely attaches a *different* image than `+1`);
-the rest of the gate's "no" and "yes-but-oracle-can't-confirm" cases are safe divergences —
-buildings mostly don't use this convention at all, units with a separate turret/overlay image
-push their real shadow to `+2` instead (the gate correctly declines to guess — still true after
-the geyser fix, since that's a hardcoded one-unit special case, not a general scan), and a large
-block of THG2 doodad/prop image pairs (contiguous main/shadow slots, correctly styled) show no
-*iscript*-driven attachment at all in the oracle, most likely because BW attaches those specific
-pairs outside `imgul` entirely rather than because the data pairing is wrong. Net effect: the
-heuristic never fabricates a shadow from an unrelated image beyond that 2-case margin, and its
-failure mode is under-coverage (some real shadows missed, most notably buildings and
-turret-bearing units), which is the safe direction for a heuristic that isn't running the real
-VM. The vespene geyser was the one exception worth hardcoding: user-visible (every melee map has
-geysers) and confirmed with certainty against real data (image 344 → `+1` 345, a render_style-0
-variant → `+2` 346, `neutral\geyShad.grp`, render_style 10). The oracle script and its
-cross-check are throwaway (not part of the crate or its tests) but the underlying real-data
-verification lives on as `GameData::tests::shadow_plus_one_convention_holds_broadly` and
-`GameData::tests::geyser_shadow_resolves_to_the_real_plus_two_image` (both gated on
-`BROODMAP_TEST_SCR_DIR`, like the rest of the real-install suite).
-
-*Possible upgrade discovered during the phase-3 `mainSD.anim` reversing (not yet implemented):*
-`images.rel`'s `rel_type == 8` records turn out to map every shadow image to its parent unit
-image — the set of type-8 records is exactly the set of `render_style == 10` images (230 = 230,
-verified on a real install), and the parent-to-shadow deltas they encode run past `+1` (172x +1,
-27x +2, 9x +3, plus +4/+10/+14 stragglers). Inverting that table would give an exact,
-data-driven parent -> shadow mapping with no heuristic at all: it would cover the buildings and
-turret-bearing units the `+1` convention misses, and retire both the `render_style` gate and the
-geyser's hardcoded `+2` (whose rel record — image 346, `rel_type 8`, `ref_image 344` — already
-encodes precisely what the special case hardcodes). Worth doing as its own change: it touches
-the calibrated shadow path, so it needs the usual visual verification pass, and a decision about
-parents with multiple shadow records.
+History, kept because it establishes why the table is trustworthy: the first implementation was a
+`+1`-slot heuristic (shadow conventionally lives at `main_image_id + 1`, gated on
+`render_style == 10`, with a hardcoded `+2` for the vespene geyser whose `+1` is an art variant
+of the geyser itself). It was verified against a real install (59.6% of units resolved a shadow:
+81/127 non-building units, 49/95 buildings, 6/6 critters) and cross-checked against neobrood's
+generated iscript disassembly as a development-time oracle — of 745 resolved unit/sprite image
+IDs, only 2 real false positives, with under-coverage (buildings, turret-bearing units whose
+shadow sits at `+2`) as the failure mode. The `rel_type == 8` table was then discovered during
+the phase-3 `mainSD.anim` reversing and replaced the heuristic outright: it agrees with
+everything the heuristic got right (172 of its 230 pairs are the `+1` cases; the geyser's record,
+346 -> 344, encodes precisely what the special case hardcoded), covers what the heuristic
+couldn't (the 46 non-`+1` parents are almost entirely building shadows — protoss nexus 179 ->
+182, terran control tower 63 -> 277, ...), and lifts real-install unit coverage from 59.6% to
+80.7% with no heuristic left. HD/HD2 per-image anims exist for the newly covered shadow images
+(spot-verified in CASC), so drawing them matches SC:R's own behavior in every art style. The
+real-data invariants live on as env-gated tests in `gamedata.rs` (type-8/render-style set
+equality, coverage floor, geyser 344 -> 346 straight from the table).
 
 Art style is the only user-facing quality knob: `ArtStyle { Original, Remastered, Cartooned }`.
 The SD art is genuinely different art from the HD art (HD2 is the same art as HD at half
@@ -247,6 +242,8 @@ pub enum AssetRequest {
   ImagesRel,
   Anim(u16, AssetTier),         // image ID (HD/HD2 per-image files)
   MainSdAnim,                   // the single bundled SD art container
+  Grp { path: String },         // classic GRP (images.tbl path) — 6-byte header only,
+                                // the SD canvas source
   // ...
 }
 
@@ -492,7 +489,9 @@ render plan computes up front; the executor walks it bandwise).
   and the empirical evidence live in `broodmap-formats/src/mainsd.rs`'s module docs, and the
   headline facts (entry directory, 12-byte reference entries, `"BMP "` teamcolor stencils,
   SD-texel — not 4K-unit — frame coordinates) are summarized in the phase-2/3 facts list
-  above.
+  above. The follow-up question of where SD placement *canvases* come from (every entry
+  declares 0x0) is also resolved — the classic GRP headers; see the facts list and
+  `broodmap-formats/src/grp.rs`.
 - ~~Downscaling quality~~ — resolved: see the "Terrain downscaling" section for the shipped
   pipeline (native-resolution strip compositing, linear-light Catmull-Rom resampling), the
   measurements behind the kernel choice, and the record of the texture-breakup experiment that
