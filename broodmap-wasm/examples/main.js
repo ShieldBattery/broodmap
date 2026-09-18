@@ -17,14 +17,21 @@ let renderRevision = 0
 let analysisRevision = 0
 let routeRevision = 0
 let obstacleRevision = 0
+let baseRevision = 0
+let baseRouteRevision = 0
 let renderInFlight = false
 let analysisInFlight = false
 let routeInFlight = false
 let obstacleInFlight = false
+let basesInFlight = false
+let baseRouteInFlight = false
 let renderStatusToken = 0
 let analysisStatusToken = 0
+let baseStatusToken = 0
 let terrain = null
 let route = null
+let baseDiscovery = null
+let baseRoute = null
 let selected = []
 const pending = new Map()
 
@@ -81,9 +88,42 @@ function clearCanvas(id) {
   canvas.height = 0
 }
 
+function resetBases() {
+  baseRevision++
+  baseRouteRevision++
+  baseDiscovery = null
+  baseRoute = null
+  basesInFlight = false
+  baseRouteInFlight = false
+  el('findBases').disabled = true
+  el('showBases').checked = true
+  el('showBases').disabled = true
+  el('baseControls').hidden = true
+  el('baseA').replaceChildren()
+  el('baseB').replaceChildren()
+  el('compareBases').disabled = true
+  el('baseMode').textContent = 'Find bases after terrain analysis.'
+  el('baseResult').textContent = 'Find bases after terrain analysis to inspect mineral fields.'
+  el('baseRouteResult').textContent = 'Choose two discovered bases to compare their anchors.'
+}
+
+function syncBaseControls() {
+  const pending = basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight
+  el('findBases').disabled = !terrain || pending
+  el('showBases').disabled = !baseDiscovery || basesInFlight || obstacleInFlight
+  el('baseControls').hidden = !baseDiscovery
+  const comparable = hasBasePair()
+  el('baseA').disabled = !baseDiscovery || pending
+  el('baseB').disabled = !baseDiscovery || pending
+  el('compareBases').disabled = !comparable || pending
+  el('respectObstacles').disabled = !terrain || pending
+  el('analyze').disabled = !mapInfo || pending
+}
+
 function resetTerrain() {
   routeRevision++
   obstacleRevision++
+  resetBases()
   terrain = null
   route = null
   selected = []
@@ -211,13 +251,14 @@ el('analyze').addEventListener('click', async () => {
     drawTerrainBackdrop()
     drawOverlay()
     el('routeResult').textContent = 'Click a walkable cell for A, then another for B.'
+    syncBaseControls()
     if (ownsStatus(analysisStatusToken)) status(`Terrain analyzed: ${terrain.widthWalkTiles}x${terrain.heightWalkTiles} walk cells; ${terrain.obstacleCount} static map blockers.`)
   } catch (error) {
     if (target === worker && revision === analysisRevision && ownsStatus(analysisStatusToken)) status(`Terrain analysis failed: ${error.message || error}`)
   } finally {
     if (target === worker) {
       analysisInFlight = false
-      if (mapInfo) el('analyze').disabled = false
+      syncBaseControls()
     }
   }
 })
@@ -228,7 +269,7 @@ el('opacity').addEventListener('input', () => {
   drawOverlay()
 })
 el('respectObstacles').addEventListener('change', async () => {
-  if (!terrain || obstacleInFlight) return
+  if (!terrain || obstacleInFlight || basesInFlight || baseRouteInFlight) return
   const enabled = el('respectObstacles').checked
   const target = worker
   const snapshot = terrain
@@ -237,8 +278,13 @@ el('respectObstacles').addEventListener('change', async () => {
   route = null
   selected = []
   obstacleInFlight = true
+  routeInFlight = false
+  baseRouteRevision++
+  baseRoute = null
+  el('baseRouteResult').textContent = 'Updating map obstacles...'
   el('respectObstacles').disabled = true
   el('analyze').disabled = true
+  syncBaseControls()
   const obstacleStatusToken = status('Updating map obstacles...')
   el('routeResult').textContent = 'Updating map obstacles...'
   drawOverlay()
@@ -264,6 +310,9 @@ el('respectObstacles').addEventListener('change', async () => {
       el('respectObstacles').disabled = false
       if (mapInfo && !analysisInFlight) el('analyze').disabled = false
       updateObstacleMode()
+      syncBaseControls()
+      if (hasBasePair()) requestBaseRoute()
+      else el('baseRouteResult').textContent = 'Choose two discovered bases to compare their anchors.'
     }
   }
 })
@@ -278,8 +327,146 @@ function updateObstacleMode() {
   }
 }
 
+function baseById(id) {
+  return baseDiscovery?.bases.find((base) => base.id === id) || null
+}
+
+function selectedBaseIds() {
+  if (!baseDiscovery) return []
+  return [el('baseA').value, el('baseB').value]
+    .map((value) => Number(value))
+    .filter((id) => Number.isInteger(id) && baseById(id))
+}
+
+function hasBasePair() {
+  const [a, b] = selectedBaseIds()
+  return Number.isInteger(a) && Number.isInteger(b) && a !== b && baseById(a).routeAnchor !== null && baseById(b).routeAnchor !== null
+}
+
+function baseLabel(base) {
+  const starts = base.startPlayers.length ? `, Start P${base.startPlayers.join(', P')}` : ''
+  const clearing = [
+    base.requiredMinerals.length ? `clear ${base.requiredMinerals.length} mineral patch(es)` : '',
+    base.requiredObstacles.length ? `clear ${base.requiredObstacles.length} building(s)` : '',
+    base.startClearedObstacles.length ? `startup clears ${base.startClearedObstacles.length} object(s)` : '',
+  ].filter(Boolean).map((text) => `, ${text}`).join('')
+  return `Base ${base.id + 1}: ${base.mineralCount} minerals, ${base.gasCount} gas${starts}${clearing}`
+}
+
+function populateBaseControls() {
+  const priorA = el('baseA').value
+  const priorB = el('baseB').value
+  const options = baseDiscovery.bases.map((base) => {
+    const option = document.createElement('option')
+    option.value = String(base.id)
+    option.textContent = baseLabel(base)
+    return option
+  })
+  el('baseA').replaceChildren(...options.map((option) => option.cloneNode(true)))
+  el('baseB').replaceChildren(...options)
+  const ids = baseDiscovery.bases.map((base) => String(base.id))
+  el('baseA').value = ids.includes(priorA) ? priorA : (ids[0] || '')
+  el('baseB').value = ids.includes(priorB) && priorB !== el('baseA').value
+    ? priorB
+    : (ids.find((id) => id !== el('baseA').value) || ids[0] || '')
+}
+
+function describeBases() {
+  const summary = baseDiscovery.bases.map((base) => `${baseLabel(base)}${base.routeAnchor === null ? ' (depot area currently blocked)' : ''}`)
+  if (baseDiscovery.unplacedClusters) summary.push(`${baseDiscovery.unplacedClusters} qualifying cluster(s) had no suitable depot footprint.`)
+  if (baseDiscovery.ignoredResources) summary.push(`${baseDiscovery.ignoredResources} unsupported, malformed, out-of-map, or duplicate resource(s) ignored.`)
+  el('baseResult').textContent = summary.join('\n') || 'No qualifying mineral fields found.'
+}
+
+el('findBases').addEventListener('click', async () => {
+  if (!terrain || basesInFlight || baseRouteInFlight || obstacleInFlight) return
+  const revision = ++baseRevision
+  baseRouteRevision++
+  baseRoute = null
+  const target = worker
+  const snapshot = terrain
+  basesInFlight = true
+  el('analyze').disabled = true
+  el('respectObstacles').disabled = true
+  syncBaseControls()
+  drawOverlay()
+  baseStatusToken = status('Finding resource bases...')
+  try {
+    const result = await callWorker('findBases', {})
+    if (target !== worker || snapshot !== terrain || revision !== baseRevision) return
+    baseDiscovery = result
+    populateBaseControls()
+    describeBases()
+    el('showBases').checked = true
+    el('baseMode').textContent = `Base footprints use the stock 4x3 depot heuristic (${result.elapsedMs} ms). Marked sites require clearing minerals or buildings. Start-site cleanup is conditional on that start being occupied. Current routes retain these objects.`
+    el('baseRouteResult').textContent = hasBasePair()
+      ? 'Choose Compare bases to route between the selected depot anchors.'
+      : 'Choose two different bases with currently accessible depot anchors to compare.'
+    drawOverlay()
+    if (ownsStatus(baseStatusToken)) status(`Found ${result.bases.length} base candidate(s) in ${result.elapsedMs} ms.`)
+  } catch (error) {
+    if (target === worker && snapshot === terrain && revision === baseRevision && ownsStatus(baseStatusToken)) {
+      status(`Base discovery failed: ${error.message || error}`)
+    }
+  } finally {
+    if (target === worker && snapshot === terrain && revision === baseRevision) {
+      basesInFlight = false
+      if (mapInfo && !analysisInFlight && !obstacleInFlight) el('analyze').disabled = false
+      if (terrain) el('respectObstacles').disabled = false
+      syncBaseControls()
+    }
+  }
+})
+
+async function requestBaseRoute() {
+  if (!terrain || basesInFlight || baseRouteInFlight || obstacleInFlight || !hasBasePair()) return
+  const [startId, endId] = selectedBaseIds()
+  const revision = ++baseRouteRevision
+  const target = worker
+  const snapshot = terrain
+  baseRouteInFlight = true
+  baseRoute = null
+  syncBaseControls()
+  drawOverlay()
+  el('baseRouteResult').textContent = `Comparing Base ${startId + 1} and Base ${endId + 1}...`
+  try {
+    const result = await callWorker('baseRoute', { startId, endId })
+    if (target !== worker || snapshot !== terrain || revision !== baseRouteRevision) return
+    baseRoute = result
+    const ground = result.groundDistancePixels === null
+      ? 'ground: disconnected'
+      : `ground: ${result.groundDistancePixels}px (${(result.groundDistancePixels / 32).toFixed(2)} tiles)`
+    el('baseRouteResult').textContent = `Base ${startId + 1} to Base ${endId + 1}: ${ground}; air: ${result.airDistancePixels.toFixed(1)}px (${(result.airDistancePixels / 32).toFixed(2)} tiles).`
+    drawOverlay()
+  } catch (error) {
+    if (target === worker && snapshot === terrain && revision === baseRouteRevision) {
+      el('baseRouteResult').textContent = `Base comparison failed: ${error.message || error}`
+    }
+  } finally {
+    if (target === worker && snapshot === terrain && revision === baseRouteRevision) {
+      baseRouteInFlight = false
+      syncBaseControls()
+    }
+  }
+}
+
+el('compareBases').addEventListener('click', requestBaseRoute)
+for (const id of ['baseA', 'baseB']) {
+  el(id).addEventListener('change', () => {
+    baseRouteRevision++
+    baseRoute = null
+    el('baseRouteResult').textContent = hasBasePair()
+      ? 'Choose Compare bases to route between the selected depot anchors.'
+      : 'Choose two different bases with currently accessible depot anchors to compare.'
+    syncBaseControls()
+    drawOverlay()
+  })
+}
+el('showBases').addEventListener('change', drawOverlay)
+
 el('resetRoute').addEventListener('click', () => {
   routeRevision++
+  routeInFlight = false
   selected = []
   route = null
   drawOverlay()
@@ -315,7 +502,7 @@ el('terrainOverlay').addEventListener('pointermove', (event) => {
 
 el('terrainOverlay').addEventListener('click', async (event) => {
   const cell = selectedOverlayCell(event)
-  if (!cell || routeInFlight || obstacleInFlight) return
+  if (!cell || routeInFlight || obstacleInFlight || basesInFlight) return
   if (!(cell.flags & 1)) {
     el('routeResult').textContent = `(${cell.x}, ${cell.y}) is blocked. Pick a resolved walkable cell.`
     return
@@ -335,7 +522,8 @@ el('terrainOverlay').addEventListener('click', async (event) => {
     return
   }
   routeInFlight = true
-  const revision = routeRevision
+  const revision = ++routeRevision
+  const snapshot = terrain
   const target = worker
   drawOverlay()
   try {
@@ -358,7 +546,7 @@ el('terrainOverlay').addEventListener('click', async (event) => {
   } catch (error) {
     if (target === worker && revision === routeRevision) el('routeResult').textContent = `Route failed: ${error.message || error}`
   } finally {
-    if (target === worker) routeInFlight = false
+    if (target === worker && snapshot === terrain && revision === routeRevision) routeInFlight = false
   }
 })
 
@@ -393,6 +581,49 @@ function overlayTexture(kind) {
   return scratch
 }
 
+function needsClearing(base) {
+  return base.requiredMinerals.length || base.requiredObstacles.length || base.startClearedObstacles.length
+}
+
+function drawBases(ctx, unit) {
+  if (!baseDiscovery || !el('showBases').checked) return
+  const selectedIds = new Set(selectedBaseIds())
+  const width = baseDiscovery.depotWidthTiles * 4
+  const height = baseDiscovery.depotHeightTiles * 4
+  ctx.save()
+  ctx.lineWidth = 2 * unit
+  ctx.font = `bold ${12 * unit}px system-ui`
+  for (const base of baseDiscovery.bases) {
+    const [tileX, tileY] = base.depotTile
+    const selectedBase = selectedIds.has(base.id)
+    ctx.strokeStyle = selectedBase ? '#ffe36e' : needsClearing(base) ? '#ffb84d' : '#75d8ff'
+    ctx.fillStyle = selectedBase ? '#fff2a0' : '#d6f4ff'
+    ctx.strokeRect(tileX * 4, tileY * 4, width, height)
+    ctx.fillText(`${base.id + 1}${needsClearing(base) ? '*' : ''}`, tileX * 4 + unit * 2, tileY * 4 + 12 * unit)
+    if (!selectedBase) continue
+    ctx.fillStyle = '#7ee6ff55'
+    ctx.strokeStyle = '#7ee6ff'
+    ctx.lineWidth = unit
+    for (const resource of base.resources) {
+      const [left, top, right, bottom] = resource.bounds
+      ctx.fillRect(left / 8, top / 8, (right - left) / 8, (bottom - top) / 8)
+      ctx.strokeRect(left / 8, top / 8, (right - left) / 8, (bottom - top) / 8)
+    }
+    ctx.strokeStyle = '#ff9d35'
+    ctx.fillStyle = '#ff9d3577'
+    const clearingBounds = [
+      ...base.requiredMinerals.map((resource) => resource.bounds),
+      ...base.requiredObstacles,
+      ...base.startClearedObstacles,
+    ]
+    for (const [left, top, right, bottom] of clearingBounds) {
+      ctx.fillRect(left / 8, top / 8, (right - left) / 8, (bottom - top) / 8)
+      ctx.strokeRect(left / 8, top / 8, (right - left) / 8, (bottom - top) / 8)
+    }
+  }
+  ctx.restore()
+}
+
 function drawOverlay() {
   if (!terrain) return
   const canvas = el('terrainOverlay')
@@ -406,6 +637,7 @@ function drawOverlay() {
   ctx.globalAlpha = Number(el('opacity').value) / 100
   ctx.drawImage(overlayTexture(el('overlay').value), 0, 0)
   ctx.globalAlpha = 1
+  drawBases(ctx, unit)
   const point = (cell) => [cell.x + 0.5, cell.y + 0.5]
   const radius = 4 * unit
   ctx.lineWidth = 2 * unit
@@ -435,6 +667,28 @@ function drawOverlay() {
     ctx.lineWidth = 3 * unit
     ctx.beginPath()
     route.points.forEach(([x, y], index) => {
+      if (index) ctx.lineTo(x + 0.5, y + 0.5)
+      else ctx.moveTo(x + 0.5, y + 0.5)
+    })
+    ctx.stroke()
+  }
+  if (baseRoute && hasBasePair()) {
+    const [a, b] = selectedBaseIds().map((id) => baseById(id).routeAnchor)
+    ctx.save()
+    ctx.strokeStyle = '#ffe3b2'
+    ctx.setLineDash([6 * unit, 4 * unit])
+    ctx.lineWidth = 2 * unit
+    ctx.beginPath()
+    ctx.moveTo(a[0] + 0.5, a[1] + 0.5)
+    ctx.lineTo(b[0] + 0.5, b[1] + 0.5)
+    ctx.stroke()
+    ctx.restore()
+  }
+  if (baseRoute?.points?.length) {
+    ctx.strokeStyle = '#ffb84d'
+    ctx.lineWidth = 3 * unit
+    ctx.beginPath()
+    baseRoute.points.forEach(([x, y], index) => {
       if (index) ctx.lineTo(x + 0.5, y + 0.5)
       else ctx.moveTo(x + 0.5, y + 0.5)
     })

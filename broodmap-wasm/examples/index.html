@@ -13,7 +13,7 @@
   button { cursor: pointer; padding: .3rem .7rem; }
   canvas { image-rendering: pixelated; }
   #preview, #minimap { max-width: 100%; height: auto; border: 1px solid #72869b88; }
-  #status, #hover, #routeResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
+  #status, #hover, #routeResult, #baseResult, #baseRouteResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
   .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
   .row > * { min-width: 0; }
   #terrainShell { position: relative; width: min(100%, 60rem); background: #080c11; border: 1px solid #72869b88; overflow: hidden; }
@@ -56,11 +56,22 @@
     <label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
     <span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
     <button id="resetRoute">Reset route</button>
+    <button id="findBases" disabled>Find bases</button>
+    <label><input id="showBases" type="checkbox" checked disabled> Show base footprints</label>
+    <span id="baseMode" class="note">Find bases after terrain analysis.</span>
+    <div id="baseControls" hidden>
+      <label>Base A: <select id="baseA" aria-label="Base A"></select></label>
+      <label>Base B: <select id="baseB" aria-label="Base B"></select></label>
+      <button id="compareBases">Compare bases</button>
+    </div>
   </div>
   <p class="legend"><span><i class="swatch" style="background:#2372bf"></i>elevation 0</span><span><i class="swatch" style="background:#39ad77"></i>elevation 1</span><span><i class="swatch" style="background:#e7c14a"></i>elevation 2</span></p>
   <div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div>
   <p id="hover">Move over the terrain view after analysis.</p>
   <p id="routeResult">Analyze terrain, then click two walkable cells.</p>
+  <p id="baseResult">Find bases after terrain analysis to inspect mineral fields.</p>
+  <p id="baseRouteResult">Choose two discovered bases to compare their anchors.</p>
+  <p class="note">Base discovery uses a stock 4x3 depot-footprint heuristic. Orange lines show ground routes; dashed lines show air distance. Terrain defines resource clusters. Sites marked * require clearing small mineral patches or overlapping buildings. Occupied starts clear overlapping objects automatically; current routes keep them present. Candidate scoring balances mineral and gas access. Full placement legality and mover clearance are not established.</p>
   <p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p>
 </section>
 

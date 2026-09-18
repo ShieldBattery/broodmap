@@ -40,6 +40,20 @@ Toggle walkability, static obstacles, elevation, terrain buildability, or ramps;
 Click two walkable cells to compare a ground route with the straight air-distance line.
 A third click starts a new route. Parsing, rendering, and routing run in a worker.
 
+Click **Find bases** to discover resource clusters and candidate depot footprints. Select **Base A**
+and **Base B**, then **Compare bases** for an orange ground route and dashed air-distance line.
+The obstacle toggle preserves base IDs and recomputes the selected comparison. Base labels include
+mineral/geyser counts and nearby start players; they do not assign main/natural roles.
+
+Discovery clusters resources by terrain connectivity and uses a stock 4x3 depot footprint.
+Candidate scoring accounts for static blockers and balances mineral and gas access. Sites marked
+`*` require clearing small mineral patches or overlapping buildings, highlighted in orange when
+selected. Exact start sites can clear overlapping objects automatically when occupied, including
+invincible ones. Current routes retain all these objects because this snapshot does not know the
+active starting assignments. Creep/power, full placement
+legality, and optimal gathering are not established. Small mineral groups may be omitted as bases,
+and qualifying clusters with no suitable site are reported.
+
 The routing model is an 8-pixel point grid with eight directions and no diagonal corner
 cutting. Resources and grounded neutral buildings from UNIT/THG2 block intersecting cells
 using caller-supplied units.dat collision bounds. It ignores moving units, mover sizes,
@@ -75,6 +89,15 @@ const analysis = map.analyzeMap(
 const flags = analysis.cellFlags() // row-major; see generated TypeScript docs for bit layout
 const route = JSON.parse(analysis.routeJson(10, 20, 30, 40)) // walk-cell coordinates
 // null groundDistancePixels means disconnected; invalid/blocked endpoints throw.
+const catalog = JSON.parse(analysis.findBasesJson('{}'))
+// Options: {depotWidthTiles:4,depotHeightTiles:3,maxMineralBlockerAmount:8}; unknown options throw.
+// Use maxMineralBlockerAmount:null, allowDestructibleClearing:false, and
+// allowStartObstacleClearing:false for strict current placement. See each base.requiredMinerals,
+// requiredObstacles, and startClearedObstacles.
+const bases = catalog.bases.filter(base => base.routeAnchor !== null)
+if (bases.length >= 2) {
+  const baseRoute = JSON.parse(analysis.baseRouteJson(bases[0].id, bases[1].id))
+}
 analysis.free()
 ```
 

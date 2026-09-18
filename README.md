@@ -6,9 +6,10 @@ files, and offers handling for the archive format (MPQ) as well as the internal 
 
 ## Terrain analysis experiment
 
-`broodmap-analysis` resolves terrain flags and computes routes around static map obstacles. The
-[WASM demo](broodmap-wasm/README.md) shows overlays and compares ground and air distances.
-See the [design and limitations](docs/analysis-design.md) for the path toward base and wall analysis.
+`broodmap-analysis` resolves terrain flags, suggests resource-base locations, and computes routes
+around static map obstacles. The [WASM demo](broodmap-wasm/README.md) shows overlays and compares
+ground and air distances between points or base candidates. See the
+[design and limitations](docs/analysis-design.md) for the heuristics and path toward wall analysis.
 
 ## WIP
 

@@ -159,5 +159,17 @@ async function handle({ id, type, ...payload }) {
     post(id, JSON.parse(analysis.routeJson(payload.startX, payload.startY, payload.endX, payload.endY)))
     return
   }
+  if (type === 'findBases') {
+    if (!analysis) throw new Error('Analyze terrain before finding bases.')
+    const started = performance.now()
+    const result = JSON.parse(analysis.findBasesJson('{}'))
+    post(id, { ...result, elapsedMs: Math.round(performance.now() - started) })
+    return
+  }
+  if (type === 'baseRoute') {
+    if (!analysis) throw new Error('Analyze terrain before comparing bases.')
+    post(id, JSON.parse(analysis.baseRouteJson(payload.startId, payload.endId)))
+    return
+  }
   throw new Error(`Unknown worker request: ${type}`)
 }

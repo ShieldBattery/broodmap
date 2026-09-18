@@ -8,6 +8,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::MapRenderer;
 
+mod bases;
+
 #[wasm_bindgen]
 impl MapRenderer {
     /// The CV5 and VF4 paths, in that order. Fetch these and pass their bytes to
@@ -60,6 +62,7 @@ impl MapRenderer {
         analysis.obstructed = Some(analysis.grid.with_obstacles(&obstacles));
         analysis.obstacle_count = obstacles.len();
         analysis.respect_obstacles = true;
+        analysis.base_inputs = Some(bases::BaseInputs::new(units, sprites, &definitions));
         Ok(analysis)
     }
 
@@ -86,6 +89,8 @@ impl MapRenderer {
             obstructed: None,
             respect_obstacles: false,
             obstacle_count: 0,
+            base_inputs: None,
+            base_catalog: None,
         })
     }
 }
@@ -98,6 +103,8 @@ pub struct TerrainAnalysis {
     obstructed: Option<TerrainGrid>,
     respect_obstacles: bool,
     obstacle_count: usize,
+    base_inputs: Option<bases::BaseInputs>,
+    base_catalog: Option<bases::BaseCatalog>,
 }
 
 #[derive(serde::Serialize)]
@@ -294,6 +301,8 @@ mod tests {
             obstructed: None,
             respect_obstacles: false,
             obstacle_count: 0,
+            base_inputs: None,
+            base_catalog: None,
         };
         assert_eq!(analysis.cell_flags(), [23, 22, 23]);
         let unreachable: serde_json::Value =
