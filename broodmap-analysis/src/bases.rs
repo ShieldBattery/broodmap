@@ -1098,7 +1098,8 @@ struct ScoringScratch {
     epoch: u32,
     seen: Vec<u32>,
     distances: Vec<u32>,
-    queue: BinaryHeap<Reverse<(u32, u32, u32, usize)>>,
+    // Row-major cell indices preserve the (y, x) tie order without storing both coordinates.
+    queue: BinaryHeap<Reverse<(u32, usize)>>,
 }
 
 impl ScoringScratch {
@@ -1132,9 +1133,9 @@ impl ScoringScratch {
             }
             self.seen[index] = self.epoch;
             self.distances[index] = 0;
-            self.queue.push(Reverse((0, start.y, start.x, index)));
+            self.queue.push(Reverse((0, index)));
         }
-        while let Some(Reverse((cost, _, _, index))) = self.queue.pop() {
+        while let Some(Reverse((cost, index))) = self.queue.pop() {
             if self.seen[index] != self.epoch || self.distances[index] != cost {
                 continue;
             }
@@ -1150,8 +1151,7 @@ impl ScoringScratch {
                 }
                 self.seen[next_index] = self.epoch;
                 self.distances[next_index] = next_cost;
-                self.queue
-                    .push(Reverse((next_cost, next.y, next.x, next_index)));
+                self.queue.push(Reverse((next_cost, next_index)));
             }
         }
     }

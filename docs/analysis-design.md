@@ -250,6 +250,9 @@ depot is actually spawned; a map's start marker alone does not establish removal
 
 ## Validation and next checkpoints
 
+The [base discovery profiling checkpoint](analysis-performance.md) records native/browser
+latency, memory measurements, the installed-map inventory, and a repeatable native harness.
+
 Synthetic tests cover table/index resolution, global row layout across megatiles, aggregate
 walkability thresholds, creep, malformed inputs, diagonal pinches, deterministic ties,
 disconnection, and route cost versus an independent Dijkstra reference. WASM tests exercise
