@@ -12,6 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 broodmap = { version = "0.1.0", path = "../broodmap" }
+broodmap-analysis = { version = "0.1.0", path = "../broodmap-analysis" }
+broodmap-formats = { version = "0.1.0", path = "../broodmap-formats" }
 # No default features: `fs` (DirSource) is meaningless in a browser; assets arrive through
 # MemorySource via the two-round prefetch. `png` gives Blob-friendly output, `serde` the plan.
 broodmap-render = { version = "0.1.0", path = "../broodmap-render", default-features = false, features = [

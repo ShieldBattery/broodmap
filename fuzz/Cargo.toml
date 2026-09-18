@@ -16,6 +16,9 @@ path = "../broodmap"
 [dependencies.broodmap-formats]
 path = "../broodmap-formats"
 
+[dependencies.broodmap-analysis]
+path = "../broodmap-analysis"
+
 [dependencies.broodmap-render]
 path = "../broodmap-render"
 default-features = false
@@ -79,6 +82,13 @@ bench = false
 [[bin]]
 name = "plan_execute"
 path = "fuzz_targets/plan_execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terrain_analyze"
+path = "fuzz_targets/terrain_analyze.rs"
 test = false
 doc = false
 bench = false

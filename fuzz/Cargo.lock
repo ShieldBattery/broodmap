@@ -39,6 +39,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "broodmap-analysis"
+version = "0.1.0"
+dependencies = [
+ "broodmap",
+ "broodmap-formats",
+ "thiserror",
+]
+
+[[package]]
 name = "broodmap-formats"
 version = "0.1.0"
 dependencies = [
@@ -51,6 +60,7 @@ name = "broodmap-fuzz"
 version = "0.0.0"
 dependencies = [
  "broodmap",
+ "broodmap-analysis",
  "broodmap-formats",
  "broodmap-render",
  "libfuzzer-sys",

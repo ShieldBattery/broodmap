@@ -1,4 +1,4 @@
-//! Browser bindings for broodmap's preview renderer: parse a map, learn which assets it needs
+//! Browser bindings for broodmap's preview renderer and terrain analysis: parse a map, learn which assets it needs
 //! (the two-round prefetch API), feed fetched bytes back in, render.
 //!
 //! The render core is sync while browser fetches are async, so the flow is
@@ -16,6 +16,13 @@
 //! const image = map.renderRgba(opts); // or renderPng(opts) / minimapPng(opts) / planJson(opts)
 //! ```
 //!
+//! Analysis is independent of artwork: `requiredMapAnalysisAssets()` names CV5, VF4, and
+//! units.dat for `analyzeMap(cv5, vf4, units)`, returning an owned [`TerrainAnalysis`] snapshot.
+//! Use `cellFlags()` for overlays and `routeJson()` for point-grid routes; `setObstaclesEnabled()`
+//! switches between static map obstacles and terrain alone. `requiredAnalysisAssets()` and
+//! `analyzeTerrain(cv5, vf4)` provide the terrain-only subset. These methods accept bytes directly,
+//! without `addAsset`, and do not establish exact engine pathing or building placement legality.
+//!
 //! Asset keys are the CASC catalog paths (`AssetRequest::casc_path`), which double as URL
 //! suffixes: a directory produced by `broodmap-cli fetch-assets` served statically is a
 //! complete asset origin. Assets that fail to fetch can simply be skipped — a missing anim/GRP
@@ -26,6 +33,10 @@
 //! "startLocations": "block"|"sprite"|"hidden", "asPlaced": false, "showCritters": true,
 //! "showResources": true, "showDoodads": true, "showNeutralBuildings": true,
 //! "showShadows": true, "terrainOnly": false, "scale": 4 }` (`scale` is minimap-only).
+
+mod analysis;
+
+pub use analysis::TerrainAnalysis;
 
 use std::collections::HashMap;
 

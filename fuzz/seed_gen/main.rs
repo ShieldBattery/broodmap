@@ -18,8 +18,9 @@ use broodmap::chk::terrain::{TerrainTileIds, TileId};
 use broodmap::chk::tileset::Tileset;
 use broodmap::extract_chk_from_map;
 use broodmap_formats::{
-    Anim, DdsVr4, Frame, MainSdAnim, parse_cv5, parse_dds, parse_flingy_dat, parse_images_dat,
-    parse_images_rel, parse_sprites_dat, parse_tbl, parse_teamcolor_mask, parse_units_dat,
+    Anim, DdsVr4, Frame, MainSdAnim, MiniTileFlags, TileGroupFlags, parse_cv5, parse_dds,
+    parse_flingy_dat, parse_images_dat, parse_images_rel, parse_sprites_dat, parse_tbl,
+    parse_teamcolor_mask, parse_units_dat,
 };
 use broodmap_render::{
     ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, MinimapOptions, PlannedBlock,
@@ -125,6 +126,7 @@ fn main() {
     write_mainsd_parse_seed(&seeds_root);
     write_minimap_parse_seed(&seeds_root);
     write_plan_execute_seed(&seeds_root);
+    write_terrain_analyze_seeds(&seeds_root);
 
     println!("done");
 }
@@ -1241,6 +1243,37 @@ fn write_mainsd_parse_seed(seeds_root: &Path) {
         );
     }
     write_seed(&dir, "sd_bundle_valid.bin", &sd_bytes);
+}
+
+/// Writes compact synthetic seeds for terrain analysis. These contain no game assets: the first
+/// seed has one walkable CV5/VF4 tile and the second deliberately exercises malformed dimensions.
+fn write_terrain_analyze_seeds(seeds_root: &Path) {
+    let dir = seeds_root.join("terrain_analyze");
+    fs::create_dir_all(&dir).expect("create terrain_analyze seed dir");
+
+    let mut valid = vec![0, 0, 0, 0]; // 1x1 MTXM, tile ID 0.
+    let mut cv5 = vec![0u8; 52];
+    cv5[0..2].copy_from_slice(&1u16.to_le_bytes()); // group type
+    cv5[2..4].copy_from_slice(&TileGroupFlags::WALKABLE.bits().to_le_bytes());
+    cv5[20..22].copy_from_slice(&0u16.to_le_bytes()); // tile index 0 -> megatile 0
+    let mut vf4 = vec![0u8; 32];
+    for index in 0..16 {
+        let offset = index * 2;
+        vf4[offset..offset + 2].copy_from_slice(&MiniTileFlags::WALKABLE.bits().to_le_bytes());
+    }
+    vf4.resize(cv5.len(), 0); // Equal halves let the fuzz target carve complete CV5/VF4 records.
+    valid.extend_from_slice(&cv5);
+    valid.extend_from_slice(&vf4);
+    write_seed(&dir, "valid_walkable.bin", &valid);
+
+    // 8x8 normalized walk-cell grid: control bytes select dimensions, byte 4 disables the
+    // deliberate length mismatch, and each following byte describes an open cell.
+    let mut normalized = vec![2, 7, 2, 7, 1];
+    normalized.extend(std::iter::repeat_n(1u8, 64));
+    write_seed(&dir, "normalized_grid.bin", &normalized);
+
+    // Zero dimensions trigger the bounded from_cells error path; the trailing bytes are harmless.
+    write_seed(&dir, "invalid_dimensions.bin", &[0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 fn write_seed(dir: &Path, name: &str, bytes: &[u8]) {

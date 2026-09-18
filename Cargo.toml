@@ -3,6 +3,7 @@ resolver = "3"
 
 members = [
     "broodmap",
+    "broodmap-analysis",
     "broodmap-cli",
     "broodmap-formats",
     "broodmap-render",
