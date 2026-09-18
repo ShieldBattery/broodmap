@@ -85,8 +85,10 @@ const [cv5Path, vf4Path, unitsPath] = map.requiredMapAnalysisAssets()
 const analysis = map.analyzeMap(
   await fetchBytes(cv5Path), await fetchBytes(vf4Path), await fetchBytes(unitsPath),
 )
-// analysis.setObstaclesEnabled(false) selects terrain-only routes.
+// analysis.setObstaclesEnabled(false) selects terrain-only routes and clearance.
 const flags = analysis.cellFlags() // row-major; see generated TypeScript docs for bit layout
+const clearance = analysis.clearancePixels() // Uint16Array, row-major square radii in logical pixels
+// 0 = blocked; 4 = next to a blocker/map edge. Not unit passability or corridor width.
 const route = JSON.parse(analysis.routeJson(10, 20, 30, 40)) // walk-cell coordinates
 // null groundDistancePixels means disconnected; invalid/blocked endpoints throw.
 const catalog = JSON.parse(analysis.findBasesJson('{}'))
@@ -102,6 +104,13 @@ analysis.free()
 ```
 
 `requiredAnalysisAssets()` / `analyzeTerrain(cv5, vf4)` remain available for terrain-only callers.
+
+Select **Clearance** in the demo overlay menu to inspect narrow passages and open areas.
+Hover details include the numerical clearance radius with any overlay.
+The heatmap and hover radius follow **Respect map obstacles**. **Color scale maximum** defaults
+to 256px; choose a smaller range for tight gaps or a larger range for open areas. It changes
+only the colors, not the measured radii. Radius measures a centered,
+axis-aligned empty square and includes the map boundary; it is not an engine movement test.
 
 For a static demo build, run `pnpm run build:demo`. The output is `examples/dist/`.
 Game assets are not bundled: serve an exported asset directory separately and set the

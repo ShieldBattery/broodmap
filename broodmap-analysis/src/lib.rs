@@ -1,7 +1,8 @@
 //! Static terrain analysis for StarCraft: Brood War maps.
 //!
-//! This crate resolves terrain and optional static collision rectangles. It does not simulate
-//! moving units, mover clearance, regions, or engine-specific movement rules. In particular,
+//! This crate resolves terrain, optional static collision rectangles, and square-clearance
+//! fields. It does not simulate moving units, mover clearance, regions, or engine-specific
+//! movement rules. In particular,
 //! [`TerrainGrid::from_terrain`] uses VF4/CV5 aggregation checked against OpenBW and an
 //! MTXM bit-15 creep override verified in the inspected game binary (12310g.exe). This is
 //! useful for analysis and UI previews, not a certified engine pathing implementation.
@@ -13,12 +14,14 @@ use broodmap_formats::{Cv5, MiniTileFlags, TileGroupFlags, Vf4};
 use thiserror::Error;
 
 pub mod bases;
+pub mod clearance;
 pub mod obstacles;
 
 pub use bases::{
     BaseCandidate, BaseDiscovery, BaseError, BaseSearchOptions, DepotFootprint, PixelPosition,
     ResourceKind, ResourceNode, TilePosition, discover_bases,
 };
+pub use clearance::ClearanceField;
 pub use obstacles::{PixelRect, StaticObstacle, melee_obstacle_objects, melee_obstacles};
 
 const MAX_TILES_PER_AXIS: usize = 256;

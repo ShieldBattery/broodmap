@@ -9,6 +9,7 @@
   body { margin: 2rem auto; padding: 0 1rem; max-width: 76rem; }
   fieldset, .panel { border: 1px solid #5f718544; border-radius: 8px; background: #18212c; margin: 1rem 0; padding: 1rem; }
   label { margin: .25rem 1rem .25rem 0; display: inline-block; }
+  label[hidden] { display: none; }
   input, select, button { font: inherit; }
   button { cursor: pointer; padding: .3rem .7rem; }
   canvas { image-rendering: pixelated; }
@@ -51,7 +52,8 @@
   <h2 id="terrainHeading">Terrain inspector</h2>
   <p class="note">The minimap is the backdrop until rendered artwork is available. Terrain buildability is a CV5 terrain hint, not actual placement legality.</p>
   <div id="terrainControls" hidden>
-    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option></select></label>
+    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option><option value="clearance">Clearance radius</option></select></label>
+    <label id="clearanceScaleControl" hidden>Color scale maximum: <select id="clearanceMax"><option value="64">64px (2 tiles)</option><option value="128">128px (4 tiles)</option><option value="256" selected>256px (8 tiles)</option><option value="512">512px (16 tiles)</option></select></label>
     <label>Opacity: <input id="opacity" type="range" min="10" max="90" value="45"> <output id="opacityValue">45%</output></label>
     <label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
     <span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
@@ -65,13 +67,17 @@
       <button id="compareBases">Compare bases</button>
     </div>
   </div>
-  <p class="legend"><span><i class="swatch" style="background:#2372bf"></i>elevation 0</span><span><i class="swatch" style="background:#39ad77"></i>elevation 1</span><span><i class="swatch" style="background:#e7c14a"></i>elevation 2</span></p>
+  <p class="legend">
+    <span id="clearanceLegend" hidden><i class="swatch" style="width:7rem;background:linear-gradient(90deg,#ee642d,#28cdc3,#6256e8)"></i><span id="clearanceLegendText">square radius: 4px (orange), 130px (teal), 256+px (violet)</span></span>
+    <span id="elevationLegend" hidden><i class="swatch" style="background:#2372bf"></i>elevation 0 <i class="swatch" style="background:#39ad77"></i>elevation 1 <i class="swatch" style="background:#e7c14a"></i>elevation 2</span>
+  </p>
   <div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div>
   <p id="hover">Move over the terrain view after analysis.</p>
   <p id="routeResult">Analyze terrain, then click two walkable cells.</p>
   <p id="baseResult">Find bases after terrain analysis to inspect mineral fields.</p>
   <p id="baseRouteResult">Choose two discovered bases to compare their anchors.</p>
   <p class="note">Base discovery uses a stock 4x3 depot-footprint heuristic. Orange lines show ground routes; dashed lines show air distance. Terrain defines resource clusters. Sites marked * require clearing small mineral patches or overlapping buildings. Occupied starts clear overlapping objects automatically; current routes keep them present. Candidate scoring balances mineral and gas access. Full placement legality and mover clearance are not established.</p>
+  <p class="note">Clearance shows how far an empty square can extend from each cell center before touching blocked terrain, active map obstacles, or the map edge. Hover to see its radius in pixels. Adjust the color scale to reveal differences in wider areas; values above its maximum share the final color. This measures space in the grid; actual unit passage needs additional movement rules.</p>
   <p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p>
 </section>
 

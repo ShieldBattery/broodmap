@@ -167,6 +167,16 @@ impl TerrainAnalysis {
             .collect()
     }
 
+    /// Row-major logical-pixel radii of empty, axis-aligned squares centered on walk cells.
+    /// Blocked cells are zero; walkable cells adjacent to a blocker or map edge are 4px.
+    /// Values follow the obstacle toggle and include the map boundary. This is a square
+    /// (Chebyshev) distance measure of the raster, not Euclidean distance, corridor width,
+    /// or proof that a StarCraft unit can pass. The returned buffer is independently owned.
+    #[wasm_bindgen(js_name = clearancePixels)]
+    pub fn clearance_pixels(&self) -> Vec<u16> {
+        self.active_grid().clearance().into_radii_pixels()
+    }
+
     /// Routes between 8-pixel cell centers. Both endpoints must be walkable; they are
     /// never silently moved. Points include both endpoints. Disconnected endpoints return
     /// an empty point list and null groundDistancePixels. Distances use logical pixels,
@@ -233,6 +243,13 @@ mod tests {
             (512, 512)
         );
         assert_eq!(analysis.cell_flags(), vec![3; 512 * 512]);
+        let mut clearance = analysis.clearance_pixels();
+        assert_eq!(clearance.len(), 512 * 512);
+        assert_eq!(clearance[0], 4);
+        assert_eq!(clearance[255 * 512 + 255], 2044);
+        clearance[0] = u16::MAX;
+        assert_eq!(analysis.clearance_pixels()[0], 4);
+
         assert!(map.analyze_terrain(&[], &vf4).is_err());
         assert!(map.analyze_terrain(&vec![0; 52 * 2049], &vf4).is_err());
         assert!(map.analyze_terrain(&cv5, &vec![0; 32 * 65537]).is_err());
@@ -272,15 +289,27 @@ mod tests {
         assert!(analysis.obstacle_count() > 0);
         let index = (y * analysis.width_walk_tiles() + x) as usize;
         let flags = analysis.cell_flags();
+        let blocked_clearance = analysis.clearance_pixels();
+        assert_eq!(blocked_clearance[index], 0);
+        assert_eq!(blocked_clearance.len(), flags.len());
         assert_eq!(flags[index] & 33, 32);
         assert!(analysis.route_json(x, y, x, y).is_err());
         analysis.set_obstacles_enabled(false);
         assert_eq!(analysis.cell_flags()[index] & 33, 33);
+        let terrain_clearance = analysis.clearance_pixels();
+        assert!(terrain_clearance[index] > 0);
+        assert!(
+            blocked_clearance
+                .iter()
+                .zip(&terrain_clearance)
+                .all(|(a, b)| a <= b)
+        );
         let route: serde_json::Value =
             serde_json::from_str(&analysis.route_json(x, y, x, y).unwrap()).unwrap();
         assert_eq!(route["groundDistancePixels"], 0.0);
         analysis.set_obstacles_enabled(true);
         assert_eq!(analysis.cell_flags(), flags);
+        assert_eq!(analysis.clearance_pixels(), blocked_clearance);
         assert!(map.analyze_map(&cv5, &vf4, &units[..19875]).is_err());
         units.push(0);
         assert!(map.analyze_map(&cv5, &vf4, &units).is_err());

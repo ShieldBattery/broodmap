@@ -136,6 +136,9 @@ function resetTerrain() {
   clearCanvas('terrainOverlay')
   el('terrainShell').style.removeProperty('aspect-ratio')
   el('terrainControls').hidden = true
+  el('clearanceLegend').hidden = true
+  el('clearanceScaleControl').hidden = true
+  el('elevationLegend').hidden = true
   el('routeResult').textContent = 'Analyze terrain, then click two walkable cells.'
   el('hover').textContent = 'Move over the terrain view after analysis.'
 }
@@ -240,7 +243,7 @@ el('analyze').addEventListener('click', async () => {
     const result = await callWorker('analyzeTerrain', { assetBase: resolveAssetBase() })
     if (target !== worker || revision !== analysisRevision) return
     routeRevision++
-    terrain = { ...result, flags: new Uint8Array(result.flags), textures: new Map(), obstaclesEnabled: true }
+    terrain = { ...result, flags: new Uint8Array(result.flags), clearance: new Uint16Array(result.clearance), textures: new Map(), obstaclesEnabled: true }
     el('respectObstacles').checked = true
     el('respectObstacles').disabled = false
     updateObstacleMode()
@@ -263,7 +266,14 @@ el('analyze').addEventListener('click', async () => {
   }
 })
 
-el('overlay').addEventListener('change', drawOverlay)
+el('overlay').addEventListener('change', () => {
+  el('hover').textContent = 'Move over the terrain view to inspect a cell.'
+  drawOverlay()
+})
+el('clearanceMax').addEventListener('change', () => {
+  terrain?.textures.delete('clearance')
+  drawOverlay()
+})
 el('opacity').addEventListener('input', () => {
   el('opacityValue').value = `${el('opacity').value}%`
   drawOverlay()
@@ -292,9 +302,11 @@ el('respectObstacles').addEventListener('change', async () => {
     const result = await callWorker('setObstaclesEnabled', { enabled })
     if (target !== worker || snapshot !== terrain || obstacleToken !== obstacleRevision) return
     terrain.flags = new Uint8Array(result.flags)
+    terrain.clearance = new Uint16Array(result.clearance)
     terrain.obstacleCount = result.obstacleCount
     terrain.obstaclesEnabled = result.enabled
     terrain.textures = new Map()
+    el('hover').textContent = 'Move over the terrain view to inspect the updated cells.'
     drawOverlay()
     updateObstacleMode()
     if (ownsStatus(obstacleStatusToken)) status(`Map obstacles ${result.enabled ? 'enabled' : 'disabled'}; ${result.obstacleCount} static map blockers identified.`)
@@ -497,7 +509,8 @@ el('terrainOverlay').addEventListener('pointermove', (event) => {
   const cell = selectedOverlayCell(event)
   if (!cell) return
   const elevation = (cell.flags >> 3) & 3
-  el('hover').textContent = `Walk (${cell.x}, ${cell.y}) | pixel (${cell.x * 8 + 4}, ${cell.y * 8 + 4}) | ${cell.flags & 1 ? 'walkable' : 'blocked'}, ${cell.flags & 2 ? 'terrain-buildable' : 'terrain-unbuildable'}, ${cell.flags & 4 ? 'ramp' : 'flat'}, ${cell.flags & 32 ? 'map obstacle' : 'no map obstacle'}, elevation ${elevation}`
+  const clearance = ` | square clearance radius ${terrain.clearance[cell.y * terrain.widthWalkTiles + cell.x]}px`
+  el('hover').textContent = `Walk (${cell.x}, ${cell.y}) | pixel (${cell.x * 8 + 4}, ${cell.y * 8 + 4}) | ${cell.flags & 1 ? 'walkable' : 'blocked'}, ${cell.flags & 2 ? 'terrain-buildable' : 'terrain-unbuildable'}, ${cell.flags & 4 ? 'ramp' : 'flat'}, ${cell.flags & 32 ? 'map obstacle' : 'no map obstacle'}, elevation ${elevation}${clearance}`
 })
 
 el('terrainOverlay').addEventListener('click', async (event) => {
@@ -560,6 +573,8 @@ function overlayTexture(kind) {
   scratch.height = height
   const pixels = new Uint8ClampedArray(width * height * 4)
   const elevation = [[35, 114, 191], [57, 173, 119], [231, 193, 74], [120, 120, 120]]
+  const clearanceMax = Number(el('clearanceMax').value)
+  const clearanceColors = [[238, 100, 45], [40, 205, 195], [98, 86, 232]]
   for (let index = 0; index < terrain.flags.length; index++) {
     const flags = terrain.flags[index]
     let color = null
@@ -567,6 +582,17 @@ function overlayTexture(kind) {
     if (kind === 'buildability' && !(flags & 2)) color = [245, 165, 45]
     if (kind === 'ramps' && (flags & 4)) color = [175, 90, 230]
     if (kind === 'obstacles' && (flags & 32)) color = [222, 55, 218]
+    if (kind === 'clearance') {
+      const radius = terrain.clearance[index]
+      if (!(flags & 1)) color = [42, 47, 58]
+      else {
+        const scale = Math.max(0, Math.min(1, (radius - 4) / (clearanceMax - 4))) * 2
+        const segment = Math.min(1, Math.floor(scale))
+        const fraction = scale - segment
+        color = clearanceColors[segment].map((value, channel) =>
+          Math.round(value + (clearanceColors[segment + 1][channel] - value) * fraction))
+      }
+    }
     if (kind === 'elevation') color = elevation[(flags >> 3) & 3]
     if (color) {
       const offset = index * 4
@@ -625,6 +651,11 @@ function drawBases(ctx, unit) {
 }
 
 function drawOverlay() {
+  el('clearanceLegend').hidden = !terrain || el('overlay').value !== 'clearance'
+  el('clearanceScaleControl').hidden = el('clearanceLegend').hidden
+  const clearanceMax = Number(el('clearanceMax').value)
+  el('clearanceLegendText').textContent = `square radius: 4px (orange), ${(clearanceMax + 4) / 2}px (teal), ${clearanceMax}+px (violet)`
+  el('elevationLegend').hidden = !terrain || el('overlay').value !== 'elevation'
   if (!terrain) return
   const canvas = el('terrainOverlay')
   const width = terrain.widthWalkTiles

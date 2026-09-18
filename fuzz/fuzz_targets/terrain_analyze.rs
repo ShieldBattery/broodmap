@@ -45,9 +45,43 @@ fn obstacle_rectangles(data: &[u8]) -> Vec<PixelRect> {
 fn exercise_grid(grid: &TerrainGrid, data: &[u8]) {
     let width = grid.width();
     let height = grid.height();
+    let clearance = grid.clearance();
+    assert_eq!((clearance.width(), clearance.height()), (width, height));
+    assert_eq!(clearance.radii_pixels().len(), grid.cells().len());
+    assert_eq!(
+        clearance.radius_pixels(WalkPosition { x: u32::MAX, y: 0 }),
+        None
+    );
+    assert_eq!(
+        clearance.radius_pixels(WalkPosition { x: 0, y: u32::MAX }),
+        None
+    );
     for y in 0..height {
         for x in 0..width {
-            let _ = grid.cell(WalkPosition { x, y });
+            let point = WalkPosition { x, y };
+            let cell = grid.cell(point).unwrap();
+            let radius = clearance.radius_pixels(point).unwrap();
+            assert_eq!(radius > 0, cell.walkable);
+            let edge = (x + 1).min(y + 1).min(width - x).min(height - y) * 8 - 4;
+            assert!(u32::from(radius) <= edge);
+            if x > 0 {
+                assert!(
+                    radius.abs_diff(
+                        clearance
+                            .radius_pixels(WalkPosition { x: x - 1, y })
+                            .unwrap()
+                    ) <= 8
+                );
+            }
+            if y > 0 {
+                assert!(
+                    radius.abs_diff(
+                        clearance
+                            .radius_pixels(WalkPosition { x, y: y - 1 })
+                            .unwrap()
+                    ) <= 8
+                );
+            }
         }
     }
     let _ = grid.cell(WalkPosition {

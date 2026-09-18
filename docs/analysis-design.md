@@ -1,8 +1,8 @@
 # Terrain analysis experiment
 
-This checkpoint adds resolved terrain, static map obstacles, resource-base candidates, and point/base
-route comparisons. It is a foundation for regions and wall checking, not an engine-compatible
-movement solver or a complete building-placement checker.
+This checkpoint adds resolved terrain, static map obstacles, square clearance fields, resource-base
+candidates, and point/base route comparisons. It is a foundation for regions and wall checking,
+not an engine-compatible movement solver or a complete building-placement checker.
 
 ## Ownership and inputs
 
@@ -110,6 +110,42 @@ The browser defaults to map obstacles present and can ignore all obstacles for c
 that toggle includes invincible objects and is not a destruction simulation. No result certifies that a particular unit can cross a gap or that
 a wall is tight. Terrain dimensions are bounded to 256x256 map tiles / 1024x1024 walk cells;
 route state is allocated per request. The worker keeps one route request in flight in the UI.
+
+## Clearance field
+
+`TerrainGrid::clearance()` measures the largest empty, axis-aligned square centered on each
+8px walk-cell center. Its radius is the distance from that center to a side of the square,
+in logical pixels. The square's interior cannot overlap blocked cells or extend outside the
+map; touching their boundaries is allowed. Blocked cells have radius zero. Walkable cells next
+to a blocker or map edge have radius 4, then 12, 20, and so on. An entirely open map therefore
+still has finite clearance, bounded by its edges.
+
+This is a Chebyshev (square) distance field of the resolved raster, not Euclidean distance or
+corridor width. It does not certify a unit's movement or a wall: mover shape, collision rules,
+and the conservative 8px obstacle rasterization still matter. Terrain buildability, elevation,
+and ramps do not independently restrict clearance. Apply `with_obstacles` before computing
+clearance to include the desired static objects; the source grid is never changed.
+
+`ClearanceField` owns dimensions and row-major `u16` radii. `radius_pixels(WalkPosition)`
+returns `None` outside the grid, distinct from a blocked cell's `Some(0)`. The field supports
+borrowed and consuming buffer access. Two deterministic raster passes compute minimum
+8-neighbor distance to blocked or virtual outside cells, then convert distance `d` to
+`8*d - 4` for walkable cells. Work is linear in the number of cells, with one 2 MiB result
+buffer at the maximum 1024x1024 shape and no per-cell heap queue.
+
+WASM `clearancePixels()` returns an independently owned `Uint16Array` for the active obstacle
+mode. The demo transfers it alongside flags when analyzing terrain or changing obstacle mode,
+so the two overlays describe the same snapshot. The generated bindings copy each result out
+of WASM memory; the worker transfers that owned buffer directly without another array copy.
+Select **Clearance** for the heatmap; the numerical radius appears in hover details for every
+overlay. The color scale defaults to 4-256px (orange through teal to violet) and has explicit
+64/128/256/512px maximum presets. The legend follows that setting; saturated colors do not cap
+the stored values. Changing the color scale only repaints the field, without recomputing it.
+Existing routes and base placement do not use this field yet.
+
+This is the first region-analysis checkpoint. Inspecting narrow passages and open-area peaks
+comes before choosing a region-segmentation/merging heuristic. Region boundaries, choke
+connections, base-region associations, and main/natural roles remain subsequent work.
 
 ## Resource bases and depot candidates
 
@@ -253,6 +289,11 @@ depot is actually spawned; a map's start marker alone does not establish removal
 The [base discovery profiling checkpoint](analysis-performance.md) records native/browser
 latency, memory measurements, the installed-map inventory, and a repeatable native harness.
 
+Clearance tests compare the transform with direct geometric minima on small grids, including
+diagonal blockers, corridors, map edges, obstacle monotonicity, and the maximum grid. WASM
+checks verify owned buffers and obstacle toggles; the terrain fuzzer checks clearance bounds
+and local continuity.
+
 Synthetic tests cover table/index resolution, global row layout across megatiles, aggregate
 walkability thresholds, creep, malformed inputs, diagonal pinches, deterministic ties,
 disconnection, and route cost versus an independent Dijkstra reference. WASM tests exercise
@@ -268,7 +309,7 @@ and Hunters 2021 verify all start-aligned depots and Python
 island prerequisites. Lost Temple and Horizon Lunar Colony also exercise candidate/route invariants
 and UI behavior; their candidate counts are observations, not ground-truth annotations.
 
-Future checkpoints can add per-object identity/removal, movement profiles, clearance fields, and
+Future checkpoints can add per-object identity/removal, movement profiles, and terrain
 regions. Base sites, terrain regions, base territory, and a main/natural role relative to a start
 remain distinct concepts.
 

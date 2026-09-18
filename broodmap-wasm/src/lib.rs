@@ -19,7 +19,9 @@
 //! Analysis is independent of artwork: `requiredMapAnalysisAssets()` names CV5, VF4, and
 //! units.dat for `analyzeMap(cv5, vf4, units)`, returning an owned [`TerrainAnalysis`] snapshot.
 //! Use `cellFlags()` for overlays and `routeJson()` for point-grid routes; `setObstaclesEnabled()`
-//! switches between static map obstacles and terrain alone. `findBasesJson("{}")` discovers stock
+//! switches between static map obstacles and terrain alone. `clearancePixels()` gives an owned
+//! row-major `Uint16Array` of square clearance radii in logical pixels for the active grid.
+//! `findBasesJson("{}")` discovers stock
 //! resource-base candidates; `baseRouteJson(a, b)` compares their ground/air distances.
 //! `requiredAnalysisAssets()` and
 //! `analyzeTerrain(cv5, vf4)` provide the terrain-only subset. These methods accept bytes directly,

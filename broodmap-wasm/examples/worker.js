@@ -133,9 +133,12 @@ async function handle({ id, type, ...payload }) {
     const units = await fetchBytes(payload.assetBase, paths[2], true, 19876)
     const nextAnalysis = map.analyzeMap(cv5, vf4, units)
     let flags
+    let clearance
     let minimap
     try {
-      flags = new Uint8Array(nextAnalysis.cellFlags()).buffer
+      // The bindings return owned arrays, so their buffers can be transferred directly.
+      flags = nextAnalysis.cellFlags().buffer
+      clearance = nextAnalysis.clearancePixels().buffer
       minimap = imageResult(map.minimapRgba(JSON.stringify({ scale: 2 })))
     } catch (error) {
       nextAnalysis.free?.()
@@ -144,14 +147,15 @@ async function handle({ id, type, ...payload }) {
     const oldAnalysis = analysis
     analysis = nextAnalysis
     oldAnalysis?.free?.()
-    post(id, { widthWalkTiles: analysis.widthWalkTiles, heightWalkTiles: analysis.heightWalkTiles, obstacleCount: analysis.obstacleCount, flags, minimap }, [flags, minimap.data])
+    post(id, { widthWalkTiles: analysis.widthWalkTiles, heightWalkTiles: analysis.heightWalkTiles, obstacleCount: analysis.obstacleCount, flags, clearance, minimap }, [flags, clearance, minimap.data])
     return
   }
   if (type === 'setObstaclesEnabled') {
     if (!analysis) throw new Error('Analyze terrain before changing obstacle handling.')
     analysis.setObstaclesEnabled(Boolean(payload.enabled))
-    const flags = new Uint8Array(analysis.cellFlags()).buffer
-    post(id, { flags, obstacleCount: analysis.obstacleCount, enabled: Boolean(payload.enabled) }, [flags])
+    const flags = analysis.cellFlags().buffer
+    const clearance = analysis.clearancePixels().buffer
+    post(id, { flags, clearance, obstacleCount: analysis.obstacleCount, enabled: Boolean(payload.enabled) }, [flags, clearance])
     return
   }
   if (type === 'route') {
