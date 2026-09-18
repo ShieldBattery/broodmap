@@ -15,7 +15,7 @@ The CLI (`broodmap-cli`) renders previews/minimaps and exports game assets for r
 
 ## Fuzzing
 
-`fuzz/` is a cargo-fuzz crate (its own workspace, nightly-only — doesn't affect the library's MSRV) with one target per parser/pipeline: `chk_parse`, `mpq_parse`, `full_pipeline`, `formats_parse`, `anim_parse`, `mainsd_parse`, `render_terrain`, `minimap_parse`, `plan_execute` (hostile deserialized `RenderPlan`s through the plan executor), `terrain_analyze` (terrain resolution, obstacle extraction/rasterization, and routes). Because parsing is lazy, targets must exercise every lazy accessor (e.g. every `Chk` field, every `MainSdAnim` entry), not just construct the top-level type.
+`fuzz/` is a cargo-fuzz crate (its own workspace, nightly-only — doesn't affect the library's MSRV) with one target per parser/pipeline: `chk_parse`, `mpq_parse`, `full_pipeline`, `formats_parse`, `anim_parse`, `mainsd_parse`, `render_terrain`, `minimap_parse`, `plan_execute` (hostile deserialized `RenderPlan`s through the plan executor), `terrain_analyze` (terrain resolution, obstacle extraction/rasterization, resource-base discovery, and routes). Because parsing is lazy, targets must exercise every lazy accessor (e.g. every `Chk` field, every `MainSdAnim` entry), not just construct the top-level type.
 
 ```bash
 cargo +nightly fuzz run chk_parse fuzz/corpus/chk_parse fuzz/seeds/chk_parse -- -max_len=65536

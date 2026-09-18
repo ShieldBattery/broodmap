@@ -12,9 +12,14 @@ use broodmap::chk::terrain::TerrainTileIds;
 use broodmap_formats::{Cv5, MiniTileFlags, TileGroupFlags, Vf4};
 use thiserror::Error;
 
+pub mod bases;
 pub mod obstacles;
 
-pub use obstacles::{PixelRect, melee_obstacles};
+pub use bases::{
+    BaseCandidate, BaseDiscovery, BaseError, BaseSearchOptions, DepotFootprint, PixelPosition,
+    ResourceKind, ResourceNode, TilePosition, discover_bases,
+};
+pub use obstacles::{PixelRect, StaticObstacle, melee_obstacle_objects, melee_obstacles};
 
 const MAX_TILES_PER_AXIS: usize = 256;
 const WALK_CELLS_PER_TILE: usize = 4;

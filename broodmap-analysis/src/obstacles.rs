@@ -16,6 +16,7 @@ const CELL_PIXELS: i32 = 8;
 const BUILDING: u32 = 0x0000_0001;
 const FLYER: u32 = 0x0000_0004;
 const RESOURCE: u32 = 0x0000_2000;
+const DAT_INVINCIBLE: u32 = 0x2000_0000;
 const START_LOCATION: u16 = 214;
 
 /// Half-open logical pixel bounds: `[left, right) x [top, bottom)`.
@@ -25,6 +26,14 @@ pub struct PixelRect {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+/// A static blocker and whether analysis may treat its destruction as a prerequisite.
+/// This does not establish attacker access or simulate destruction.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct StaticObstacle {
+    pub bounds: PixelRect,
+    pub destructible: bool,
 }
 
 /// Returns conservative collision rectangles for conventional melee static blockers.
@@ -47,6 +56,18 @@ pub fn melee_obstacles(
     sprites: &[Sprite],
     definitions: &UnitsDat,
 ) -> Vec<PixelRect> {
+    melee_obstacle_objects(units, sprites, definitions)
+        .into_iter()
+        .map(|obstacle| obstacle.bounds)
+        .collect()
+}
+
+/// Returns conventional melee blockers with the metadata needed to model destruction.
+pub fn melee_obstacle_objects(
+    units: &[PlacedUnit],
+    sprites: &[Sprite],
+    definitions: &UnitsDat,
+) -> Vec<StaticObstacle> {
     let mut obstacles = Vec::new();
 
     for unit in units {
@@ -62,7 +83,10 @@ pub fn melee_obstacles(
             continue;
         }
         if let Some(rect) = obstacle_rect(unit.unit_id, unit.x, unit.y, definitions) {
-            obstacles.push(rect);
+            obstacles.push(StaticObstacle {
+                bounds: rect,
+                destructible: obstacle_destructible(unit.unit_id, Some(unit.state), definitions),
+            });
         }
     }
 
@@ -71,11 +95,24 @@ pub fn melee_obstacles(
             continue;
         }
         if let Some(rect) = obstacle_rect(sprite.id, sprite.x, sprite.y, definitions) {
-            obstacles.push(rect);
+            obstacles.push(StaticObstacle {
+                bounds: rect,
+                destructible: obstacle_destructible(sprite.id, None, definitions),
+            });
         }
     }
 
     obstacles
+}
+
+fn obstacle_destructible(unit_id: u16, state: Option<UnitState>, definitions: &UnitsDat) -> bool {
+    let Some(entry) = definitions.entry(unit_id) else {
+        return false;
+    };
+    let flags = entry.special_ability_flags;
+    flags & RESOURCE == 0
+        && flags & DAT_INVINCIBLE == 0
+        && state.is_none_or(|state| !state.contains(UnitState::INVINCIBLE))
 }
 
 fn obstacle_rect(unit_id: u16, x: u16, y: u16, definitions: &UnitsDat) -> Option<PixelRect> {
@@ -573,6 +610,43 @@ mod tests {
                     bottom: 93
                 },
             ]
+        );
+    }
+    #[test]
+    fn melee_objects_report_destructibility_without_changing_order_or_bounds() {
+        let definitions = definitions(&[
+            (1, BUILDING, (8, 4, 16, 12)),
+            (2, BUILDING | DAT_INVINCIBLE, (8, 4, 16, 12)),
+            (176, RESOURCE, (8, 4, 16, 12)),
+        ]);
+        let units = [
+            unit(1, None, UnitState::empty()),
+            unit(1, None, UnitState::INVINCIBLE),
+            unit(2, None, UnitState::empty()),
+            unit(176, Some(3), UnitState::empty()),
+        ];
+        let sprites = [Sprite {
+            id: 1,
+            x: 32,
+            y: 40,
+            owner: 11,
+            flags: SpriteFlags::empty(),
+        }];
+        let objects = melee_obstacle_objects(&units, &sprites, &definitions);
+        assert_eq!(objects.len(), 5);
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.bounds)
+                .collect::<Vec<_>>(),
+            melee_obstacles(&units, &sprites, &definitions)
+        );
+        assert_eq!(
+            objects
+                .iter()
+                .map(|object| object.destructible)
+                .collect::<Vec<_>>(),
+            vec![true, false, false, false, true]
         );
     }
 }
