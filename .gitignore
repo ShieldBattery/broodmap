@@ -1,3 +1,5 @@
 /target
 .idea
 .mcp.json
+
+/broodmap-wasm/examples/dist/

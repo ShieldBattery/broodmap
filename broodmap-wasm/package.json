@@ -7,13 +7,13 @@
     "build": "pnpm run build:web && pnpm run build:node",
     "build:web": "wasm-pack build --target web",
     "build:node": "wasm-pack build --target nodejs --out-dir pkg-node",
+    "assets:analysis": "cargo run --release -p broodmap-cli -- fetch-assets --analysis-only --out examples/assets",
     "assets": "cargo run --release -p broodmap-cli -- fetch-assets --out examples/assets",
-    "dev": "pnpm run build:web && vite"
+    "dev": "pnpm run build:web && vite",
+    "build:demo": "pnpm run build:web && vite build"
   },
   "license": "MIT OR Apache-2.0",
   "devDependencies": {
-    "vite": "^7.1.5",
-    "vite-plugin-top-level-await": "^1.6.0",
-    "vite-plugin-wasm": "^3.5.0"
+    "vite": "^7.1.5"
   }
 }

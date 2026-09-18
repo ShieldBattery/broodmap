@@ -4,6 +4,12 @@ A pure Rust implementation of StarCraft 1 map parsing. This library works for bo
 files, and offers handling for the archive format (MPQ) as well as the internal scenario description
 (CHK).
 
+## Terrain analysis experiment
+
+`broodmap-analysis` resolves terrain flags and computes routes around static map obstacles. The
+[WASM demo](broodmap-wasm/README.md) shows overlays and compares ground and air distances.
+See the [design and limitations](docs/analysis-design.md) for the path toward base and wall analysis.
+
 ## WIP
 
 This library is a work-in-progress, it is not yet complete or ready for use.

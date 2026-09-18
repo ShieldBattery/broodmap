@@ -1,7 +1,5 @@
 import { defineConfig } from 'vite'
 import { resolve } from 'path'
-import wasm from 'vite-plugin-wasm'
-import topLevelAwait from 'vite-plugin-top-level-await'
 
 export default defineConfig({
   root: 'examples',
@@ -12,7 +10,8 @@ export default defineConfig({
       },
     },
   },
-  plugins: [wasm(), topLevelAwait()],
+  // wasm-pack's explicit async init needs no top-level-await transform.
+  worker: { format: 'es' },
   server: {
     port: 3000,
     open: true,

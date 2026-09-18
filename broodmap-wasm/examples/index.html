@@ -3,51 +3,66 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>broodmap browser example</title>
+<title>broodmap browser terrain inspector</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 72rem; }
-  fieldset { border: 1px solid #8884; border-radius: 6px; margin-bottom: 1rem; }
-  label { margin-right: 1rem; }
-  canvas { max-width: 100%; height: auto; border: 1px solid #8884; image-rendering: pixelated; }
-  #status { white-space: pre-line; font-family: monospace; margin: 0.75rem 0; }
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10151d; color: #e9eff7; }
+  body { margin: 2rem auto; padding: 0 1rem; max-width: 76rem; }
+  fieldset, .panel { border: 1px solid #5f718544; border-radius: 8px; background: #18212c; margin: 1rem 0; padding: 1rem; }
+  label { margin: .25rem 1rem .25rem 0; display: inline-block; }
+  input, select, button { font: inherit; }
+  button { cursor: pointer; padding: .3rem .7rem; }
+  canvas { image-rendering: pixelated; }
+  #preview, #minimap { max-width: 100%; height: auto; border: 1px solid #72869b88; }
+  #status, #hover, #routeResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
   .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
+  .row > * { min-width: 0; }
+  #terrainShell { position: relative; width: min(100%, 60rem); background: #080c11; border: 1px solid #72869b88; overflow: hidden; }
+  #terrainShell canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #terrainBackdrop { z-index: 0; }
+  #terrainOverlay { z-index: 1; cursor: crosshair; }
+  .note { color: #b8c5d3; max-width: 70ch; }
+  .legend { display: flex; gap: .75rem; flex-wrap: wrap; font-size: .9rem; color: #c7d3df; }
+  .swatch { display: inline-block; width: .8rem; height: .8rem; margin-right: .25rem; border: 1px solid #ffffff66; vertical-align: -.05rem; }
+  h2 { margin-bottom: .4rem; }
 </style>
 </head>
 <body>
-<h1>broodmap browser example</h1>
-<p>
-  Renders a StarCraft: Brood War map preview entirely in the browser: the map is parsed and
-  rendered by <code>broodmap-wasm</code>; SC:R assets are fetched on demand from a static
-  directory produced by <code>broodmap-cli fetch-assets</code> (see the README).
-</p>
+<h1>broodmap browser terrain inspector</h1>
+<p class="note">Parse maps and render previews locally in your browser. Artwork comes from a static directory produced by <code>broodmap-cli fetch-assets</code>.</p>
 
 <fieldset>
-  <legend>Inputs</legend>
+  <legend>Inputs and preview</legend>
   <label>Map (.scm/.scx): <input type="file" id="map" accept=".scm,.scx"></label>
   <label>Asset base URL: <input type="text" id="assetBase" value="./assets" size="20"></label>
-  <label>Style:
-    <select id="style">
-      <option value="original" selected>original</option>
-      <option value="remastered">remastered</option>
-      <option value="cartooned">cartooned</option>
-    </select>
-  </label>
+  <label>Style: <select id="style"><option value="original" selected>original</option><option value="remastered">remastered</option><option value="cartooned">cartooned</option></select></label>
   <label>Size: <input type="number" id="size" value="1024" min="64" max="8192" step="64"></label>
   <button id="render" disabled>Render</button>
+  <button id="analyze" disabled>Analyze terrain</button>
 </fieldset>
 
-<div id="status">Pick a map file to begin.</div>
+<div id="status" role="status">Pick a map file to begin.</div>
 
 <div class="row">
-  <div>
-    <h2>Preview</h2>
-    <canvas id="preview" width="0" height="0"></canvas>
-  </div>
-  <div>
-    <h2>Minimap (zero-asset)</h2>
-    <canvas id="minimap" width="0" height="0"></canvas>
-  </div>
+  <section><h2>Preview</h2><canvas id="preview" width="0" height="0"></canvas></section>
+  <section><h2>Minimap (zero-asset)</h2><canvas id="minimap" width="0" height="0"></canvas></section>
 </div>
+
+<section class="panel" aria-labelledby="terrainHeading">
+  <h2 id="terrainHeading">Terrain inspector</h2>
+  <p class="note">The minimap is the backdrop until rendered artwork is available. Terrain buildability is a CV5 terrain hint, not actual placement legality.</p>
+  <div id="terrainControls" hidden>
+    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option></select></label>
+    <label>Opacity: <input id="opacity" type="range" min="10" max="90" value="45"> <output id="opacityValue">45%</output></label>
+    <label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
+    <span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
+    <button id="resetRoute">Reset route</button>
+  </div>
+  <p class="legend"><span><i class="swatch" style="background:#2372bf"></i>elevation 0</span><span><i class="swatch" style="background:#39ad77"></i>elevation 1</span><span><i class="swatch" style="background:#e7c14a"></i>elevation 2</span></p>
+  <div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div>
+  <p id="hover">Move over the terrain view after analysis.</p>
+  <p id="routeResult">Analyze terrain, then click two walkable cells.</p>
+  <p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p>
+</section>
 
 <script type="module" src="./main.js"></script>
 </body>
