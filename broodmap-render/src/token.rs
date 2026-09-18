@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn pixels_well_outside_the_token_are_left_untouched() {
         let mut image = blank_image(80, 80);
-        image.data.chunks_exact_mut(4).for_each(|p| {
+        image.data.as_chunks_mut::<4>().0.iter_mut().for_each(|p| {
             p.copy_from_slice(&[0, 0, 255, 255]); // solid "terrain" blue
         });
         draw_player_token(&mut image, 10, 10, 70, 70, [244, 4, 4]);

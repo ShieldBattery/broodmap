@@ -103,8 +103,10 @@ pub fn read_terrain(
     };
 
     let mut tiles = data
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()).into())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk).into())
         .collect::<Vec<_>>();
     if tiles.len() != tile_count {
         tiles.resize(tile_count, TileId::default());

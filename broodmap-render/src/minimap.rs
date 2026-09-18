@@ -1033,8 +1033,8 @@ mod tests {
             &MinimapOptions::default(),
         );
         assert_eq!((image.width, image.height), (4, 4));
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [0, 0, 0, 255]);
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [0, 0, 0, 255]);
         }
     }
 
@@ -1139,8 +1139,8 @@ mod tests {
             None,
             &MinimapOptions::default(),
         );
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [50, 60, 70, 255]);
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [50, 60, 70, 255]);
         }
     }
 
@@ -1163,8 +1163,8 @@ mod tests {
             &MinimapOptions::default(),
         );
         // Index 0's color, per `synthetic_table_bytes`'s `[i, i, i]` identity palette.
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [0, 0, 0, 255]);
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [0, 0, 0, 255]);
         }
     }
 
@@ -1483,7 +1483,9 @@ mod tests {
         assert!(
             image
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|t| close_to_player_color([t[0], t[1], t[2]], [244, 4, 4])),
             "the start-location token must draw over the unit dot beneath it"
         );
@@ -1506,7 +1508,7 @@ mod tests {
             None,
             &options,
         );
-        for texel in image.data.chunks_exact(4) {
+        for texel in image.data.as_chunks::<4>().0 {
             assert_ne!([texel[0], texel[1], texel[2]], [244, 4, 4]);
         }
     }
@@ -1533,7 +1535,9 @@ mod tests {
             assert!(
                 image
                     .data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|t| close_to_player_color([t[0], t[1], t[2]], [244, 4, 4])),
                 "{mode:?}: no pixel near the expected player color"
             );
@@ -1584,7 +1588,9 @@ mod tests {
         );
         let has_red = |img: &RgbaImage| {
             img.data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|t| [t[0], t[1], t[2]] == [244, 4, 4])
         };
         assert!(has_red(&image), "the unit sprite must be drawn somewhere");
@@ -1622,12 +1628,16 @@ mod tests {
         );
         let has_red = image
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|t| [t[0], t[1], t[2]] == [244, 4, 4]);
         assert!(!has_red, "player-owned unit must be dropped under melee");
         let has_neutral = image
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|t| [t[0], t[1], t[2]] == RESOURCE_MINIMAP_COLOR);
         assert!(has_neutral, "neutral unit must be kept and drawn");
     }
@@ -1652,7 +1662,9 @@ mod tests {
         assert!(
             image
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|t| [t[0], t[1], t[2]] == [244, 4, 4])
         );
     }
@@ -1678,7 +1690,9 @@ mod tests {
         assert!(
             !image
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|t| [t[0], t[1], t[2]] == [244, 4, 4])
         );
     }

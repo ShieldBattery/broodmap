@@ -1419,11 +1419,16 @@ pub(crate) fn scan_used_string_ids(data: &[u8]) -> impl Iterator<Item = StringId
     const ACTION_SIZE: usize = 32;
     const ACTIONS_SIZE: usize = 64 * ACTION_SIZE;
 
-    data.chunks_exact(TRIGGER_SIZE).flat_map(|trigger| {
-        trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
-            .chunks_exact(ACTION_SIZE)
-            .filter_map(scan_action_string_id)
-    })
+    data.as_chunks::<TRIGGER_SIZE>()
+        .0
+        .iter()
+        .flat_map(|trigger| {
+            trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
+                .as_chunks::<ACTION_SIZE>()
+                .0
+                .iter()
+                .filter_map(|action| scan_action_string_id(action))
+        })
 }
 
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]

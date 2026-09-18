@@ -41,7 +41,9 @@ pub enum SpriteError {
 /// Reads the sprites chunk of a CHK file (aka the THG2 chunk).
 pub fn read_sprites(data: &[u8]) -> Result<Vec<Sprite>, SpriteError> {
     let result = data
-        .chunks_exact(10)
+        .as_chunks::<10>()
+        .0
+        .iter()
         .map(|chunk| {
             let id = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
             let x = u16::from_le_bytes(chunk[2..4].try_into().unwrap());

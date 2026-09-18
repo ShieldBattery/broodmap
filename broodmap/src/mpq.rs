@@ -222,10 +222,10 @@ impl Decrypter {
             (&data[0..data.len() - extra], &data[data.len() - extra..])
         };
 
-        data.chunks_exact(4)
-            .flat_map(|val| {
-                u32::to_le_bytes(self.decrypt_u32(u32::from_le_bytes(val.try_into().unwrap())))
-            })
+        data.as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|val| u32::to_le_bytes(self.decrypt_u32(u32::from_le_bytes(*val))))
             .chain(remainder.iter().copied())
             .collect()
     }
@@ -309,7 +309,7 @@ fn mpq_hash_table(input: &[u8], max_entries: usize) -> Result<Vec<MpqHashTableEn
     result
         .try_reserve_exact(entry_count)
         .map_err(|_| allocation_error(Resource::MpqHashTableEntries, entry_count))?;
-    for entry in input.chunks_exact(MPQ_HASH_TABLE_ENTRY_SIZE) {
+    for entry in input.as_chunks::<MPQ_HASH_TABLE_ENTRY_SIZE>().0 {
         let hash_a = decrypter.decrypt_u32(u32::from_le_bytes(entry[0..4].try_into().unwrap()));
         let hash_b = decrypter.decrypt_u32(u32::from_le_bytes(entry[4..8].try_into().unwrap()));
         let locale_platform =
@@ -414,7 +414,7 @@ fn mpq_block_table(input: &[u8], max_entries: usize) -> Result<Vec<MpqBlockTable
     result
         .try_reserve_exact(entry_count)
         .map_err(|_| allocation_error(Resource::MpqBlockTableEntries, entry_count))?;
-    for entry in input.chunks_exact(MPQ_BLOCK_TABLE_ENTRY_SIZE) {
+    for entry in input.as_chunks::<MPQ_BLOCK_TABLE_ENTRY_SIZE>().0 {
         result.push(MpqBlockTableEntry {
             offset: decrypter.decrypt_u32(u32::from_le_bytes(entry[0..4].try_into().unwrap()))
                 as i32,
@@ -447,8 +447,8 @@ fn mpq_sector_table(
     result
         .try_reserve_exact(num_sectors)
         .map_err(|_| allocation_error(Resource::MpqFileSectors, num_sectors))?;
-    for bytes in input[..byte_len].chunks_exact(4) {
-        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+    for bytes in input[..byte_len].as_chunks::<4>().0 {
+        let value = u32::from_le_bytes(*bytes);
         result.push(match decrypter {
             Some(ref mut decrypter) => decrypter.decrypt_u32(value) as i32,
             None => value as i32,

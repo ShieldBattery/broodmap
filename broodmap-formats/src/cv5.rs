@@ -57,7 +57,9 @@ impl Cv5 {
 /// dropped.
 pub fn parse_cv5(data: &[u8]) -> Cv5 {
     let groups = data
-        .chunks_exact(ENTRY_SIZE)
+        .as_chunks::<ENTRY_SIZE>()
+        .0
+        .iter()
         .take(MAX_GROUPS)
         .map(|entry| {
             let group_type = u16::from_le_bytes(entry[0..2].try_into().unwrap());

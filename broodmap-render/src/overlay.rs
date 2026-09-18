@@ -1421,7 +1421,7 @@ const SHADOW_ALPHA_SCALE: f32 = 0.5;
 /// `teamcolor` layer to apply) and alpha is scaled by [`SHADOW_ALPHA_SCALE`], so the diffuse
 /// frame's own alpha channel still provides the silhouette's shape.
 fn apply_shadow_tint(frame: &mut [u8]) {
-    for texel in frame.chunks_exact_mut(4) {
+    for texel in frame.as_chunks_mut::<4>().0 {
         texel[0] = 0;
         texel[1] = 0;
         texel[2] = 0;
@@ -1551,7 +1551,12 @@ fn crop(layer: &DecodedLayer, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
 ///   blobs of pure player color. Visibly wrong at a glance.
 /// - **Additive (`diffuse + m * player`)**: blows the masked regions out toward white.
 fn apply_team_color(frame: &mut [u8], mask: &[u8], color: [u8; 3]) {
-    for (texel, mask_texel) in frame.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
+    for (texel, mask_texel) in frame
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(mask.as_chunks::<4>().0.iter())
+    {
         let m = team_color_mask(mask_texel) as u32;
         if m == 0 {
             continue;
@@ -2419,7 +2424,7 @@ mod tests {
             4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255, // row 1
         ];
         flip_horizontal(&mut rgba, 3, 2);
-        let reds: Vec<u8> = rgba.chunks_exact(4).map(|t| t[0]).collect();
+        let reds: Vec<u8> = rgba.as_chunks::<4>().0.iter().map(|t| t[0]).collect();
         assert_eq!(reds, vec![3, 2, 1, 6, 5, 4]);
     }
 
@@ -3152,8 +3157,8 @@ mod tests {
             &opts,
         )
         .unwrap();
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [0, 0, 255, 255], "pure terrain, and no error");
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [0, 0, 255, 255], "pure terrain, and no error");
         }
     }
 
@@ -3355,8 +3360,8 @@ mod tests {
         )
         .unwrap();
         assert!(preview.warnings.is_empty(), "{:?}", preview.warnings);
-        for texel in preview.image.data.chunks_exact(4) {
-            assert_eq!(texel, [0, 0, 255, 255], "pure terrain, and no error");
+        for texel in preview.image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [0, 0, 255, 255], "pure terrain, and no error");
         }
     }
 

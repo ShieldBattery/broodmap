@@ -60,7 +60,7 @@ fn renders_lost_temple_in_all_styles() {
         assert_eq!(image.data.len(), 256 * 256 * 4, "{style:?}");
 
         let mut distinct = std::collections::HashSet::new();
-        for texel in image.data.chunks_exact(4) {
+        for texel in image.data.as_chunks::<4>().0 {
             assert_eq!(texel[3], 255, "{style:?}: terrain must be fully opaque");
             distinct.insert([texel[0], texel[1], texel[2]]);
         }
@@ -157,8 +157,10 @@ fn lost_temple_preview_overlays_the_terrain() {
 
     let changed = terrain_only
         .data
-        .chunks_exact(4)
-        .zip(preview.image.data.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(preview.image.data.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a != b)
         .count();
     assert!(
@@ -181,7 +183,9 @@ fn lost_temple_preview_overlays_the_terrain() {
         let found = preview
             .image
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|t| close([t[0], t[1], t[2]], expected));
         assert!(
             found,

@@ -290,7 +290,12 @@ pub(crate) fn resample_linear(
         }
 
         let out_row = &mut out[oy as usize * stride..(oy as usize + 1) * stride];
-        for (texel, linear) in out_row.chunks_exact_mut(4).zip(accum.chunks_exact(4)) {
+        for (texel, linear) in out_row
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(accum.as_chunks::<4>().0.iter())
+        {
             texel[0] = encode_linear(tables, linear[0]);
             texel[1] = encode_linear(tables, linear[1]);
             texel[2] = encode_linear(tables, linear[2]);
@@ -435,13 +440,13 @@ mod tests {
             data: vec![0u8; width * height * 4],
             width: width as u32,
         };
-        for texel in rows.data.chunks_exact_mut(4) {
+        for texel in rows.data.as_chunks_mut::<4>().0 {
             texel.copy_from_slice(&[137, 42, 200, 255]);
         }
 
         let out = resample_linear(&mut rows, width as u32, height as u32, 8, 8);
-        for texel in out.chunks_exact(4) {
-            assert_eq!(texel, [137, 42, 200, 255], "a flat field must stay flat");
+        for texel in out.as_chunks::<4>().0 {
+            assert_eq!(*texel, [137, 42, 200, 255], "a flat field must stay flat");
         }
     }
 
@@ -453,7 +458,7 @@ mod tests {
         // Two 32px "tiles" side by side: black then white, downscaled 4:1 to 8x1 output pixels.
         let width = 64usize;
         let mut data = vec![255u8; width * 4];
-        for (x, texel) in data.chunks_exact_mut(4).enumerate() {
+        for (x, texel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let value = if x < 32 { 0 } else { 255 };
             texel.copy_from_slice(&[value, value, value, 255]);
         }
@@ -463,7 +468,7 @@ mod tests {
         };
 
         let out = resample_linear(&mut rows, width as u32, 1, 8, 1);
-        let luma: Vec<u8> = out.chunks_exact(4).map(|t| t[0]).collect();
+        let luma: Vec<u8> = out.as_chunks::<4>().0.iter().map(|t| t[0]).collect();
 
         assert_eq!(luma[0], 0, "far from the seam the tiles keep their color");
         assert_eq!(luma[7], 255);
@@ -479,7 +484,7 @@ mod tests {
         let width = 48usize;
         let height = 48usize;
         let mut data = vec![0u8; width * height * 4];
-        for (i, texel) in data.chunks_exact_mut(4).enumerate() {
+        for (i, texel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             texel.copy_from_slice(&[(i % 251) as u8, (i % 199) as u8, (i % 173) as u8, 255]);
         }
 

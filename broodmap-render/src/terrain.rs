@@ -333,7 +333,12 @@ fn render_megatile(dds_vr4: &DdsVr4, megatile_id: u16, ppt: u32) -> Vec<u8> {
             }
 
             let mut rgba = vec![0u8; needed * 4];
-            for (texel, &index) in rgba.chunks_exact_mut(4).zip(&indices[..needed]) {
+            for (texel, &index) in rgba
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&indices[..needed])
+            {
                 let [r, g, b] = palette.rgb(index);
                 texel[0] = r;
                 texel[1] = g;
@@ -354,7 +359,7 @@ fn render_megatile(dds_vr4: &DdsVr4, megatile_id: u16, ppt: u32) -> Vec<u8> {
 /// An opaque black `ppt`x`ppt` RGBA8 tile, used as a fallback for missing/unusable megatile art.
 fn opaque_black(ppt: u32) -> Vec<u8> {
     let mut tile = vec![0u8; ppt as usize * ppt as usize * 4];
-    for texel in tile.chunks_exact_mut(4) {
+    for texel in tile.as_chunks_mut::<4>().0 {
         texel[3] = 255;
     }
     tile
@@ -650,8 +655,8 @@ mod tests {
         let image = render_terrain(&terrain, Tileset::Jungle, &source, &options).unwrap();
         assert_eq!((image.width, image.height), (8, 8));
         // All four quadrants resolve to megatile 0 (white), whether present or defaulted.
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [255, 255, 255, 255]);
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [255, 255, 255, 255]);
         }
     }
 
@@ -744,7 +749,12 @@ mod tests {
         let image = render_terrain(&terrain, Tileset::Jungle, &source, &options).unwrap();
         assert_eq!((image.width, image.height), (8, 4));
 
-        let luma: Vec<u8> = image.data[..8 * 4].chunks_exact(4).map(|t| t[0]).collect();
+        let luma: Vec<u8> = image.data[..8 * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|t| t[0])
+            .collect();
         assert_eq!(luma[0], 0, "far from the seam the tiles keep their color");
         assert_eq!(luma[7], 255);
         assert!(
@@ -815,11 +825,11 @@ mod tests {
 
         let image = render_terrain(&terrain, Tileset::Jungle, &source, &options).unwrap();
         assert_eq!(image.width, 8);
-        for texel in image.data[..4 * 4].chunks_exact(4) {
-            assert_eq!(texel, [123, 125, 123, 255]);
+        for texel in image.data[..4 * 4].as_chunks::<4>().0 {
+            assert_eq!(*texel, [123, 125, 123, 255]);
         }
-        for texel in image.data[4 * 4..8 * 4].chunks_exact(4) {
-            assert_eq!(texel, [74, 77, 74, 255]);
+        for texel in image.data[4 * 4..8 * 4].as_chunks::<4>().0 {
+            assert_eq!(*texel, [74, 77, 74, 255]);
         }
     }
 
@@ -880,8 +890,8 @@ mod tests {
         };
 
         let image = render_terrain(&terrain, Tileset::Jungle, &source, &options).unwrap();
-        for texel in image.data.chunks_exact(4) {
-            assert_eq!(texel, [0, 0, 0, 255]);
+        for texel in image.data.as_chunks::<4>().0 {
+            assert_eq!(*texel, [0, 0, 0, 255]);
         }
     }
 }

@@ -242,8 +242,8 @@ mod tests {
         let data = bc1_block(0xFFFF, 0xFFFF, 0);
         let rgba = decode_bc1(&data, 4, 4);
         assert_eq!(rgba.len(), 4 * 4 * 4);
-        for texel in rgba.chunks_exact(4) {
-            assert_eq!(texel, [255, 255, 255, 255]);
+        for texel in rgba.as_chunks::<4>().0 {
+            assert_eq!(*texel, [255, 255, 255, 255]);
         }
     }
 
@@ -283,8 +283,8 @@ mod tests {
         let data = bc1_block(color0, color1, pack_indices_2bit(indices));
         let rgba = decode_bc1(&data, 4, 4);
 
-        for (n, texel) in rgba.chunks_exact(4).enumerate() {
-            assert_eq!(texel, expected[n % 4], "texel {n}");
+        for (n, texel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*texel, expected[n % 4], "texel {n}");
         }
     }
 
@@ -317,8 +317,8 @@ mod tests {
         let data = bc1_block(color0, color1, pack_indices_2bit(indices));
         let rgba = decode_bc1(&data, 4, 4);
 
-        for (n, texel) in rgba.chunks_exact(4).enumerate() {
-            assert_eq!(texel, expected[n % 4], "texel {n}");
+        for (n, texel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*texel, expected[n % 4], "texel {n}");
         }
     }
 
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(data.len(), 16);
 
         let rgba = decode_bc3(&data, 4, 4);
-        for (n, texel) in rgba.chunks_exact(4).enumerate() {
+        for (n, texel) in rgba.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(texel[0..3], [255, 255, 255]);
             assert_eq!(texel[3], expected_alpha[n % 8], "texel {n}");
         }
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(data.len(), 16);
 
         let rgba = decode_bc3(&data, 4, 4);
-        for (n, texel) in rgba.chunks_exact(4).enumerate() {
+        for (n, texel) in rgba.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(texel[3], expected_alpha[n % 8], "texel {n}");
         }
     }

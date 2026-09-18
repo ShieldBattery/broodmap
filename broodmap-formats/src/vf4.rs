@@ -37,7 +37,9 @@ impl Vf4 {
 /// are silently dropped.
 pub fn parse_vf4(data: &[u8]) -> Vf4 {
     let mega_tiles = data
-        .chunks_exact(ENTRY_SIZE)
+        .as_chunks::<ENTRY_SIZE>()
+        .0
+        .iter()
         .take(MAX_MEGA_TILES)
         .map(|entry| {
             let mut flags = [MiniTileFlags::empty(); 16];

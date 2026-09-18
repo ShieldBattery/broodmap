@@ -90,8 +90,10 @@ pub fn read_force_settings(data: &[u8]) -> Result<RawForceSettings, ForceSetting
 
     let assigned_forces: [u8; 8] = data[0..8].try_into().unwrap();
     let force_names_iter = data[8..16]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes(c.try_into().unwrap()).into());
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c).into());
     let force_flags_iter = data[16..20]
         .iter()
         .map(|f| ForceFlags::from_bits_truncate(*f));

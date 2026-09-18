@@ -2,7 +2,7 @@
 //!
 //! The file has no header: it's a flat array of fixed-size records, one per image ID, giving each
 //! image an optional redirect to another image's art. Parsing is permissive: trailing bytes that
-//! don't form a full record are ignored (`chunks_exact`).
+//! don't form a full record are ignored.
 
 /// Size in bytes of a single record: `u32` rel_type, `u32` ref_image.
 const RECORD_SIZE: usize = 8;
@@ -58,7 +58,9 @@ pub struct ImagesRel {
 /// produces more than [`MAX_RECORDS`] records, regardless of how much data is passed in.
 pub fn parse_images_rel(data: &[u8]) -> ImagesRel {
     let records = data
-        .chunks_exact(RECORD_SIZE)
+        .as_chunks::<RECORD_SIZE>()
+        .0
+        .iter()
         .take(MAX_RECORDS)
         .map(|rec| {
             let rel_type = u32::from_le_bytes(rec[0..4].try_into().unwrap());

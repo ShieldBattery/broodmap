@@ -389,7 +389,7 @@ pub(crate) mod tests {
 
         // images.rel: 999 records of {u32 rel_type, u32 ref_image}; 0x200 = "redirect".
         let mut rel = vec![0u8; 999 * 8];
-        for rec in rel.chunks_exact_mut(8) {
+        for rec in rel.as_chunks_mut::<8>().0 {
             rec[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         }
         if let Some((from, to)) = redirect {

@@ -60,7 +60,9 @@ pub enum PlacedUnitsError {
 /// Reads the placed units chunk of a CHK file (aka the UNIT chunk).
 pub fn read_placed_units(data: &[u8]) -> Result<Vec<PlacedUnit>, PlacedUnitsError> {
     let result = data
-        .chunks_exact(36)
+        .as_chunks::<36>()
+        .0
+        .iter()
         .map(|chunk| {
             let instance_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
             let x = u16::from_le_bytes(chunk[4..6].try_into().unwrap());
