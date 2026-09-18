@@ -48,6 +48,8 @@ impl DatKind {
 pub enum AssetRequest {
     /// A tileset's CV5 tile-group table (shared by every tier and art pack).
     Cv5(#[cfg_attr(feature = "serde", serde(with = "crate::plan::tileset_serde"))] Tileset),
+    /// A tileset's minitile terrain flags, used by terrain analysis rather than rendering.
+    Vf4(#[cfg_attr(feature = "serde", serde(with = "crate::plan::tileset_serde"))] Tileset),
     /// A tileset's pre-rendered megatile textures at a given quality tier, from a given art
     /// pack.
     TilesetDds(
@@ -97,6 +99,10 @@ impl std::hash::Hash for AssetRequest {
         match self {
             AssetRequest::Cv5(tileset) => {
                 0u8.hash(state);
+                tileset_discriminant(*tileset).hash(state);
+            }
+            AssetRequest::Vf4(tileset) => {
+                8u8.hash(state);
                 tileset_discriminant(*tileset).hash(state);
             }
             AssetRequest::TilesetDds(tileset, tier, pack) => {
@@ -149,6 +155,7 @@ impl AssetRequest {
     pub fn casc_path(&self) -> String {
         match self {
             AssetRequest::Cv5(tileset) => format!("TileSet/{}.cv5", tileset_stem(*tileset)),
+            AssetRequest::Vf4(tileset) => format!("TileSet/{}.vf4", tileset_stem(*tileset)),
             AssetRequest::TilesetDds(tileset, tier, pack) => format!(
                 "{}{}TileSet/{}.dds.vr4",
                 tier.casc_prefix(),
@@ -389,6 +396,10 @@ mod tests {
     #[test]
     fn cv5_path_matches_expected_layout() {
         assert_eq!(
+            AssetRequest::Vf4(Tileset::Jungle).casc_path(),
+            "TileSet/jungle.vf4"
+        );
+        assert_eq!(
             AssetRequest::Cv5(Tileset::Jungle).casc_path(),
             "TileSet/jungle.cv5"
         );
@@ -508,6 +519,8 @@ mod tests {
         use std::collections::HashSet;
 
         let requests = [
+            AssetRequest::Vf4(Tileset::Jungle),
+            AssetRequest::Vf4(Tileset::Arctic),
             AssetRequest::Cv5(Tileset::Jungle),
             AssetRequest::Cv5(Tileset::Desert),
             AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Hd2, ArtPack::Standard),

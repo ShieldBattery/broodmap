@@ -218,6 +218,10 @@ impl CdnArgs {
 
 #[derive(clap::Args)]
 struct FetchAssetsArgs {
+    /// Fetch CV5/VF4 and units.dat analysis tables, without loading or fetching artwork.
+    #[arg(long)]
+    analysis_only: bool,
+
     /// Optional .scm/.scx map files: fetch only the union of these maps' needs instead of the
     /// style-complete set (worthwhile for the Remastered-family styles, whose complete sets are
     /// large; a fixed map pool needs far less).
@@ -470,8 +474,8 @@ fn minimap(args: MinimapArgs) -> Result<()> {
     Ok(())
 }
 
-/// Downloads render dependencies into a directory laid out the way `DirSource` reads (each
-/// asset at its CASC catalog path under `--out`). With no maps this is the library's
+/// Downloads render and terrain-analysis dependencies into a directory laid out the way
+/// `DirSource` reads (each asset at its CASC catalog path under `--out`). With no maps this is the library's
 /// style-complete set (`required_style_assets`) — everything any map could request at the given
 /// style/size; with maps it's the union of their two-round prefetch lists. Either way the
 /// selection comes from the library, so it can't drift from what `render_chk_preview` actually
@@ -509,10 +513,18 @@ fn fetch_assets(args: FetchAssetsArgs) -> Result<()> {
     };
     let source = source.as_ref();
 
-    let data = GameData::load(source).context("failed to load game data tables")?;
+    // Analysis needs only units.dat, not the complete rendering GameData or artwork.
+    let data = if args.analysis_only {
+        None
+    } else {
+        Some(GameData::load(source).context("failed to load game data tables")?)
+    };
 
-    let requests: Vec<AssetRequest> = if args.maps.is_empty() {
-        required_style_assets(&data, &options)
+    let mut requests: Vec<AssetRequest> = if args.maps.is_empty() {
+        match &data {
+            Some(data) => required_style_assets(data, &options),
+            None => (0u16..8).map(|id| AssetRequest::Cv5(id.into())).collect(),
+        }
     } else {
         let mut seen: HashSet<AssetRequest> = HashSet::new();
         let mut requests = Vec::new();
@@ -521,9 +533,13 @@ fn fetch_assets(args: FetchAssetsArgs) -> Result<()> {
                 .with_context(|| format!("failed to read map file {}", map.display()))?;
             let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None)
                 .with_context(|| format!("failed to parse map file {}", map.display()))?;
-            let per_map = required_preview_assets_for_chk(&chk, &options)
-                .into_iter()
-                .chain(required_preview_graphics_for_chk(&chk, &data, &options));
+            let per_map = match &data {
+                Some(data) => required_preview_assets_for_chk(&chk, &options)
+                    .into_iter()
+                    .chain(required_preview_graphics_for_chk(&chk, data, &options))
+                    .collect(),
+                None => vec![AssetRequest::Cv5(chk.tileset())],
+            };
             for req in per_map {
                 if seen.insert(req.clone()) {
                     requests.push(req);
@@ -532,6 +548,19 @@ fn fetch_assets(args: FetchAssetsArgs) -> Result<()> {
         }
         requests
     };
+    // Full bundles serve both the preview and inspector; restricted map pools only need
+    // the same tilesets' VF4 tables. Rendering itself still does not request these files.
+    let terrain_flags: Vec<_> = requests
+        .iter()
+        .filter_map(|req| match req {
+            AssetRequest::Cv5(tileset) => Some(AssetRequest::Vf4(*tileset)),
+            _ => None,
+        })
+        .collect();
+    requests.extend(terrain_flags);
+    if args.analysis_only {
+        requests.push(AssetRequest::Dat(broodmap_render::DatKind::Units));
+    }
 
     let mut total_bytes: u64 = 0;
     let mut written = 0usize;
