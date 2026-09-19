@@ -6,8 +6,9 @@ use broodmap::chk::{
     terrain::{TerrainTileIds, TileId},
 };
 use broodmap_analysis::{
-    BaseSearchOptions, DepotFootprint, PixelPosition, PixelRect, ResourceKind, ResourceNode,
-    StaticObstacle, TerrainCell, TerrainGrid, WalkPosition, discover_bases, melee_obstacles,
+    BaseSearchOptions, BoundarySpan, DepotFootprint, EntranceOptions, PixelPosition, PixelRect,
+    RegionOptions, ResourceKind, ResourceNode, StaticObstacle, TerrainCell, TerrainGrid,
+    WalkPosition, discover_bases, melee_obstacles,
 };
 use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 use libfuzzer_sys::fuzz_target;
@@ -42,7 +43,301 @@ fn obstacle_rectangles(data: &[u8]) -> Vec<PixelRect> {
     obstacles
 }
 
+// Independent graph oracle for region connectivity and passage coverage.
+fn region_neighbors(grid: &TerrainGrid, index: usize) -> Vec<usize> {
+    let width = grid.width() as usize;
+    let x = (index % width) as u32;
+    let y = (index / width) as u32;
+    let mut result = Vec::new();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let (Some(nx), Some(ny)) = (x.checked_add_signed(dx), y.checked_add_signed(dy)) else {
+                continue;
+            };
+            if !grid
+                .cell(WalkPosition { x: nx, y: ny })
+                .is_some_and(|c| c.walkable)
+            {
+                continue;
+            }
+            if dx != 0
+                && dy != 0
+                && (!grid
+                    .cell(WalkPosition { x: nx, y })
+                    .is_some_and(|c| c.walkable)
+                    || !grid
+                        .cell(WalkPosition { x, y: ny })
+                        .is_some_and(|c| c.walkable))
+            {
+                continue;
+            }
+            result.push(ny as usize * width + nx as usize);
+        }
+    }
+    result
+}
+
+fn exercise_regions(grid: &TerrainGrid, data: &[u8]) {
+    let options = RegionOptions {
+        min_prominence_pixels: 8 + u16::from(data.first().copied().unwrap_or(0) % 16) * 8,
+        min_relative_prominence_percent: data.get(1).copied().unwrap_or(40) % 101,
+    };
+    let analysis = grid.regions(&options).unwrap();
+    let labels = analysis.labels();
+    assert_eq!(labels.len(), grid.cells().len());
+    assert_eq!(
+        analysis.region_at(WalkPosition {
+            x: u32::MAX,
+            y: u32::MAX
+        }),
+        None
+    );
+    let clearance = grid.clearance();
+    let width = grid.width() as usize;
+    let mut counts = vec![0; analysis.regions().len() + 1];
+    let mut expected_pairs = std::collections::BTreeSet::new();
+    for (index, (&label, cell)) in labels.iter().zip(grid.cells()).enumerate() {
+        assert_eq!(label != 0, cell.walkable);
+        assert!(label as usize <= analysis.regions().len());
+        counts[label as usize] += 1;
+        if label == 0 {
+            continue;
+        }
+        for neighbor in region_neighbors(grid, index) {
+            let other = labels[neighbor];
+            if label != other {
+                expected_pairs.insert([label.min(other), label.max(other)]);
+            }
+        }
+    }
+    let mut visited = vec![false; labels.len()];
+    for (i, region) in analysis.regions().iter().enumerate() {
+        assert_eq!(region.id as usize, i + 1);
+        assert_eq!(analysis.region_at(region.peak), Some(region.id));
+        assert_eq!(
+            clearance.radius_pixels(region.peak),
+            Some(region.peak_clearance_pixels)
+        );
+        assert_eq!(counts[region.id as usize], region.cell_count);
+        let start = region.peak.y as usize * width + region.peak.x as usize;
+        let mut queue = std::collections::VecDeque::from([start]);
+        visited[start] = true;
+        let mut reached = 0;
+        while let Some(index) = queue.pop_front() {
+            reached += 1;
+            for next in region_neighbors(grid, index) {
+                if labels[next] == region.id && !visited[next] {
+                    visited[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        assert_eq!(reached, region.cell_count);
+    }
+    let mut pairs = std::collections::BTreeSet::new();
+    for passage in analysis.passages() {
+        assert!(pairs.insert(passage.regions));
+        assert!(passage.regions[0] < passage.regions[1]);
+        let [a, b] = passage.endpoints;
+        assert_eq!(analysis.region_at(a), Some(passage.regions[0]));
+        assert_eq!(analysis.region_at(b), Some(passage.regions[1]));
+        assert!(
+            region_neighbors(grid, a.y as usize * width + a.x as usize)
+                .contains(&(b.y as usize * width + b.x as usize))
+        );
+        assert_eq!(
+            passage.clearance_radius_pixels,
+            clearance
+                .radius_pixels(a)
+                .unwrap()
+                .min(clearance.radius_pixels(b).unwrap())
+        );
+    }
+    assert_eq!(pairs, expected_pairs);
+    if data.first().is_some_and(|byte| byte & 7 == 0) {
+        assert_eq!(analysis, grid.regions(&options).unwrap());
+        let coarser = grid
+            .regions(&RegionOptions {
+                min_prominence_pixels: options.min_prominence_pixels + 32,
+                ..options
+            })
+            .unwrap();
+        assert!(coarser.regions().len() <= analysis.regions().len());
+        let relative_coarser = grid
+            .regions(&RegionOptions {
+                min_relative_prominence_percent: options
+                    .min_relative_prominence_percent
+                    .saturating_add(20)
+                    .min(100),
+                ..options
+            })
+            .unwrap();
+        assert!(relative_coarser.regions().len() <= analysis.regions().len());
+    }
+}
+
+fn exercise_entrances(grid: &TerrainGrid, data: &[u8]) {
+    let options = EntranceOptions {
+        max_distance_pixels: 256 + u32::from(data.first().copied().unwrap_or(0)) * 8,
+        min_widening_percent: u16::from(data.get(1).copied().unwrap_or(25)) % 201,
+    };
+    let endpoints: Vec<_> = grid
+        .cells()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cell)| {
+            cell.walkable.then_some(WalkPosition {
+                x: i as u32 % grid.width(),
+                y: i as u32 / grid.width(),
+            })
+        })
+        .collect();
+    let (Some(&start), Some(&end)) = (endpoints.first(), endpoints.last()) else {
+        return;
+    };
+    let result = grid.entrances(start, end, &options).unwrap();
+    assert!(result.candidates.len() <= 4);
+    if let Some(route) = &result.route {
+        assert_eq!(route.points.first(), Some(&start));
+        assert_eq!(route.points.last(), Some(&end));
+        let mut cost = 0_u64;
+        for pair in route.points.windows(2) {
+            let [a, b] = [pair[0], pair[1]];
+            let ai = a.y as usize * grid.width() as usize + a.x as usize;
+            let bi = b.y as usize * grid.width() as usize + b.x as usize;
+            assert!(region_neighbors(grid, ai).contains(&bi));
+            cost += if a.x == b.x || a.y == b.y { 1000 } else { 1414 };
+        }
+        assert!((route.distance_pixels - cost as f64 * 8.0 / 1000.0).abs() < 0.00001);
+    } else {
+        assert!(result.candidates.is_empty());
+        assert!(grid.route(start, end).unwrap().is_none());
+    }
+    let mut prior = None;
+    for candidate in &result.candidates {
+        assert!(grid.cell(candidate.position).unwrap().walkable);
+        assert!((64.0..=640.0).contains(&candidate.width_pixels));
+        assert!(candidate.approach_max_width_pixels <= candidate.width_pixels * 1.3 + 0.00001);
+        assert!(candidate.outward_min_width_pixels + 0.00001 >= candidate.width_pixels + 64.0);
+        assert!(
+            candidate.outward_min_width_pixels * 100.0 + 0.00001
+                >= candidate.width_pixels * f64::from(100 + options.min_widening_percent)
+        );
+        assert!(candidate.distance_from_start_pixels <= f64::from(options.max_distance_pixels));
+        if let Some(previous) = prior {
+            assert!(candidate.distance_from_start_pixels - previous >= 256.0 - 0.00001);
+        }
+        prior = Some(candidate.distance_from_start_pixels);
+        for endpoint in candidate.endpoints {
+            assert!(endpoint.x <= grid.width() * 8);
+            assert!(endpoint.y <= grid.height() * 8);
+        }
+        let [a, b] = candidate.endpoints;
+        let actual = f64::from(a.x.abs_diff(b.x)).hypot(f64::from(a.y.abs_diff(b.y)));
+        assert!((actual - candidate.width_pixels).abs() < 0.2);
+    }
+    if data.first().is_some_and(|b| b & 15 == 0) {
+        assert_eq!(result, grid.entrances(start, end, &options).unwrap());
+        let middle = endpoints[endpoints.len() / 2];
+        let queries = [
+            (start, end),
+            (start, middle),
+            (end, start),
+            (start, end),
+            (start, start),
+        ];
+        let batch = grid.entrances_batch(&queries, &options).unwrap();
+        for (actual, &(a, b)) in batch.iter().zip(&queries) {
+            assert_eq!(*actual, grid.entrances(a, b, &options).unwrap());
+        }
+        let reversed: Vec<_> = queries.into_iter().rev().collect();
+        assert_eq!(
+            batch.into_iter().rev().collect::<Vec<_>>(),
+            grid.entrances_batch(&reversed, &options).unwrap()
+        );
+    }
+}
+
+fn exercise_areas(grid: &TerrainGrid, data: &[u8]) {
+    let original = grid.partition_by_spans(&[]).unwrap();
+    let coordinate = |index: usize, bound: u32| {
+        let value = u32::from(data.get(index).copied().unwrap_or(0))
+            + u32::from(data.get(index + 1).copied().unwrap_or(0)) * 256;
+        value % (bound + 1)
+    };
+    let mut spans = Vec::new();
+    for index in 0..usize::from(data.first().copied().unwrap_or(0) % 5) {
+        let start = index * 8 + 1;
+        let endpoints = [
+            PixelPosition {
+                x: coordinate(start, grid.width() * 8),
+                y: coordinate(start + 2, grid.height() * 8),
+            },
+            PixelPosition {
+                x: coordinate(start + 4, grid.width() * 8),
+                y: coordinate(start + 6, grid.height() * 8),
+            },
+        ];
+        if endpoints[0] != endpoints[1] {
+            spans.push(BoundarySpan { endpoints });
+        }
+    }
+    let partition = grid.partition_by_spans(&spans).unwrap();
+    let labels = partition.labels();
+    assert_eq!(labels.len(), grid.cells().len());
+    assert!(partition.areas().len() >= original.areas().len());
+    let mut counts = vec![0_u32; partition.areas().len() + 1];
+    let mut parents = vec![None; counts.len()];
+    for (index, (&label, cell)) in labels.iter().zip(grid.cells()).enumerate() {
+        assert_eq!(label > 0, cell.walkable);
+        assert!((label as usize) < counts.len());
+        if label == 0 {
+            continue;
+        }
+        counts[label as usize] += 1;
+        let parent = parents[label as usize].get_or_insert(original.labels()[index]);
+        assert_eq!(
+            *parent,
+            original.labels()[index],
+            "cuts cannot join original components"
+        );
+    }
+    for area in partition.areas() {
+        assert_eq!(counts[area.id as usize], area.cell_count);
+    }
+    for boundary in partition.boundaries() {
+        assert!(boundary.separated_edge_count <= boundary.removed_edge_count);
+        assert_eq!(
+            boundary.separated_edge_count == 0,
+            boundary.region_pairs.is_empty()
+        );
+        for &[a, b] in &boundary.region_pairs {
+            assert!(a > 0 && a < b && (b as usize) < counts.len());
+            assert_eq!(parents[a as usize], parents[b as usize]);
+        }
+    }
+    if data.first().is_some_and(|value| value & 7 == 0) {
+        let mut reordered = spans.clone();
+        reordered.reverse();
+        for span in &mut reordered {
+            span.endpoints.swap(0, 1);
+        }
+        if let Some(span) = spans.first() {
+            reordered.push(*span);
+        }
+        let again = grid.partition_by_spans(&reordered).unwrap();
+        assert_eq!(labels, again.labels());
+        assert_eq!(partition.areas(), again.areas());
+    }
+}
+
 fn exercise_grid(grid: &TerrainGrid, data: &[u8]) {
+    exercise_regions(grid, data);
+    exercise_entrances(grid, data);
+    exercise_areas(grid, data);
     let width = grid.width();
     let height = grid.height();
     let clearance = grid.clearance();
@@ -239,6 +534,28 @@ fuzz_target!(|data: &[u8]| {
     let Some((&h_byte, rest)) = rest.split_first() else {
         return;
     };
+    // Random tiny grids mostly exercise validation and disconnected routes. This family also
+    // reaches the full-width profile: a confined vertical approach opens into a larger room.
+    if w_byte & 15 == 0 {
+        let mouth_y = 36 + u32::from(h_byte % 17);
+        let half_width = 4 + u32::from(data.get(2).copied().unwrap_or(0) % 9);
+        let cells = (0..96)
+            .flat_map(|y| {
+                (0..96).map(move |x| TerrainCell {
+                    walkable: (y >= 1
+                        && y <= mouth_y
+                        && x >= 48 - half_width
+                        && x <= 48 + half_width)
+                        || (y > mouth_y && y < 95 && (4..92).contains(&x)),
+                    terrain_buildable: true,
+                    elevation: 0,
+                    ramp: false,
+                })
+            })
+            .collect();
+        let grid = TerrainGrid::from_cells(96, 96, cells).unwrap();
+        exercise_entrances(&grid, data);
+    }
     let records = &data[..data.len().min(2048)];
     let units = read_placed_units(records).unwrap();
     let sprites = read_sprites(records).unwrap();
