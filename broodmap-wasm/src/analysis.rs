@@ -1,14 +1,24 @@
 //! Compact, graphics-independent bindings for the terrain analysis experiment.
 
+use std::sync::{Arc, OnceLock};
+
 use broodmap::chk::{placed_units::PlacedUnitsError, sprites::SpriteError};
-use broodmap_analysis::{TerrainGrid, WalkPosition, melee_obstacles};
+use broodmap_analysis::{
+    EntranceSurvey, SpanPartition, TerrainGrid, WalkPosition, melee_obstacles,
+};
 use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 use broodmap_render::{AssetRequest, DatKind};
 use wasm_bindgen::prelude::*;
 
 use crate::MapRenderer;
 
+mod areas;
 mod bases;
+mod entrances;
+mod regions;
+
+pub use areas::AreaSnapshot;
+pub use regions::RegionSnapshot;
 
 #[wasm_bindgen]
 impl MapRenderer {
@@ -84,14 +94,7 @@ impl MapRenderer {
             .map_err(|e| format!("terrain unavailable: {e}"))?;
         let grid = TerrainGrid::from_terrain(terrain, &parse_cv5(cv5), &parse_vf4(vf4))
             .map_err(|e| format!("terrain analysis failed: {e}"))?;
-        Ok(TerrainAnalysis {
-            grid,
-            obstructed: None,
-            respect_obstacles: false,
-            obstacle_count: 0,
-            base_inputs: None,
-            base_catalog: None,
-        })
+        Ok(TerrainAnalysis::terrain_only(grid))
     }
 }
 
@@ -99,12 +102,14 @@ impl MapRenderer {
 /// Moving units and mover size are not represented. This does not certify engine pathing or walls.
 #[wasm_bindgen]
 pub struct TerrainAnalysis {
-    grid: TerrainGrid,
+    grid: Arc<TerrainGrid>,
     obstructed: Option<TerrainGrid>,
     respect_obstacles: bool,
     obstacle_count: usize,
     base_inputs: Option<bases::BaseInputs>,
     base_catalog: Option<bases::BaseCatalog>,
+    entrance_survey: OnceLock<EntranceSurvey>,
+    empty_partition: OnceLock<Arc<SpanPartition>>,
 }
 
 #[derive(serde::Serialize)]
@@ -213,11 +218,48 @@ impl TerrainAnalysis {
 }
 
 impl TerrainAnalysis {
+    fn terrain_only(grid: TerrainGrid) -> Self {
+        Self {
+            grid: Arc::new(grid),
+            obstructed: None,
+            respect_obstacles: false,
+            obstacle_count: 0,
+            base_inputs: None,
+            base_catalog: None,
+            entrance_survey: OnceLock::new(),
+            empty_partition: OnceLock::new(),
+        }
+    }
+
+    fn entrance_survey(&self) -> &EntranceSurvey {
+        self.entrance_survey
+            .get_or_init(|| EntranceSurvey::new(Arc::clone(&self.grid)))
+    }
+
+    fn empty_partition(&self) -> Result<Arc<SpanPartition>, String> {
+        if let Some(partition) = self.empty_partition.get() {
+            return Ok(Arc::clone(partition));
+        }
+        let partition = Arc::new(
+            self.grid
+                .partition_by_spans(&[])
+                .map_err(|error| format!("area partition: {error}"))?,
+        );
+        match self.empty_partition.set(Arc::clone(&partition)) {
+            Ok(()) => Ok(partition),
+            Err(_) => {
+                self.empty_partition.get().cloned().ok_or_else(|| {
+                    "empty area partition cache initialization was interrupted".into()
+                })
+            }
+        }
+    }
+
     fn active_grid(&self) -> &TerrainGrid {
         if self.respect_obstacles {
-            self.obstructed.as_ref().unwrap_or(&self.grid)
+            self.obstructed.as_ref().unwrap_or(self.grid.as_ref())
         } else {
-            &self.grid
+            self.grid.as_ref()
         }
     }
 }
@@ -325,14 +367,7 @@ mod tests {
         };
         let mut cells = vec![cell; 3];
         cells[1].walkable = false;
-        let analysis = TerrainAnalysis {
-            grid: TerrainGrid::from_cells(3, 1, cells).unwrap(),
-            obstructed: None,
-            respect_obstacles: false,
-            obstacle_count: 0,
-            base_inputs: None,
-            base_catalog: None,
-        };
+        let analysis = TerrainAnalysis::terrain_only(TerrainGrid::from_cells(3, 1, cells).unwrap());
         assert_eq!(analysis.cell_flags(), [23, 22, 23]);
         let unreachable: serde_json::Value =
             serde_json::from_str(&analysis.route_json(0, 0, 2, 0).unwrap()).unwrap();

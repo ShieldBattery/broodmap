@@ -122,3 +122,96 @@ output comparisons, rebuilt web/Node WASM packages, unchanged catalogs and route
 on five real maps, six-map browser checks, and 51,722 terrain fuzz executions without a
 finding. Map inputs, raw measurements, and the temporary instrumented copy stay in the
 ignored `target/` directory; the reusable native example is the maintained artifact.
+
+
+## Entrance surveys and experimental base areas
+
+The entrance/area prototype now batches directed surveys by origin. A single Dijkstra
+search settles all requested destinations for that origin, preserving the original
+neighbor order, heap ties, and each directional route. The immutable terrain snapshot
+also retains its clearance field and the ordinary components used to measure an area's
+original size. Search trees are released after each origin; partitions with proposed
+cuts are still computed per request.
+
+A side-by-side comparison used the saved pre-optimization release Node/WASM build and
+the rebuilt release module, with identical maps and demo query selection. Times below
+are medians of seven interleaved before/after calls after correctness comparisons warmed
+both implementations. They include surveys, JSON conversion, and original/cut area
+partitions; they exclude map loading, base discovery, rendering, and worker round trips.
+No build or other benchmark ran concurrently. These are local Node measurements, not
+browser latency guarantees.
+
+| Map | Selected pair before -> after (ms) | Whole-map before -> after (ms) | Whole-map directed queries |
+| --- | ---: | ---: | ---: |
+| Python 1.3 | 241.9 -> 106.0 | 949.7 -> 401.5 | 50 |
+| Hunters 2021 | 295.5 -> 186.0 | 913.1 -> 364.2 | 66 |
+
+Both selected-pair workloads contain 14 directed surveys, including nearby bases.
+Whole-map workloads apply the same three-nearest-base policy to every base, plus the
+selected pair, with duplicate queries removed. Whole-map analysis is a benchmark here;
+the demo still analyzes the selected bases and their nearby connections. Batching reduces
+whole-map time by about 58-60%, but it does not make its cost equal to a selected pair.
+
+The first selected-pair call on a fresh analysis snapshot took median 124.7ms on Python
+and 208.8ms on Hunters (three calls each, after module warmup). This includes preparing
+the clearance and original components; map loading and base discovery remain excluded.
+The retained fields use six bytes per walk cell for clearance and component labels,
+about 1.5 MiB on a 128x128-build-tile map, plus component metadata and allocation overhead.
+The underlying terrain grid is shared rather than copied into the prepared survey.
+
+Complete old/new results matched on Python 1.3, Python 1.6, Hunters 2021, Revolver SE 2.0,
+and Lemon 1.1: route points, distances, candidates, boundary metadata, and all area labels.
+Selected-pair comparisons covered widening thresholds 15%, 25%, and 40%; whole-map
+comparisons additionally checked reversed query order and obstacle-mode independence.
+The browser regression covered those five maps, repeated requests, controls, ordinary
+routing, and stale worker replies after map replacement.
+
+Core regression tests compare batching against the original single-query algorithm on
+64 generated grids, disconnected endpoints, duplicate/reversed queries, and a corridor
+requiring expansion through an already settled destination. Batch output is limited to
+256 queries and 2,097,152 total route points, including duplicates. The WASM JSON input
+is additionally limited to 32 KiB. Requests exceeding a limit fail explicitly; they do not
+silently omit surveys or return partial results. Raw comparisons and the saved baseline
+remain in ignored `target/` files.
+
+Validation also passed all 493 workspace tests, three demo orchestration tests, strict
+workspace Clippy, formatting, and a Rust 1.95 all-targets check. A 26-second terrain fuzz
+smoke completed 2,709 executions with no finding, including sampled batch-versus-single
+query equivalence and reversed query ordering.
+
+
+## Review follow-up: diagonal boundary sweeps
+
+The original partitioner inspected every walk cell in each span's expanded bounding box.
+A diagonal across a 1024x1024 grid therefore caused a full-map candidate scan per span.
+The replacement enumerates a conservative strip along the span's major axis, visiting
+at most seven cells per column or row, and applies the unchanged exact crossing predicate.
+The final component flood still runs once over the grid. A deterministic regression
+bounds 256 long diagonal spans to at most `256 * 1024 * 7` candidate cells and checks
+that a span never enumerates the same candidate twice.
+
+A native release diagnostic used an open 1024x1024 grid, with spans from `(0, offset)`
+to `(8192, 8192 - offset)` for offsets 0 through 255, reversing every other span. One
+baseline run took 5062ms; optimized runs took 234ms and 97ms. These are a few diagnostic
+samples rather than a latency distribution. All reported 6735 components, with 4091
+removed edges for the first span and 4030 for the last. One exact diagonal took 49ms
+before and 51/36ms after; the remaining full-map component flood dominates that case.
+Correctness is established separately by the independent finite-segment oracle and
+complete old/new real-map output comparisons, not by these aggregate benchmark counts.
+
+The entrance cleanup also omits four unused rays per eligible route cell: widths at
++32/+64 pixels never fed a filter. Both positions still participate in tangent checks,
+preserving bend rejection. Region indices remain `usize`: narrowing them to `u32`
+would save memory on 64-bit native builds, but they are already 32-bit on wasm32.
+
+The 256-query entrance batch cap and aggregate route-point limit do not impose a CPU
+budget. Every distinct origin may still require a full-grid search, so callers should
+group queries by origin and yield between smaller batches when responsiveness matters.
+This behavior is now stated beside the limits in both core and WASM API documentation;
+no new origin cap or cancellation mechanism was introduced in this checkpoint.
+
+Follow-up validation passed 496 workspace tests, three Node orchestration tests, strict
+workspace Clippy, formatting, Rust 1.95 compatibility, rebuilt web/Node WASM and Vite,
+and the five-map browser regression. All five complete pre-change WASM comparisons
+still matched, including candidate geometry and every partition label. A 31-second
+terrain fuzz smoke completed 3,839 executions without a finding.

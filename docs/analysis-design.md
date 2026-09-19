@@ -1,8 +1,8 @@
 # Terrain analysis experiment
 
-This checkpoint adds resolved terrain, static map obstacles, square clearance fields, resource-base
-candidates, and point/base route comparisons. It is a foundation for regions and wall checking,
-not an engine-compatible movement solver or a complete building-placement checker.
+This checkpoint adds resolved terrain, static map obstacles, square clearance fields, terrain regions,
+resource-base candidates, and point/base route comparisons. It is a foundation for base territory
+and wall checking, not an engine-compatible movement solver or a complete building-placement checker.
 
 ## Ownership and inputs
 
@@ -143,9 +143,220 @@ overlay. The color scale defaults to 4-256px (orange through teal to violet) and
 the stored values. Changing the color scale only repaints the field, without recomputing it.
 Existing routes and base placement do not use this field yet.
 
-This is the first region-analysis checkpoint. Inspecting narrow passages and open-area peaks
-comes before choosing a region-segmentation/merging heuristic. Region boundaries, choke
-connections, base-region associations, and main/natural roles remain subsequent work.
+## Regions and candidate passages
+
+`TerrainGrid::regions(&RegionOptions)` partitions the active walkable raster using clearance
+peaks. `min_prominence_pixels` defaults to 32 and accepts 8 through 4096.
+`min_relative_prominence_percent` defaults to 40 and accepts 0 through 100; zero disables the
+relative filter. A losing peak survives only if the clearance drop before connecting to a stronger
+peak satisfies **both** the absolute threshold and that percentage of its own peak clearance.
+For example, a 200px peak connecting at 160px clears the 32px threshold, but its 20% narrowing
+fails the default relative threshold. A 60px peak connecting at 20px passes both. This suppresses
+splits caused by shallow dips in broad rooms, including those around resources. The strongest
+peak in each disconnected component always survives. Equal-height peaks prefer the earlier
+row-major position; flat plateaus do not produce one seed per cell. Increasing either threshold
+keeps fewer peaks and therefore produces no more regions, although individual boundaries
+and IDs can change. This is an exploratory terrain partition, not a base-territory classifier.
+
+The first pass activates cells in descending clearance order and joins active routing neighbors
+with a disjoint-set structure, recording the prominence of losing peaks at their merge level.
+Surviving peaks seed a priority flood across the same eight-neighbor graph used by routes,
+including the prohibition on diagonal corner cutting. Flood priority favors a higher path
+bottleneck, then shorter local flood distance, then lower region ID and cell index. Distance resets
+to zero whenever a path reaches a lower clearance level, then accumulates octile steps while its
+bottleneck stays at that level. This places competing fronts relative to the local narrowing
+rather than the distance back to their room centers. It reduces the bias that pulled boundaries
+away from entrances when neighboring rooms had unequal sizes. Ownership is final once a cell is settled. This is a
+deterministic segmentation heuristic, not a globally optimal path metric or minimum cut. Every walkable cell gets exactly one
+region; blocked cells get label 0. Each region is connected and contains its seed. Public IDs
+start at 1 and follow seed row-major order. Results are deterministic for the same grid and
+options, but IDs are local to that result rather than persistent map identities.
+
+`RegionAnalysis` owns the row-major `u32` labels, region metadata (peak position, peak square
+clearance radius, cell count), and a graph of candidate passages. Each adjacent region pair
+has one representative crossing between two valid neighboring cells. Among crossings for
+that pair, selection prefers the largest minimum endpoint clearance, with coordinate ties
+resolved deterministically. The marker's `clearance_radius_pixels` is that square radius,
+not a corridor width or a guarantee that a unit can pass. Several geographically distinct
+entrances between the same pair currently share one representative. A region boundary can
+also cross open ground; these markers are not automatically certified strategic chokepoints.
+
+Regions use only walkability and clearance. Elevation, buildability, starts, resources, and
+race-specific building rules do not independently force boundaries. To account for resources
+and neutral objects, run on the grid produced by `with_obstacles`; the demo uses its current
+obstacle mode. Terrain-only mode can help distinguish geological passages from object clutter.
+The implementation is bounded by the existing 1024x1024 grid limit, uses O(N) memory, and
+O(N log N) sorting/priority-queue work. It does not silently drop regions to fit a display cap.
+
+WASM `analysis.analyzeRegions(minProminencePixels, minRelativeProminencePercent)` returns an owned
+`RegionSnapshot`. The second argument is optional and defaults to 40; metadata records both settings.
+`labels()` returns an independent `Uint32Array`; `metadataJson()` returns the small metadata
+catalog without repeating the label raster. Free the snapshot when done. It remains valid
+after the source analysis is freed or toggled, and computing regions does not modify routes
+or base discovery. The worker transfers labels and frees its temporary snapshot in `finally`.
+
+The demo's **Find regions** action displays colored regions and optional passage markers.
+Peak labels are shown only for regions with at least 64 walk cells; smaller regions still
+retain their colors, hover IDs, and graph entries. The peak prominence and minimum relative
+narrowing controls let callers compare finer and coarser partitions. Changing it,
+changing obstacle mode, or rebuilding/replacing terrain clears the old result; stale replies
+cannot attach a previous partition to a new snapshot. Base descriptions associate a base's
+existing route anchor with its region. A base whose route anchor is absent remains unassigned,
+including in terrain-only mode; no replacement anchor or hypothetical obstacle removal is
+inferred. Multiple bases can share one region. Main/natural labels and base territory remain
+separate future steps.
+
+The general peak-suppression/marker-flooding approach is informed by the
+[scikit-image morphology documentation](https://scikit-image.org/docs/stable/api/skimage.morphology#skimage.morphology.h_maxima)
+and [watershed documentation](https://scikit-image.org/docs/stable/api/skimage.segmentation#skimage.segmentation.watershed).
+This implementation uses the project's routing graph and deterministic peak-persistence
+rules; it does not import those libraries or claim identical segmentation results.
+
+## Entrance-width experiment
+
+`TerrainGrid::entrances(start, end, &EntranceOptions)` looks for a confined approach opening
+into wider terrain along a directed survey route. It does not require a clearance peak on both
+sides, and does not depend on region labels or their prominence settings. It returns evidence
+for inspection; it does not yet cut regions, assign base territory, or certify a walling location.
+
+The survey route favors clearance with edge cost `step + step * 64 / min(endpoint_radii)`, using
+integer division and the usual 1000/1414 step costs. This discourages wall-hugging while preserving
+the same legal walk graph. Reported route distance is its physical octile length, not the penalized
+search cost. Its path can differ from ordinary shortest routes. Invalid/blocked endpoints are
+errors; disconnected endpoints return a null route with no candidates.
+
+`TerrainGrid::entrances_batch(queries, options)` returns the same directed results in query order,
+sharing one search among all destinations with the same origin and one clearance field across
+the batch. `EntranceSurvey::new(Arc<TerrainGrid>)` prepares a reusable immutable terrain survey;
+its `batch` method reuses clearance across calls as well. Each search stops when all requested
+destinations have been settled, or its reachable component is exhausted. Settled targets still
+expand when another target remains. Heap ordering and equal-cost parent handling are unchanged,
+so routes and candidate evidence match independent directed queries. Reverse queries remain
+separate origins; a reversed forward route is not substituted for a reverse search.
+
+Batches accept at most 256 queries and cap the combined returned route length at 2,097,152 walk
+points, returning an error if either limit is exceeded. These are input/output limits, not a CPU
+budget: each distinct origin can require a full-grid Dijkstra search, including when an unreachable
+target requires exhausting its reachable component. In the worst case, 256 distinct origins mean
+256 such searches. Callers needing responsive cancellation should submit smaller origin groups
+and yield between batches; a synchronous call cannot be interrupted midway. Empty batches return
+no results. Prepared surveys keep clearance but do not retain every origin's search tree or cache
+results by options.
+
+Candidate centers lie within the first `max_distance_pixels` logical pixels (default 1024,
+valid 256..4096). Profiles need 128px of route behind and 192px ahead, including tangent checks;
+that lookahead may extend beyond the center limit. At each eligible route cell it estimates
+direction from nearby points, quantizes that direction to eight headings, and casts perpendicular rays to measure a cross-section. One normal
+is held fixed across the candidate's entire comparison window. Each ray stops at a blocker, the
+map edge, or 80 walk steps. Cardinal spans count 8 pixels per crossed cell; diagonal spans use
+the same 1.414 approximation as routes. These are sampled raster spans, not exact physical widths
+or engine collision measurements. Returned span endpoints are in logical pixels.
+
+Samples behind the candidate must show a confined approach over 96px, ending at an opening
+64..640px wide. The maximum approach span may be at most 130% of the candidate span. Samples
+96, 128, and 160px ahead must all widen by at least 64px and `min_widening_percent` (default 25,
+valid 0..200). The inside samples must hit terrain on both sides; map-edge and scan-limit hits
+cannot supply those walls. Outward measurements may be lower bounds, explicitly marked in the
+result. Direction checks reject sharp bends through the comparison window. Candidates within
+256px of route distance compete, favoring smaller spans and stronger widening, with at most four
+returned in outward order.
+
+The WASM `entrancesJson(startX, startY, endX, endY, minWideningPercent?)` adapter always uses the
+terrain-only grid. Its coordinates and route points are walk cells; candidate endpoints, spans,
+and route distances are logical pixels. Resources and neutral buildings do not supply the
+geological entrance walls. The core method can instead be called on any caller-supplied grid.
+No base catalog, route, or obstacle mode is mutated by these queries. The WASM snapshot lazily
+prepares one survey tied to its original terrain, shared by the single-query adapter and
+`entrancesBatchJson(queriesJson, minWideningPercent?)`. Batch JSON is
+`[[[startX,startY],[endX,endY]], ...]`, capped at 32 KiB, and the result is an array of the same
+survey objects in input order. The terrain is shared through `Arc`, so preparation does not copy
+the grid. Obstacle toggles do not invalidate this terrain-only cache; replacing the analysis
+snapshot gives the new map its own cache.
+
+In the demo, discover bases, select A and B, and choose **Inspect entrances at A and B**.
+Both directed surveys run independently, so the selected order cannot hide an entrance near B.
+Dashed routes show the surveyed paths; A1/B1 span labels identify the originating base and show
+widths in build tiles, with approach and outward evidence in the result text. Changing region
+thresholds does not change these results. Base selections, terrain, and entrance settings invalidate old results, and stale
+worker replies cannot restore them. Bases without an existing route anchor cannot start a survey.
+
+This is a local, direction-dependent detector. Another target can select another exit; parallel
+bypasses are not ruled out. Winding entrances, transitions outside the sampling window, and
+openings outside the span limits can be missed. Terrain-only evidence does not establish current
+access through neutral blockers, building placement legality, or unit fit. The base-area experiment
+below tests whether proposed spans can supply useful partition boundaries.
+
+The initial real-map check covers Python 1.3 and 1.6, Hunters 2021, and Revolver SE 2.0.
+On both Python versions, surveying the right natural toward the left natural finds a 320px span
+with at least 400px ahead; the top natural toward the bottom main finds 392px with 528px ahead.
+These are repeatable geometric observations, not ground-truth wall labels. Tests cover exact ray
+endpoints, blocked diagonal corners, flat corridors, bends, disconnected endpoints, and capped
+outward evidence. Fuzz checks enforce legal routes, physical distances, span bounds, widening,
+candidate spacing, and determinism. The browser check exercises tuning, overlay visibility,
+base changes, obstacle modes, and stale replies across map replacement.
+
+## Base-area boundary experiment
+
+**Test base areas at A and B** shades the terrain components containing the selected bases after
+candidate entrance crossings are closed for partitioning. Ordinary routes and clearance regions
+stay unchanged. This is a way to evaluate proposed base boundaries, not a finished map-wide
+region classifier or a wall-placement solver.
+
+`TerrainGrid::partition_by_spans(&[BoundarySpan])` accepts up to 256 finite segments in logical
+pixel coordinates. It removes only existing legal walk-graph edges crossing those segments and
+floods the remaining graph. Every original walkable cell retains a positive component label;
+blocked terrain stays zero. No virtual obstacle is added to the source grid. Endpoints may lie
+on the map edge, but must be in bounds and distinct. Component IDs follow row-major traversal.
+Reversing endpoints, reordering spans, or duplicating spans leaves labels unchanged.
+
+A graph vertex lies at its walk-cell center. Vertices exactly on a span's line belong to its
+nonnegative signed side after lexicographically ordering the endpoints. This consistent tie rule
+avoids manufacturing an isolated row of vertices along the cut. Diagonal edges obey the original
+no-corner-cut movement rule. Crossings are tested against the finite segment, not its infinite
+supporting line. Candidate edges are enumerated along the span's major axis, with at most seven
+minor-axis cells visited per column or row. Integer interpolation and a conservative margin
+include crossings at endpoints and grid corners; the exact finite-segment predicate still decides
+which edges to remove. Sweep work therefore grows with total span length rather than bounding-box
+area. A full component flood follows once after all spans; repeated spans retain separate boundary
+assessments but do not change the final labels.
+
+Each input span reports removed edge count, the count whose endpoints have different final
+labels, and sorted distinct component pairs. These effects are measured **with all cuts applied**:
+two exits can jointly enclose an area even though either alone has a bypass. A removed edge whose
+ends remain connected has a surviving bypass. A span can have both separating and bypassed
+crossings; it is not automatically validated as a chokepoint. Nor does a finite supplied span
+necessarily terminate at real walls: callers proposing their own spans must evaluate that evidence.
+
+The WASM `partitionAreas(spansJson)` method always uses terrain alone, independently of the
+obstacle toggle. JSON is an array of `[[x1,y1],[x2,y2]]` spans, with a 32 KiB input limit. The
+owned `AreaSnapshot` provides a fresh `Uint32Array` via `labels()` and compact `metadataJson()`;
+call `free()` when done. Invalid inputs leave the source analysis unchanged. The empty-span
+partition is lazily cached on the immutable terrain snapshot; returned snapshots share its
+read-only storage while `labels()` still returns a fresh owned array.
+
+The demo surveys the selected pair plus each selected base's three nearest anchored bases in
+both directions (at most 14 directed surveys submitted as one batch). Nearest means
+squared straight-line anchor distance with base-ID tie breaking, not a strategic neighbor claim.
+Exact duplicate spans are consolidated while preserving their source surveys. All proposed spans
+are then applied together. The selected areas are cyan and purple, or amber if they share a
+component. Green span lines separate components; dashed amber lines retain bypassed crossings;
+gray lines cross no legal graph edges. The summary reports area IDs, sizes, other known base
+anchors in each component, and shrinkage relative to uncut terrain connectivity. Threshold, map,
+base, and obstacle changes invalidate both area data and cached textures; stale replies cannot
+restore them. Region prominence settings do not affect the experiment.
+
+On Python 1.3 and 1.6 at 25% widening, the selected left and top naturals produce components of
+5706 and 6040 walk cells, each containing only its own known base anchor. The right natural gives
+5495 cells. Main-ramp spans provide the inner boundaries and the widening spans provide the outer
+boundaries. A sampled span toward the center remains bypassable and is marked accordingly.
+These are regression observations, not authoritative human base-area labels.
+
+Coverage remains deliberately local: bases without route anchors are skipped, nearby disconnected
+bases can consume survey slots, and other exits can be missed. Parallel but nonidentical spans
+can leave small intermediate components; this checkpoint does not merge or classify those.
+Containing only one known base anchor does not prove a strategically correct base area. The next
+step is evaluating and consolidating boundary evidence across more approaches before feeding it
+into the general region partition.
 
 ## Resource bases and depot candidates
 
@@ -294,6 +505,16 @@ diagonal blockers, corridors, map edges, obstacle monotonicity, and the maximum 
 checks verify owned buffers and obstacle toggles; the terrain fuzzer checks clearance bounds
 and local continuity.
 
+Region tests cover flat plateaus, equal-height peak ties, disconnected cells, diagonal
+pinches, corridor prominence, shallow room splits, unequal-room entrance boundaries, and
+representative crossing selection. Fuzz checks independently
+verify label coverage, connected regions, passage coverage and validity, deterministic repeats,
+and nonincreasing region counts under either coarser prominence threshold. Local WASM checks
+exercise these invariants on Lemon, Python 1.3/1.6, Hunters 2021, Revolver SE 2.0, Primeval Isles,
+and Crystallis with installation-supplied assets. Hunters and both Python versions additionally
+have sampled main-room points checked for consistent membership after relative filtering.
+These samples and screenshots are regression observations, not complete annotated base boundaries.
+
 Synthetic tests cover table/index resolution, global row layout across megatiles, aggregate
 walkability thresholds, creep, malformed inputs, diagonal pinches, deterministic ties,
 disconnection, and route cost versus an independent Dijkstra reference. WASM tests exercise
@@ -309,8 +530,8 @@ and Hunters 2021 verify all start-aligned depots and Python
 island prerequisites. Lost Temple and Horizon Lunar Colony also exercise candidate/route invariants
 and UI behavior; their candidate counts are observations, not ground-truth annotations.
 
-Future checkpoints can add per-object identity/removal, movement profiles, and terrain
-regions. Base sites, terrain regions, base territory, and a main/natural role relative to a start
+Future checkpoints can add per-object identity/removal, movement profiles, and region
+refinement. Base sites, terrain regions, base territory, and a main/natural role relative to a start
 remain distinct concepts.
 
 Wall checking should precede wall search: inspect human-provided placements, choose a mover,

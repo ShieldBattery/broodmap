@@ -89,6 +89,13 @@ const analysis = map.analyzeMap(
 const flags = analysis.cellFlags() // row-major; see generated TypeScript docs for bit layout
 const clearance = analysis.clearancePixels() // Uint16Array, row-major square radii in logical pixels
 // 0 = blocked; 4 = next to a blocker/map edge. Not unit passability or corridor width.
+const regions = analysis.analyzeRegions(32, 40) // minimum drop: 32 pixels AND 40% of peak radius
+try {
+  const labels = regions.labels() // owned Uint32Array; 0 blocked, region IDs start at 1
+  const graph = JSON.parse(regions.metadataJson()) // regions and representative passages
+} finally {
+  regions.free()
+}
 const route = JSON.parse(analysis.routeJson(10, 20, 30, 40)) // walk-cell coordinates
 // null groundDistancePixels means disconnected; invalid/blocked endpoints throw.
 const catalog = JSON.parse(analysis.findBasesJson('{}'))
@@ -99,6 +106,23 @@ const catalog = JSON.parse(analysis.findBasesJson('{}'))
 const bases = catalog.bases.filter(base => base.routeAnchor !== null)
 if (bases.length >= 2) {
   const baseRoute = JSON.parse(analysis.baseRouteJson(bases[0].id, bases[1].id))
+  const [ax, ay] = bases[0].routeAnchor
+  const [bx, by] = bases[1].routeAnchor
+  const entrances = JSON.parse(analysis.entrancesJson(ax, ay, bx, by, 25))
+  // Batch multiple destinations per origin to share route searches; outputs keep query order.
+  const surveys = JSON.parse(analysis.entrancesBatchJson(JSON.stringify([
+    [[ax, ay], [bx, by]], [[bx, by], [ax, ay]],
+  ]), 25))
+  // Terrain-only survey from A toward B. Span endpoints are pixels; route points are walk cells.
+  // An outward width marked outwardWidthIsLowerBound is not an exact measured opening width.
+  const areas = analysis.partitionAreas(JSON.stringify(entrances.candidates.map(c => c.endpoints)))
+  try {
+    const labels = areas.labels() // every terrain-walkable cell keeps a positive component ID
+    const evidence = JSON.parse(areas.metadataJson()) // areas and effects of all supplied cuts
+  } finally {
+    areas.free()
+  }
+  // These virtual partition boundaries do not change ordinary routes or clearance regions.
 }
 analysis.free()
 ```
@@ -111,6 +135,33 @@ The heatmap and hover radius follow **Respect map obstacles**. **Color scale max
 to 256px; choose a smaller range for tight gaps or a larger range for open areas. It changes
 only the colors, not the measured radii. Radius measures a centered,
 axis-aligned empty square and includes the map boundary; it is not an engine movement test.
+
+Use **Find regions** to color open-area partitions and mark candidate passages. Increase
+peak prominence or minimum relative narrowing to merge minor clearance peaks. Relative narrowing
+(default 40%) suppresses shallow splits in broad rooms, including those around resources.
+Base descriptions show their route anchor's region when available. Changing either threshold
+or obstacle mode clears the partition; run
+**Find regions** again to compare. Passage radii are square clearance values, not choke widths.
+
+After **Find bases**, select A and B and choose **Inspect entrances at A and B** to test the
+one-sided width detector in both directions. It searches the first 32 build tiles outward from
+each base along terrain-only survey routes. Labels A1/B1 identify the surveyed end, with widths
+and outward widening reported separately for each direction. Adjust **Minimum widening**
+to compare candidates. Region prominence settings do not affect this experiment. The detector
+can miss other exits and does not establish a sealed chokepoint or legal building wall.
+
+**Test base areas at A and B** also surveys each selected base's three nearest anchored bases.
+These connections are batched by origin. The terrain snapshot reuses prepared clearance and its
+original connected components across calls; changing maps creates a fresh snapshot.
+The public batch API accepts up to 256 queries, but each distinct origin can still require a
+full-grid search. The query/output limits are not a CPU budget; callers needing responsive
+cancellation should submit smaller origin groups and yield between synchronous calls.
+It closes the proposed crossings for an experimental terrain-only component flood and selects
+**Experimental base areas** in the overlay menu. Cyan/purple show the two selected components;
+amber means both bases remain in the same component. Green boundary lines separate components
+with all cuts applied; dashed amber lines retain bypassed crossings. The summary lists the known
+bases still connected inside each selected area. This local experiment can miss exits and does
+not alter normal routes, certify wallability, or replace the clearance region overlay.
 
 For a static demo build, run `pnpm run build:demo`. The output is `examples/dist/`.
 Game assets are not bundled: serve an exported asset directory separately and set the

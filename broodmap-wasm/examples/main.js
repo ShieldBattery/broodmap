@@ -25,6 +25,10 @@ let routeInFlight = false
 let obstacleInFlight = false
 let basesInFlight = false
 let baseRouteInFlight = false
+let regionRevision = 0
+let regionInFlight = false
+let entranceRevision = 0
+let entranceInFlight = false
 let renderStatusToken = 0
 let analysisStatusToken = 0
 let baseStatusToken = 0
@@ -32,6 +36,8 @@ let terrain = null
 let route = null
 let baseDiscovery = null
 let baseRoute = null
+let regions = null
+let entrances = null
 let selected = []
 const pending = new Map()
 
@@ -88,6 +94,31 @@ function clearCanvas(id) {
   canvas.height = 0
 }
 
+function invalidateRegions(message = 'Find regions after terrain analysis.') {
+  regionRevision++
+  regions = null
+  regionInFlight = false
+  terrain?.textures.delete('regions')
+  el('regionLegend').hidden = true
+  el('regionResult').textContent = message
+  el('hover').textContent = 'Move over the terrain view to inspect a cell.'
+  if (baseDiscovery) {
+    populateBaseControls()
+    describeBases()
+  }
+}
+
+function invalidateEntrances(message = 'Choose two base anchors to inspect terrain entrances.') {
+  entranceRevision++
+  entrances = null
+  entranceInFlight = false
+  el('entranceResult').textContent = message
+  el('entranceLegend').hidden = true
+  el('baseAreaLegend').hidden = true
+  el('baseAreaResult').textContent = 'Test base areas to flood behind candidate entrance boundaries.'
+  terrain?.textures.delete('baseAreas')
+}
+
 function resetBases() {
   baseRevision++
   baseRouteRevision++
@@ -95,6 +126,8 @@ function resetBases() {
   baseRoute = null
   basesInFlight = false
   baseRouteInFlight = false
+  invalidateRegions()
+  invalidateEntrances()
   el('findBases').disabled = true
   el('showBases').checked = true
   el('showBases').disabled = true
@@ -105,17 +138,36 @@ function resetBases() {
   el('baseMode').textContent = 'Find bases after terrain analysis.'
   el('baseResult').textContent = 'Find bases after terrain analysis to inspect mineral fields.'
   el('baseRouteResult').textContent = 'Choose two discovered bases to compare their anchors.'
+  el('findRegions').disabled = true
+  el('regionProminence').disabled = true
+  el('regionRelativeProminence').disabled = true
+  el('showPassages').checked = true
+  el('showPassages').disabled = true
+  el('regionResult').textContent = 'Find regions after terrain analysis.'
+  el('findEntrances').disabled = true
+  el('findBaseAreas').disabled = true
+  el('entranceWidening').disabled = true
+  el('showEntrances').checked = true
+  el('showEntrances').disabled = true
 }
 
 function syncBaseControls() {
-  const pending = basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight
+  const pending = basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight || regionInFlight || entranceInFlight
   el('findBases').disabled = !terrain || pending
+  el('findRegions').disabled = !terrain || pending
+  el('regionProminence').disabled = !terrain || pending
+  el('regionRelativeProminence').disabled = !terrain || pending
+  el('showPassages').disabled = !regions || pending
   el('showBases').disabled = !baseDiscovery || basesInFlight || obstacleInFlight
   el('baseControls').hidden = !baseDiscovery
   const comparable = hasBasePair()
   el('baseA').disabled = !baseDiscovery || pending
   el('baseB').disabled = !baseDiscovery || pending
   el('compareBases').disabled = !comparable || pending
+  el('findEntrances').disabled = !comparable || pending
+  el('findBaseAreas').disabled = !comparable || pending
+  el('entranceWidening').disabled = !comparable || pending
+  el('showEntrances').disabled = !entrances || pending
   el('respectObstacles').disabled = !terrain || pending
   el('analyze').disabled = !mapInfo || pending
 }
@@ -139,6 +191,9 @@ function resetTerrain() {
   el('clearanceLegend').hidden = true
   el('clearanceScaleControl').hidden = true
   el('elevationLegend').hidden = true
+  el('regionLegend').hidden = true
+  el('regionProminence').disabled = true
+  el('regionRelativeProminence').disabled = true
   el('routeResult').textContent = 'Analyze terrain, then click two walkable cells.'
   el('hover').textContent = 'Move over the terrain view after analysis.'
 }
@@ -211,7 +266,10 @@ el('render').addEventListener('click', async () => {
     if (target !== worker || revision !== renderRevision) return
     previewImage = result.image
     drawTo(el('preview'), previewImage)
-    if (terrain) drawTerrainBackdrop()
+    if (terrain) {
+      drawTerrainBackdrop()
+      drawOverlay()
+    }
     const notes = [
       `${mapName}: rendered ${result.image.width}x${result.image.height} in ${result.elapsedMs} ms (${result.fetched} assets).`,
       ...(result.skipped ? [`Skipped ${result.skipped} missing graphics assets.`] : []),
@@ -246,6 +304,7 @@ el('analyze').addEventListener('click', async () => {
     terrain = { ...result, flags: new Uint8Array(result.flags), clearance: new Uint16Array(result.clearance), textures: new Map(), obstaclesEnabled: true }
     el('respectObstacles').checked = true
     el('respectObstacles').disabled = false
+    el('findRegions').disabled = false
     updateObstacleMode()
     route = null
     selected = []
@@ -268,12 +327,65 @@ el('analyze').addEventListener('click', async () => {
 
 el('overlay').addEventListener('change', () => {
   el('hover').textContent = 'Move over the terrain view to inspect a cell.'
+  if (el('overlay').value === 'regions' && !regions) {
+    el('regionResult').textContent = 'Find regions first to populate this overlay.'
+  }
   drawOverlay()
 })
 el('clearanceMax').addEventListener('change', () => {
   terrain?.textures.delete('clearance')
   drawOverlay()
 })
+for (const id of ['regionProminence', 'regionRelativeProminence']) {
+  el(id).addEventListener('change', () => {
+    invalidateRegions('Find regions again with the new region settings.')
+    drawOverlay()
+    syncBaseControls()
+  })
+}
+el('showPassages').addEventListener('change', drawOverlay)
+el('findRegions').addEventListener('click', async () => {
+  if (!terrain || regionInFlight || basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight) return
+  invalidateRegions('Finding terrain regions...')
+  const revision = regionRevision
+  const target = worker
+  const snapshot = terrain
+  const prominence = Number(el('regionProminence').value)
+  const relativeProminence = Number(el('regionRelativeProminence').value)
+  regionInFlight = true
+  el('findRegions').disabled = true
+  el('regionProminence').disabled = true
+  el('regionRelativeProminence').disabled = true
+  el('showPassages').checked = true
+  syncBaseControls()
+  drawOverlay()
+  try {
+    const result = await callWorker('findRegions', { minProminencePixels: prominence, minRelativeProminencePercent: relativeProminence })
+    if (target !== worker || snapshot !== terrain || revision !== regionRevision) return
+    regions = { ...result, labels: new Uint32Array(result.labels) }
+    terrain.textures.delete('regions')
+    el('overlay').value = 'regions'
+    el('showPassages').disabled = false
+    el('regionLegend').hidden = el('overlay').value !== 'regions'
+    el('regionResult').textContent = `${result.metadata.regions.length} regions, ${result.metadata.passages.length} candidate passages found in ${result.elapsedMs} ms.`
+    if (baseDiscovery) {
+      populateBaseControls()
+      describeBases()
+    }
+    drawOverlay()
+  } catch (error) {
+    if (target === worker && snapshot === terrain && revision === regionRevision) {
+      el('regionResult').textContent = `Region analysis failed: ${error.message || error}`
+    }
+  } finally {
+    if (target === worker && snapshot === terrain && revision === regionRevision) {
+      regionInFlight = false
+      el('regionProminence').disabled = false
+      syncBaseControls()
+    }
+  }
+})
+
 el('opacity').addEventListener('input', () => {
   el('opacityValue').value = `${el('opacity').value}%`
   drawOverlay()
@@ -284,6 +396,9 @@ el('respectObstacles').addEventListener('change', async () => {
   const target = worker
   const snapshot = terrain
   const obstacleToken = ++obstacleRevision
+  invalidateRegions('Find regions again after changing map obstacles.')
+  invalidateEntrances('Find entrances again after changing map obstacles.')
+  el('showPassages').checked = true
   routeRevision++
   route = null
   selected = []
@@ -294,6 +409,7 @@ el('respectObstacles').addEventListener('change', async () => {
   el('baseRouteResult').textContent = 'Updating map obstacles...'
   el('respectObstacles').disabled = true
   el('analyze').disabled = true
+  el('findRegions').disabled = true
   syncBaseControls()
   const obstacleStatusToken = status('Updating map obstacles...')
   el('routeResult').textContent = 'Updating map obstacles...'
@@ -362,7 +478,12 @@ function baseLabel(base) {
     base.requiredObstacles.length ? `clear ${base.requiredObstacles.length} building(s)` : '',
     base.startClearedObstacles.length ? `startup clears ${base.startClearedObstacles.length} object(s)` : '',
   ].filter(Boolean).map((text) => `, ${text}`).join('')
-  return `Base ${base.id + 1}: ${base.mineralCount} minerals, ${base.gasCount} gas${starts}${clearing}`
+  let regionLabel = ', no active region'
+  if (regions && base.routeAnchor) {
+    const regionId = regions.labels[base.routeAnchor[1] * terrain.widthWalkTiles + base.routeAnchor[0]]
+    if (regionId) regionLabel = `, region ${regionId}`
+  }
+  return `Base ${base.id + 1}: ${base.mineralCount} minerals, ${base.gasCount} gas${starts}${regionLabel}${clearing}`
 }
 
 function populateBaseControls() {
@@ -378,7 +499,7 @@ function populateBaseControls() {
   el('baseB').replaceChildren(...options)
   const ids = baseDiscovery.bases.map((base) => String(base.id))
   el('baseA').value = ids.includes(priorA) ? priorA : (ids[0] || '')
-  el('baseB').value = ids.includes(priorB) && priorB !== el('baseA').value
+  el('baseB').value = ids.includes(priorB)
     ? priorB
     : (ids.find((id) => id !== el('baseA').value) || ids[0] || '')
 }
@@ -392,6 +513,7 @@ function describeBases() {
 
 el('findBases').addEventListener('click', async () => {
   if (!terrain || basesInFlight || baseRouteInFlight || obstacleInFlight) return
+  invalidateEntrances('Finding bases; entrance survey will need to be run again.')
   const revision = ++baseRevision
   baseRouteRevision++
   baseRoute = null
@@ -467,6 +589,7 @@ for (const id of ['baseA', 'baseB']) {
   el(id).addEventListener('change', () => {
     baseRouteRevision++
     baseRoute = null
+    invalidateEntrances()
     el('baseRouteResult').textContent = hasBasePair()
       ? 'Choose Compare bases to route between the selected depot anchors.'
       : 'Choose two different bases with currently accessible depot anchors to compare.'
@@ -475,6 +598,77 @@ for (const id of ['baseA', 'baseB']) {
   })
 }
 el('showBases').addEventListener('change', drawOverlay)
+el('entranceWidening').addEventListener('change', () => {
+  invalidateEntrances('Inspect entrances again with the new widening threshold.')
+  syncBaseControls()
+  drawOverlay()
+})
+el('showEntrances').addEventListener('change', drawOverlay)
+el('findEntrances').addEventListener('click', () => inspectEntrances(false))
+el('findBaseAreas').addEventListener('click', () => inspectEntrances(true))
+async function inspectEntrances(includeAreas) {
+  if (!terrain || !baseDiscovery || !hasBasePair() || entranceInFlight || basesInFlight || baseRouteInFlight || obstacleInFlight || regionInFlight || analysisInFlight) return
+  const [startId, endId] = selectedBaseIds()
+  const start = baseById(startId).routeAnchor
+  const end = baseById(endId).routeAnchor
+  const revision = ++entranceRevision
+  const target = worker
+  const snapshot = terrain
+  const selectedSnapshot = `${startId}:${endId}`
+  const widening = Number(el('entranceWidening').value)
+  entranceInFlight = true
+  entrances = null
+  terrain.textures.delete('baseAreas')
+  el('baseAreaResult').textContent = includeAreas ? 'Surveying nearby connections and testing boundary crossings...' : 'Test base areas to flood behind candidate entrance boundaries.'
+  el('entranceResult').textContent = 'Inspecting terrain-only width transitions...'
+  el('findEntrances').disabled = true
+  el('findBaseAreas').disabled = true
+  el('entranceWidening').disabled = true
+  el('showEntrances').checked = true
+  syncBaseControls()
+  drawOverlay()
+  try {
+    const result = await callWorker('findEntrances', {
+      startX: start[0], startY: start[1], endX: end[0], endY: end[1], minWideningPercent: widening,
+      includeAreas, selectedIds: [startId, endId],
+      bases: includeAreas ? baseDiscovery.bases.map(({ id, routeAnchor }) => ({ id, routeAnchor })) : undefined,
+    })
+    if (target !== worker || snapshot !== terrain || revision !== entranceRevision || selectedSnapshot !== `${selectedBaseIds()[0]}:${selectedBaseIds()[1]}`) return
+    if (result.areaExperiment) result.areaExperiment.labels = new Uint32Array(result.areaExperiment.labels)
+    entrances = result
+    if (result.areaExperiment) {
+      // The pending redraw may have cached an empty texture for this overlay.
+      terrain.textures.delete('baseAreas')
+      el('overlay').value = 'baseAreas'
+      describeBaseAreas(result.areaExperiment)
+    }
+    el('entranceLegend').hidden = false
+    const count = result.surveys.reduce((total, survey) => total + survey.candidates.length, 0)
+    const summary = result.surveys.flatMap((survey) => {
+      const baseId = survey.from === 'A' ? startId : endId
+      if (!survey.candidates.length) return [`${survey.from} (Base ${baseId + 1}): no candidate within the first ${survey.maxDistancePixels / 32} tiles.`]
+      return survey.candidates.map((candidate, index) => {
+        const lowerBound = candidate.outwardWidthIsLowerBound ? 'at least ' : ''
+        return `${survey.from}${index + 1} (Base ${baseId + 1}): ${(candidate.widthPixels / 32).toFixed(1)} tiles across; approach up to ${(candidate.approachMaxWidthPixels / 32).toFixed(1)}, widening to ${lowerBound}${(candidate.outwardMinWidthPixels / 32).toFixed(1)} tiles ahead; ${(candidate.distanceFromStartPixels / 32).toFixed(1)} tiles from ${survey.from}`
+      })
+    })
+    el('entranceResult').textContent = !result.surveys.some((survey) => survey.route)
+      ? `Base ${startId + 1} and Base ${endId + 1} are disconnected on terrain; no entrance survey route.`
+      : `${count} directional candidate${count === 1 ? '' : 's'}, surveying outward from both bases (${result.elapsedMs} ms):\n${summary.join('\n')}`
+    drawOverlay()
+  } catch (error) {
+    if (target === worker && snapshot === terrain && revision === entranceRevision) {
+      el('entranceResult').textContent = `Entrance survey failed: ${error.message || error}`
+      if (includeAreas) el('baseAreaResult').textContent = 'Base-area experiment failed; no partition is displayed.'
+    }
+  } finally {
+    if (target === worker && snapshot === terrain && revision === entranceRevision) {
+      entranceInFlight = false
+      el('entranceWidening').disabled = false
+      syncBaseControls()
+    }
+  }
+}
 
 el('resetRoute').addEventListener('click', () => {
   routeRevision++
@@ -484,6 +678,20 @@ el('resetRoute').addEventListener('click', () => {
   drawOverlay()
   el('routeResult').textContent = 'Click a walkable cell for A, then another for B.'
 })
+
+
+function describeBaseAreas(experiment) {
+  const separated = experiment.boundaries.filter((span) => span.separatedEdgeCount > 0).length
+  const bypassed = experiment.boundaries.filter((span) => span.removedEdgeCount > span.separatedEdgeCount).length
+  const ineffective = experiment.boundaries.filter((span) => !span.removedEdgeCount).length
+  const lines = experiment.selected.map((area, index) => {
+    const others = area.baseIds.filter((id) => id !== area.baseId)
+    const connected = others.length ? `also contains Bases ${others.map((id) => id + 1).join(', ')}` : 'contains only this known base anchor'
+    const reduction = area.cellCount < area.originalCellCount ? `${(100 * area.cellCount / area.originalCellCount).toFixed(1)}% of its original terrain component` : 'unchanged from its original terrain component'
+    return `${index ? 'B' : 'A'} (Base ${area.baseId + 1}, area ${area.areaId}): ${(area.cellCount / 16).toFixed(0)} build tiles of area; ${reduction}; ${connected}.`
+  })
+  el('baseAreaResult').textContent = `${experiment.surveyCount} directed surveys; ${experiment.boundaries.length} proposed boundaries. With all cuts applied: ${separated} boundaries separate components; ${bypassed} boundaries retain bypassed crossings; ${ineffective} boundaries cross no legal edges.\n${lines.join('\n')}\nExperimental terrain-only components; nearby surveys can miss exits.${experiment.skippedAnchorCount ? ` ${experiment.skippedAnchorCount} bases without route anchors were not surveyed.` : ''}`
+}
 
 function drawTo(canvas, image) {
   canvas.width = image.width
@@ -511,6 +719,8 @@ el('terrainOverlay').addEventListener('pointermove', (event) => {
   const elevation = (cell.flags >> 3) & 3
   const clearance = ` | square clearance radius ${terrain.clearance[cell.y * terrain.widthWalkTiles + cell.x]}px`
   el('hover').textContent = `Walk (${cell.x}, ${cell.y}) | pixel (${cell.x * 8 + 4}, ${cell.y * 8 + 4}) | ${cell.flags & 1 ? 'walkable' : 'blocked'}, ${cell.flags & 2 ? 'terrain-buildable' : 'terrain-unbuildable'}, ${cell.flags & 4 ? 'ramp' : 'flat'}, ${cell.flags & 32 ? 'map obstacle' : 'no map obstacle'}, elevation ${elevation}${clearance}`
+  if (regions) el('hover').textContent += ' | region ' + (regions.labels[cell.y * terrain.widthWalkTiles + cell.x] || 'unassigned')
+  if (entrances?.areaExperiment) el('hover').textContent += ' | terrain-only area ' + (entrances.areaExperiment.labels[cell.y * terrain.widthWalkTiles + cell.x] || 'blocked')
 })
 
 el('terrainOverlay').addEventListener('click', async (event) => {
@@ -575,6 +785,9 @@ function overlayTexture(kind) {
   const elevation = [[35, 114, 191], [57, 173, 119], [231, 193, 74], [120, 120, 120]]
   const clearanceMax = Number(el('clearanceMax').value)
   const clearanceColors = [[238, 100, 45], [40, 205, 195], [98, 86, 232]]
+  const areaExperiment = entrances?.areaExperiment
+  const areaA = areaExperiment?.selected[0].areaId
+  const areaB = areaExperiment?.selected[1].areaId
   for (let index = 0; index < terrain.flags.length; index++) {
     const flags = terrain.flags[index]
     let color = null
@@ -582,6 +795,16 @@ function overlayTexture(kind) {
     if (kind === 'buildability' && !(flags & 2)) color = [245, 165, 45]
     if (kind === 'ramps' && (flags & 4)) color = [175, 90, 230]
     if (kind === 'obstacles' && (flags & 32)) color = [222, 55, 218]
+    if (kind === 'regions' && (flags & 1) && regions) {
+      const regionId = regions.labels[index]
+      if (regionId) color = [80 + (regionId * 67) % 150, 90 + (regionId * 43) % 140, 120 + (regionId * 29) % 120]
+    }
+    if (kind === 'baseAreas' && areaExperiment) {
+      const label = areaExperiment.labels[index]
+      if (label && label === areaA && label === areaB) color = [243, 180, 70]
+      else if (label && label === areaA) color = [68, 204, 241]
+      else if (label && label === areaB) color = [196, 128, 242]
+    }
     if (kind === 'clearance') {
       const radius = terrain.clearance[index]
       if (!(flags & 1)) color = [42, 47, 58]
@@ -651,7 +874,10 @@ function drawBases(ctx, unit) {
 }
 
 function drawOverlay() {
+  el('baseAreaLegend').hidden = !terrain || !entrances?.areaExperiment || el('overlay').value !== 'baseAreas'
+  el('entranceLegend').hidden = !terrain || !entrances?.surveys.some((survey) => survey.route) || !el('showEntrances').checked
   el('clearanceLegend').hidden = !terrain || el('overlay').value !== 'clearance'
+  el('regionLegend').hidden = !terrain || el('overlay').value !== 'regions' || !regions
   el('clearanceScaleControl').hidden = el('clearanceLegend').hidden
   const clearanceMax = Number(el('clearanceMax').value)
   el('clearanceLegendText').textContent = `square radius: 4px (orange), ${(clearanceMax + 4) / 2}px (teal), ${clearanceMax}+px (violet)`
@@ -669,6 +895,35 @@ function drawOverlay() {
   ctx.drawImage(overlayTexture(el('overlay').value), 0, 0)
   ctx.globalAlpha = 1
   drawBases(ctx, unit)
+  if (regions && el('overlay').value === 'regions') {
+    ctx.save()
+    ctx.font = `bold ${10 * unit}px system-ui`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#ffffff'
+    for (const region of regions.metadata.regions) {
+      if (region.cellCount < 64) continue
+      const [x, y] = region.peak
+      ctx.beginPath()
+      ctx.arc(x + 0.5, y + 0.5, 2 * unit, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.fillText(String(region.id), x + 4 * unit, y + 0.5)
+    }
+    if (el('showPassages').checked) {
+      ctx.strokeStyle = '#fff0a8'
+      ctx.fillStyle = '#fff0a8'
+      for (const passage of regions.metadata.passages) {
+        const [[ax, ay], [bx, by]] = passage.endpoints
+        const x = (ax + bx) / 2 + 0.5
+        const y = (ay + by) / 2 + 0.5
+        ctx.beginPath()
+        ctx.arc(x, y, 3 * unit, 0, Math.PI * 2)
+        ctx.stroke()
+        ctx.fillText(String(passage.clearanceRadiusPixels) + 'px', x, y - 6 * unit)
+      }
+    }
+    ctx.restore()
+  }
   const point = (cell) => [cell.x + 0.5, cell.y + 0.5]
   const radius = 4 * unit
   ctx.lineWidth = 2 * unit
@@ -702,6 +957,58 @@ function drawOverlay() {
       else ctx.moveTo(x + 0.5, y + 0.5)
     })
     ctx.stroke()
+  }
+  if (entrances && el('showEntrances').checked) {
+    ctx.save()
+    ctx.strokeStyle = '#54e7f2'
+    ctx.setLineDash([3 * unit, 3 * unit])
+    ctx.lineWidth = Math.max(unit, 1)
+    for (const survey of entrances.surveys) {
+      ctx.beginPath()
+      survey.route?.points?.forEach(([x, y], index) => {
+        if (index) ctx.lineTo(x + 0.5, y + 0.5)
+        else ctx.moveTo(x + 0.5, y + 0.5)
+      })
+      if (survey.route?.points?.length) ctx.stroke()
+    }
+    ctx.setLineDash([])
+    ctx.lineWidth = 2 * unit
+    ctx.fillStyle = '#9ffaff'
+    ctx.strokeStyle = '#9ffaff'
+    ctx.font = `bold ${10 * unit}px system-ui`
+    for (const survey of entrances.surveys) {
+      survey.candidates.forEach((candidate, index) => {
+        const [[left, top], [right, bottom]] = candidate.endpoints
+        const x1 = left / 8
+        const y1 = top / 8
+        const x2 = right / 8
+        const y2 = bottom / 8
+        ctx.beginPath()
+        ctx.moveTo(x1, y1)
+        ctx.lineTo(x2, y2)
+        ctx.stroke()
+        ctx.fillText(`${survey.from}${index + 1}: ${(candidate.widthPixels / 32).toFixed(1)} tiles`, (x1 + x2) / 2 + 3 * unit, (y1 + y2) / 2)
+      })
+    }
+    ctx.restore()
+  }
+  if (entrances?.areaExperiment && el('showEntrances').checked) {
+    ctx.save()
+    ctx.lineWidth = 2 * unit
+    ctx.font = `bold ${10 * unit}px system-ui`
+    entrances.areaExperiment.boundaries.forEach((span, index) => {
+      const bypassed = span.removedEdgeCount > span.separatedEdgeCount
+      ctx.strokeStyle = !span.removedEdgeCount ? '#a0a5af' : bypassed ? '#ffc15a' : '#72ffac'
+      ctx.fillStyle = ctx.strokeStyle
+      ctx.setLineDash(bypassed ? [3 * unit, 2 * unit] : [])
+      const [[x1, y1], [x2, y2]] = span.endpoints.map(([x, y]) => [x / 8, y / 8])
+      ctx.beginPath()
+      ctx.moveTo(x1, y1)
+      ctx.lineTo(x2, y2)
+      ctx.stroke()
+      ctx.fillText(`E${index + 1}`, (x1 + x2) / 2 + 3 * unit, (y1 + y2) / 2 - 4 * unit)
+    })
+    ctx.restore()
   }
   if (baseRoute && hasBasePair()) {
     const [a, b] = selectedBaseIds().map((id) => baseById(id).routeAnchor)

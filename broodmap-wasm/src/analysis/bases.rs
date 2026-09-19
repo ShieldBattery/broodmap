@@ -499,20 +499,17 @@ mod tests {
         });
         let all_bounds: Vec<_> = resources.iter().map(|node| node.bounds).collect();
         let obstructed = grid.with_obstacles(&all_bounds);
-        let mut analysis = TerrainAnalysis {
-            grid,
-            obstructed: Some(obstructed),
-            respect_obstacles: true,
-            obstacle_count: 5,
-            base_inputs: Some(BaseInputs {
-                resources,
-                starts: vec![PixelPosition { x: 384, y: 304 }],
-                start_players: vec![Some(1)],
-                obstacles: Vec::new(),
-                ignored_resources: 0,
-            }),
-            base_catalog: None,
-        };
+        let mut analysis = TerrainAnalysis::terrain_only(grid);
+        analysis.obstructed = Some(obstructed);
+        analysis.respect_obstacles = true;
+        analysis.obstacle_count = 5;
+        analysis.base_inputs = Some(BaseInputs {
+            resources,
+            starts: vec![PixelPosition { x: 384, y: 304 }],
+            start_players: vec![Some(1)],
+            obstacles: Vec::new(),
+            ignored_resources: 0,
+        });
         let flags = analysis.cell_flags();
         let catalog: serde_json::Value =
             serde_json::from_str(&analysis.find_bases_json("{}").unwrap()).unwrap();
@@ -590,20 +587,17 @@ mod tests {
         let mut rectangles: Vec<_> = resources.iter().map(|r| r.bounds).collect();
         rectangles.push(building.bounds);
         let obstructed = grid.with_obstacles(&rectangles);
-        let mut analysis = TerrainAnalysis {
-            grid,
-            obstructed: Some(obstructed),
-            respect_obstacles: true,
-            obstacle_count: 5,
-            base_inputs: Some(BaseInputs {
-                resources,
-                starts: vec![PixelPosition { x: 384, y: 304 }],
-                start_players: vec![Some(1)],
-                obstacles: vec![building],
-                ignored_resources: 0,
-            }),
-            base_catalog: None,
-        };
+        let mut analysis = TerrainAnalysis::terrain_only(grid);
+        analysis.obstructed = Some(obstructed);
+        analysis.respect_obstacles = true;
+        analysis.obstacle_count = 5;
+        analysis.base_inputs = Some(BaseInputs {
+            resources,
+            starts: vec![PixelPosition { x: 384, y: 304 }],
+            start_players: vec![Some(1)],
+            obstacles: vec![building],
+            ignored_resources: 0,
+        });
         let before = analysis.cell_flags();
         let catalog: serde_json::Value =
             serde_json::from_str(&analysis.find_bases_json("{}").unwrap()).unwrap();

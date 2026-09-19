@@ -14,7 +14,7 @@
   button { cursor: pointer; padding: .3rem .7rem; }
   canvas { image-rendering: pixelated; }
   #preview, #minimap { max-width: 100%; height: auto; border: 1px solid #72869b88; }
-  #status, #hover, #routeResult, #baseResult, #baseRouteResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
+  #status, #hover, #routeResult, #baseResult, #baseRouteResult, #entranceResult, #baseAreaResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
   .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
   .row > * { min-width: 0; }
   #terrainShell { position: relative; width: min(100%, 60rem); background: #080c11; border: 1px solid #72869b88; overflow: hidden; }
@@ -52,30 +52,51 @@
   <h2 id="terrainHeading">Terrain inspector</h2>
   <p class="note">The minimap is the backdrop until rendered artwork is available. Terrain buildability is a CV5 terrain hint, not actual placement legality.</p>
   <div id="terrainControls" hidden>
-    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option><option value="clearance">Clearance radius</option></select></label>
+    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option><option value="clearance">Clearance radius</option><option value="regions">Terrain regions</option><option value="baseAreas">Experimental base areas</option></select></label>
     <label id="clearanceScaleControl" hidden>Color scale maximum: <select id="clearanceMax"><option value="64">64px (2 tiles)</option><option value="128">128px (4 tiles)</option><option value="256" selected>256px (8 tiles)</option><option value="512">512px (16 tiles)</option></select></label>
     <label>Opacity: <input id="opacity" type="range" min="10" max="90" value="45"> <output id="opacityValue">45%</output></label>
     <label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
     <span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
     <button id="resetRoute">Reset route</button>
     <button id="findBases" disabled>Find bases</button>
+  <label>Peak prominence: <select id="regionProminence" disabled>
+    <option value="16">Finer 16px</option><option value="32" selected>32px</option><option value="64">Coarser 64px</option><option value="96">96px</option>
+  </select></label>
+  <label>Minimum relative narrowing: <select id="regionRelativeProminence" disabled>
+    <option value="0">Off</option><option value="25">25%</option><option value="40" selected>40%</option><option value="55">55%</option>
+  </select></label>
+  <button id="findRegions" disabled>Find regions</button>
+  <label><input id="showPassages" type="checkbox" checked disabled> Show passages</label>
     <label><input id="showBases" type="checkbox" checked disabled> Show base footprints</label>
     <span id="baseMode" class="note">Find bases after terrain analysis.</span>
+    <span id="regionResult" class="note">Find regions after terrain analysis.</span>
     <div id="baseControls" hidden>
       <label>Base A: <select id="baseA" aria-label="Base A"></select></label>
       <label>Base B: <select id="baseB" aria-label="Base B"></select></label>
       <button id="compareBases">Compare bases</button>
+      <button id="findEntrances" disabled>Inspect entrances at A and B</button>
+      <button id="findBaseAreas" disabled>Test base areas at A and B</button>
+      <label>Minimum widening: <select id="entranceWidening" disabled>
+        <option value="15">15%</option><option value="25" selected>25%</option><option value="40">40%</option>
+      </select></label>
+      <label><input id="showEntrances" type="checkbox" checked disabled> Show entrance survey</label>
+      <span id="entranceResult" class="note" style="white-space:pre-line">Choose two base anchors to inspect terrain entrances.</span>
     </div>
   </div>
   <p class="legend">
-    <span id="clearanceLegend" hidden><i class="swatch" style="width:7rem;background:linear-gradient(90deg,#ee642d,#28cdc3,#6256e8)"></i><span id="clearanceLegendText">square radius: 4px (orange), 130px (teal), 256+px (violet)</span></span>
+    <span id="baseAreaLegend" hidden><i class="swatch" style="background:#44ccf1"></i>A area <i class="swatch" style="background:#c480f2"></i>B area <i class="swatch" style="background:#f3b446"></i>shared area; green boundary separates, dashed amber has a bypass</span>
+    <span id="regionLegend" hidden><i class="swatch" style="background:#8aa6e8"></i>regions and candidate passages</span><span id="entranceLegend" hidden><i class="swatch" style="background:#54e7f2"></i>terrain-only entrance survey</span><span id="clearanceLegend" hidden><i class="swatch" style="width:7rem;background:linear-gradient(90deg,#ee642d,#28cdc3,#6256e8)"></i><span id="clearanceLegendText">square radius: 4px (orange), 130px (teal), 256+px (violet)</span></span>
     <span id="elevationLegend" hidden><i class="swatch" style="background:#2372bf"></i>elevation 0 <i class="swatch" style="background:#39ad77"></i>elevation 1 <i class="swatch" style="background:#e7c14a"></i>elevation 2</span>
   </p>
   <div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div>
   <p id="hover">Move over the terrain view after analysis.</p>
   <p id="routeResult">Analyze terrain, then click two walkable cells.</p>
   <p id="baseResult">Find bases after terrain analysis to inspect mineral fields.</p>
+  <p id="baseAreaResult">Test base areas to flood behind candidate entrance boundaries.</p>
   <p id="baseRouteResult">Choose two discovered bases to compare their anchors.</p>
+  <p class="note">Test base areas surveys the selected pair and each base's three nearest anchored bases in both directions. Candidate spans block analysis crossings only; normal routes stay unchanged. The overlay floods the resulting components, which may contain multiple bases. Green boundaries separate components with all proposed cuts applied; amber boundaries still have a route around them. This does not establish wallability or exhaustive entrance coverage.</p>
+  <p class="note">Entrance surveys look outward from both A and B, marking width transitions within 32 build tiles of each base. Labels A1/B1 identify the surveyed end; terrain farther ahead supplies widening evidence. It is experimental, can miss other exits, and does not certify walls or engine unit fit.</p>
+  <p class="note">Regions and passages are heuristic summaries of the active terrain. Minimum relative narrowing suppresses room splits where the connecting clearance barely decreases compared with the smaller peak; increase it to merge more regions. Passage radius is a local square-space measure, not corridor width or a unit-fit guarantee. Peak markers show regions with at least 64 cells; hover any cell for its region.</p>
   <p class="note">Base discovery uses a stock 4x3 depot-footprint heuristic. Orange lines show ground routes; dashed lines show air distance. Terrain defines resource clusters. Sites marked * require clearing small mineral patches or overlapping buildings. Occupied starts clear overlapping objects automatically; current routes keep them present. Candidate scoring balances mineral and gas access. Full placement legality and mover clearance are not established.</p>
   <p class="note">Clearance shows how far an empty square can extend from each cell center before touching blocked terrain, active map obstacles, or the map edge. Hover to see its radius in pixels. Adjust the color scale to reveal differences in wider areas; values above its maximum share the final color. This measures space in the grid; actual unit passage needs additional movement rules.</p>
   <p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p>

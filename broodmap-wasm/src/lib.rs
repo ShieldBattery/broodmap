@@ -40,7 +40,7 @@
 
 mod analysis;
 
-pub use analysis::TerrainAnalysis;
+pub use analysis::{AreaSnapshot, RegionSnapshot, TerrainAnalysis};
 
 use std::collections::HashMap;
 
