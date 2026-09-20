@@ -1,14 +1,25 @@
 import init, { MapRenderer } from '../pkg/broodmap_wasm.js'
-import { inspectBaseAreas } from './base-areas.js'
+import { analyzeBaseAreas } from './base-areas.js'
 
 let map = null
 let analysis = null
 let ready = null
 let jobs = Promise.resolve()
+let baseAreaCache = null
+const areaRequests = new Map()
 
 self.onmessage = ({ data }) => {
+  // Cancellation must bypass the serialized queue: the running job yields between origins.
+  if (data.type === 'cancelBaseAreas') {
+    const request = areaRequests.get(data.token)
+    if (request) request.cancelled = true
+    return
+  }
+  if (data.type === 'findBaseAreas') areaRequests.set(data.token, { cancelled: false })
   jobs = jobs.then(() => handle(data)).catch((error) => {
     self.postMessage({ id: data.id, ok: false, error: message(error) })
+  }).finally(() => {
+    if (data.type === 'findBaseAreas') areaRequests.delete(data.token)
   })
 }
 
@@ -108,6 +119,7 @@ async function addAssets(paths, base, allowMissing) {
 async function handle({ id, type, ...payload }) {
   await wasm()
   if (type === 'loadMap') {
+    baseAreaCache = null
     analysis?.free?.()
     analysis = null
     map?.free?.()
@@ -147,6 +159,7 @@ async function handle({ id, type, ...payload }) {
     }
     const oldAnalysis = analysis
     analysis = nextAnalysis
+    baseAreaCache = null
     oldAnalysis?.free?.()
     post(id, { widthWalkTiles: analysis.widthWalkTiles, heightWalkTiles: analysis.heightWalkTiles, obstacleCount: analysis.obstacleCount, flags, clearance, minimap }, [flags, clearance, minimap.data])
     return
@@ -189,26 +202,42 @@ async function handle({ id, type, ...payload }) {
     post(id, JSON.parse(analysis.baseRouteJson(payload.startId, payload.endId)))
     return
   }
+  if (type === 'findBaseAreas') {
+    if (!analysis) throw new Error('Analyze terrain before finding base areas.')
+    const started = performance.now()
+    const request = areaRequests.get(payload.token)
+    const checkCancelled = () => {
+      if (!request || request.cancelled) throw new Error('Base-area analysis cancelled.')
+    }
+    const checkpoint = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      checkCancelled()
+    }
+    await checkpoint()
+    const key = JSON.stringify([payload.minWideningPercent, payload.bases])
+    const cached = baseAreaCache?.key === key
+    let result = cached ? baseAreaCache.result : await analyzeBaseAreas(
+      analysis, payload.bases, payload.minWideningPercent, {
+        checkpoint,
+        onProgress: (progress) => self.postMessage({ id, progress }),
+      },
+    )
+    await checkpoint()
+    // Only complete successful runs replace the cache. Transfer a copy to retain ownership.
+    if (!cached) baseAreaCache = { key, result }
+    result = { ...result, labels: result.labels.slice(0), cached, elapsedMs: Math.round(performance.now() - started) }
+    post(id, result, [result.labels])
+    return
+  }
   if (type === 'findEntrances') {
     if (!analysis) throw new Error('Analyze terrain before inspecting entrances.')
     const started = performance.now()
-    // Each query recognizes widening away from its start. Inspect both selected ends so
-    // an entrance near B is not hidden merely by the order of the base selections.
-    let surveys
-    let areaExperiment = null
-    if (payload.includeAreas) {
-      ({ surveys, areaExperiment } = inspectBaseAreas(
-        analysis, payload.bases, payload.selectedIds, payload.minWideningPercent,
-      ))
-    } else {
-      const start = [payload.startX, payload.startY]
-      const end = [payload.endX, payload.endY]
-      surveys = JSON.parse(analysis.entrancesBatchJson(
-        JSON.stringify([[start, end], [end, start]]), payload.minWideningPercent,
-      )).map((survey, index) => ({ from: index ? 'B' : 'A', ...survey }))
-    }
-    post(id, { surveys, areaExperiment, elapsedMs: Math.round(performance.now() - started) },
-      areaExperiment ? [areaExperiment.labels] : [])
+    const start = [payload.startX, payload.startY]
+    const end = [payload.endX, payload.endY]
+    const surveys = JSON.parse(analysis.entrancesBatchJson(
+      JSON.stringify([[start, end], [end, start]]), payload.minWideningPercent,
+    )).map((survey, index) => ({ from: index ? 'B' : 'A', ...survey }))
+    post(id, { surveys, elapsedMs: Math.round(performance.now() - started) })
     return
   }
   throw new Error(`Unknown worker request: ${type}`)

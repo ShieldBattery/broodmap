@@ -38,6 +38,9 @@ let baseDiscovery = null
 let baseRoute = null
 let regions = null
 let entrances = null
+let baseAreas = null
+let areaRevision = 0
+let areaInFlight = false
 let selected = []
 const pending = new Map()
 
@@ -46,8 +49,12 @@ function makeWorker() {
   nextWorker.onmessage = ({ data }) => {
     const job = pending.get(data.id)
     if (!job) return
-    pending.delete(data.id)
     if (job.worker !== nextWorker) return
+    if (data.progress) {
+      job.onProgress?.(data.progress)
+      return
+    }
+    pending.delete(data.id)
     if (data.ok) job.resolve(data.result)
     else job.reject(new Error(data.error))
   }
@@ -73,12 +80,12 @@ function replaceWorker() {
   return worker
 }
 
-function callWorker(type, payload, transfer = []) {
+function callWorker(type, payload, transfer = [], onProgress) {
   const target = worker
   if (!target) return Promise.reject(new Error('Choose a map first.'))
   const id = nextJobId++
   return new Promise((resolve, reject) => {
-    pending.set(id, { worker: target, resolve, reject })
+    pending.set(id, { worker: target, resolve, reject, onProgress })
     target.postMessage({ id, type, ...payload }, transfer)
   })
 }
@@ -108,15 +115,28 @@ function invalidateRegions(message = 'Find regions after terrain analysis.') {
   }
 }
 
-function invalidateEntrances(message = 'Choose two base anchors to inspect terrain entrances.') {
+function invalidateEntrances(message = 'Choose two base anchors to inspect terrain entrances.', keepAreas = false) {
+  if (!keepAreas) invalidateBaseAreas()
   entranceRevision++
   entrances = null
   entranceInFlight = false
   el('entranceResult').textContent = message
   el('entranceLegend').hidden = true
+}
+
+function invalidateBaseAreas() {
+  if (areaInFlight) worker?.postMessage({ type: 'cancelBaseAreas', token: areaRevision })
+  areaRevision++
+  areaInFlight = false
+  baseAreas = null
+  el('cancelBaseAreas').hidden = true
   el('baseAreaLegend').hidden = true
-  el('baseAreaResult').textContent = 'Test base areas to flood behind candidate entrance boundaries.'
+  el('baseAreaResult').textContent = 'Analyze all base areas once, then select bases to highlight them.'
   terrain?.textures.delete('baseAreas')
+}
+
+function selectedAreas() {
+  return selectedBaseIds().map((id) => baseAreas?.baseAreas.find((area) => area.baseId === id))
 }
 
 function resetBases() {
@@ -152,7 +172,7 @@ function resetBases() {
 }
 
 function syncBaseControls() {
-  const pending = basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight || regionInFlight || entranceInFlight
+  const pending = basesInFlight || baseRouteInFlight || obstacleInFlight || analysisInFlight || regionInFlight || entranceInFlight || areaInFlight
   el('findBases').disabled = !terrain || pending
   el('findRegions').disabled = !terrain || pending
   el('regionProminence').disabled = !terrain || pending
@@ -165,9 +185,9 @@ function syncBaseControls() {
   el('baseB').disabled = !baseDiscovery || pending
   el('compareBases').disabled = !comparable || pending
   el('findEntrances').disabled = !comparable || pending
-  el('findBaseAreas').disabled = !comparable || pending
-  el('entranceWidening').disabled = !comparable || pending
-  el('showEntrances').disabled = !entrances || pending
+  el('findBaseAreas').disabled = !baseDiscovery || pending
+  el('entranceWidening').disabled = !baseDiscovery || pending
+  el('showEntrances').disabled = (!entrances && !baseAreas) || pending
   el('respectObstacles').disabled = !terrain || pending
   el('analyze').disabled = !mapInfo || pending
 }
@@ -397,7 +417,7 @@ el('respectObstacles').addEventListener('change', async () => {
   const snapshot = terrain
   const obstacleToken = ++obstacleRevision
   invalidateRegions('Find regions again after changing map obstacles.')
-  invalidateEntrances('Find entrances again after changing map obstacles.')
+  invalidateEntrances('Find entrances again after changing map obstacles.', true)
   el('showPassages').checked = true
   routeRevision++
   route = null
@@ -589,7 +609,9 @@ for (const id of ['baseA', 'baseB']) {
   el(id).addEventListener('change', () => {
     baseRouteRevision++
     baseRoute = null
-    invalidateEntrances()
+    invalidateEntrances(undefined, true)
+    terrain?.textures.delete('baseAreas')
+    if (baseAreas) describeBaseAreas(baseAreas)
     el('baseRouteResult').textContent = hasBasePair()
       ? 'Choose Compare bases to route between the selected depot anchors.'
       : 'Choose two different bases with currently accessible depot anchors to compare.'
@@ -604,10 +626,10 @@ el('entranceWidening').addEventListener('change', () => {
   drawOverlay()
 })
 el('showEntrances').addEventListener('change', drawOverlay)
-el('findEntrances').addEventListener('click', () => inspectEntrances(false))
-el('findBaseAreas').addEventListener('click', () => inspectEntrances(true))
-async function inspectEntrances(includeAreas) {
-  if (!terrain || !baseDiscovery || !hasBasePair() || entranceInFlight || basesInFlight || baseRouteInFlight || obstacleInFlight || regionInFlight || analysisInFlight) return
+el('findEntrances').addEventListener('click', inspectEntrances)
+el('findBaseAreas').addEventListener('click', analyzeAllBaseAreas)
+async function inspectEntrances() {
+  if (!terrain || !baseDiscovery || !hasBasePair() || areaInFlight || entranceInFlight || basesInFlight || baseRouteInFlight || obstacleInFlight || regionInFlight || analysisInFlight) return
   const [startId, endId] = selectedBaseIds()
   const start = baseById(startId).routeAnchor
   const end = baseById(endId).routeAnchor
@@ -618,8 +640,6 @@ async function inspectEntrances(includeAreas) {
   const widening = Number(el('entranceWidening').value)
   entranceInFlight = true
   entrances = null
-  terrain.textures.delete('baseAreas')
-  el('baseAreaResult').textContent = includeAreas ? 'Surveying nearby connections and testing boundary crossings...' : 'Test base areas to flood behind candidate entrance boundaries.'
   el('entranceResult').textContent = 'Inspecting terrain-only width transitions...'
   el('findEntrances').disabled = true
   el('findBaseAreas').disabled = true
@@ -630,18 +650,9 @@ async function inspectEntrances(includeAreas) {
   try {
     const result = await callWorker('findEntrances', {
       startX: start[0], startY: start[1], endX: end[0], endY: end[1], minWideningPercent: widening,
-      includeAreas, selectedIds: [startId, endId],
-      bases: includeAreas ? baseDiscovery.bases.map(({ id, routeAnchor }) => ({ id, routeAnchor })) : undefined,
     })
     if (target !== worker || snapshot !== terrain || revision !== entranceRevision || selectedSnapshot !== `${selectedBaseIds()[0]}:${selectedBaseIds()[1]}`) return
-    if (result.areaExperiment) result.areaExperiment.labels = new Uint32Array(result.areaExperiment.labels)
     entrances = result
-    if (result.areaExperiment) {
-      // The pending redraw may have cached an empty texture for this overlay.
-      terrain.textures.delete('baseAreas')
-      el('overlay').value = 'baseAreas'
-      describeBaseAreas(result.areaExperiment)
-    }
     el('entranceLegend').hidden = false
     const count = result.surveys.reduce((total, survey) => total + survey.candidates.length, 0)
     const summary = result.surveys.flatMap((survey) => {
@@ -649,7 +660,8 @@ async function inspectEntrances(includeAreas) {
       if (!survey.candidates.length) return [`${survey.from} (Base ${baseId + 1}): no candidate within the first ${survey.maxDistancePixels / 32} tiles.`]
       return survey.candidates.map((candidate, index) => {
         const lowerBound = candidate.outwardWidthIsLowerBound ? 'at least ' : ''
-        return `${survey.from}${index + 1} (Base ${baseId + 1}): ${(candidate.widthPixels / 32).toFixed(1)} tiles across; approach up to ${(candidate.approachMaxWidthPixels / 32).toFixed(1)}, widening to ${lowerBound}${(candidate.outwardMinWidthPixels / 32).toFixed(1)} tiles ahead; ${(candidate.distanceFromStartPixels / 32).toFixed(1)} tiles from ${survey.from}`
+        const turnNote = candidate.outwardSampleCount === 2 ? ' (lookahead stops before a turn)' : ''
+        return `${survey.from}${index + 1} (Base ${baseId + 1}): ${(candidate.widthPixels / 32).toFixed(1)} tiles across; approach up to ${(candidate.approachMaxWidthPixels / 32).toFixed(1)}, widening to ${lowerBound}${(candidate.outwardMinWidthPixels / 32).toFixed(1)} tiles ahead${turnNote}; ${(candidate.distanceFromStartPixels / 32).toFixed(1)} tiles from ${survey.from}`
       })
     })
     el('entranceResult').textContent = !result.surveys.some((survey) => survey.route)
@@ -659,12 +671,68 @@ async function inspectEntrances(includeAreas) {
   } catch (error) {
     if (target === worker && snapshot === terrain && revision === entranceRevision) {
       el('entranceResult').textContent = `Entrance survey failed: ${error.message || error}`
-      if (includeAreas) el('baseAreaResult').textContent = 'Base-area experiment failed; no partition is displayed.'
     }
   } finally {
     if (target === worker && snapshot === terrain && revision === entranceRevision) {
       entranceInFlight = false
       el('entranceWidening').disabled = false
+      syncBaseControls()
+    }
+  }
+}
+
+el('cancelBaseAreas').addEventListener('click', () => {
+  worker?.postMessage({ type: 'cancelBaseAreas', token: areaRevision })
+  el('cancelBaseAreas').disabled = true
+  el('baseAreaResult').textContent = 'Cancelling after the current origin search...'
+})
+
+async function analyzeAllBaseAreas() {
+  if (!terrain || !baseDiscovery || areaInFlight || entranceInFlight || basesInFlight || baseRouteInFlight || obstacleInFlight || regionInFlight || analysisInFlight) return
+  if (baseAreas) {
+    el('overlay').value = 'baseAreas'
+    describeBaseAreas(baseAreas)
+    drawOverlay()
+    return
+  }
+  const revision = ++areaRevision
+  const target = worker
+  const snapshot = terrain
+  const catalog = baseDiscovery
+  const current = () => target === worker && snapshot === terrain && catalog === baseDiscovery && revision === areaRevision
+  areaInFlight = true
+  el('cancelBaseAreas').hidden = false
+  el('cancelBaseAreas').disabled = false
+  el('baseAreaResult').textContent = 'Preparing map-wide base-area analysis...'
+  syncBaseControls()
+  try {
+    const result = await callWorker('findBaseAreas', {
+      token: revision,
+      minWideningPercent: Number(el('entranceWidening').value),
+      bases: catalog.bases.map(({ id, routeAnchor }) => ({ id, routeAnchor })),
+    }, [], (progress) => {
+      if (current() && !el('cancelBaseAreas').disabled) {
+        el('baseAreaResult').textContent = `Surveying base origins: ${progress.completedOrigins}/${progress.totalOrigins}; ${progress.surveyCount} directed surveys completed...`
+      }
+    })
+    if (!current()) return
+    // A completed worker reply may already be in transit when Cancel is clicked.
+    if (el('cancelBaseAreas').disabled) {
+      el('baseAreaResult').textContent = 'Base-area analysis cancelled. No partition was applied.'
+      return
+    }
+    baseAreas = { ...result, labels: new Uint32Array(result.labels) }
+    terrain.textures.delete('baseAreas')
+    el('overlay').value = 'baseAreas'
+    el('showEntrances').checked = true
+    describeBaseAreas(baseAreas)
+    drawOverlay()
+  } catch (error) {
+    if (current()) el('baseAreaResult').textContent = `${error.message || error} No partial partition was applied.`
+  } finally {
+    if (current()) {
+      areaInFlight = false
+      el('cancelBaseAreas').hidden = true
       syncBaseControls()
     }
   }
@@ -684,13 +752,14 @@ function describeBaseAreas(experiment) {
   const separated = experiment.boundaries.filter((span) => span.separatedEdgeCount > 0).length
   const bypassed = experiment.boundaries.filter((span) => span.removedEdgeCount > span.separatedEdgeCount).length
   const ineffective = experiment.boundaries.filter((span) => !span.removedEdgeCount).length
-  const lines = experiment.selected.map((area, index) => {
+  const lines = selectedAreas().map((area, index) => {
+    if (!area) return `${index ? 'B' : 'A'}: no route anchor; no base area assigned.`
     const others = area.baseIds.filter((id) => id !== area.baseId)
     const connected = others.length ? `also contains Bases ${others.map((id) => id + 1).join(', ')}` : 'contains only this known base anchor'
     const reduction = area.cellCount < area.originalCellCount ? `${(100 * area.cellCount / area.originalCellCount).toFixed(1)}% of its original terrain component` : 'unchanged from its original terrain component'
     return `${index ? 'B' : 'A'} (Base ${area.baseId + 1}, area ${area.areaId}): ${(area.cellCount / 16).toFixed(0)} build tiles of area; ${reduction}; ${connected}.`
   })
-  el('baseAreaResult').textContent = `${experiment.surveyCount} directed surveys; ${experiment.boundaries.length} proposed boundaries. With all cuts applied: ${separated} boundaries separate components; ${bypassed} boundaries retain bypassed crossings; ${ineffective} boundaries cross no legal edges.\n${lines.join('\n')}\nExperimental terrain-only components; nearby surveys can miss exits.${experiment.skippedAnchorCount ? ` ${experiment.skippedAnchorCount} bases without route anchors were not surveyed.` : ''}`
+  el('baseAreaResult').textContent = `${experiment.surveyCount} directed surveys across the map (${experiment.elapsedMs} ms); ${experiment.observationCount} distinct entrance observations plus ${experiment.rampCount || 0} terrain ramps consolidated to ${experiment.boundaries.length} boundaries.${experiment.crossingCutsRemoved ? ` ${experiment.crossingCutsRemoved} crossing or coincident cuts discarded.` : ''}${experiment.rampInteriorCutsRemoved ? ` ${experiment.rampInteriorCutsRemoved} cuts inside ramps removed.` : ''}${experiment.serialCutsRemoved ? ` ${experiment.serialCutsRemoved} serial or flat duplicate cuts removed.` : ''}${experiment.junctionCutsRemoved ? ` ${experiment.junctionCutsRemoved} internal junction cuts removed.` : ''} With all cuts applied: ${separated} boundaries separate components; ${bypassed} boundaries retain bypassed crossings; ${ineffective} boundaries cross no legal edges.\n${lines.join('\n')}\nExperimental terrain-only components; nearby surveys can miss exits. Muted sections have no buildable terrain within 2 tiles of their midpoint; other sections are not verified wall locations.${experiment.skippedAnchorCount ? ` ${experiment.skippedAnchorCount} bases without route anchors were not surveyed.` : ''}`
 }
 
 function drawTo(canvas, image) {
@@ -720,7 +789,7 @@ el('terrainOverlay').addEventListener('pointermove', (event) => {
   const clearance = ` | square clearance radius ${terrain.clearance[cell.y * terrain.widthWalkTiles + cell.x]}px`
   el('hover').textContent = `Walk (${cell.x}, ${cell.y}) | pixel (${cell.x * 8 + 4}, ${cell.y * 8 + 4}) | ${cell.flags & 1 ? 'walkable' : 'blocked'}, ${cell.flags & 2 ? 'terrain-buildable' : 'terrain-unbuildable'}, ${cell.flags & 4 ? 'ramp' : 'flat'}, ${cell.flags & 32 ? 'map obstacle' : 'no map obstacle'}, elevation ${elevation}${clearance}`
   if (regions) el('hover').textContent += ' | region ' + (regions.labels[cell.y * terrain.widthWalkTiles + cell.x] || 'unassigned')
-  if (entrances?.areaExperiment) el('hover').textContent += ' | terrain-only area ' + (entrances.areaExperiment.labels[cell.y * terrain.widthWalkTiles + cell.x] || 'blocked')
+  if (baseAreas) el('hover').textContent += ' | terrain-only area ' + (baseAreas.labels[cell.y * terrain.widthWalkTiles + cell.x] || 'blocked')
 })
 
 el('terrainOverlay').addEventListener('click', async (event) => {
@@ -785,9 +854,10 @@ function overlayTexture(kind) {
   const elevation = [[35, 114, 191], [57, 173, 119], [231, 193, 74], [120, 120, 120]]
   const clearanceMax = Number(el('clearanceMax').value)
   const clearanceColors = [[238, 100, 45], [40, 205, 195], [98, 86, 232]]
-  const areaExperiment = entrances?.areaExperiment
-  const areaA = areaExperiment?.selected[0].areaId
-  const areaB = areaExperiment?.selected[1].areaId
+  const areaExperiment = baseAreas
+  const [selectedA, selectedB] = selectedAreas()
+  const areaA = selectedA?.areaId
+  const areaB = selectedB?.areaId
   for (let index = 0; index < terrain.flags.length; index++) {
     const flags = terrain.flags[index]
     let color = null
@@ -874,7 +944,7 @@ function drawBases(ctx, unit) {
 }
 
 function drawOverlay() {
-  el('baseAreaLegend').hidden = !terrain || !entrances?.areaExperiment || el('overlay').value !== 'baseAreas'
+  el('baseAreaLegend').hidden = !terrain || !baseAreas || el('overlay').value !== 'baseAreas'
   el('entranceLegend').hidden = !terrain || !entrances?.surveys.some((survey) => survey.route) || !el('showEntrances').checked
   el('clearanceLegend').hidden = !terrain || el('overlay').value !== 'clearance'
   el('regionLegend').hidden = !terrain || el('overlay').value !== 'regions' || !regions
@@ -992,13 +1062,15 @@ function drawOverlay() {
     }
     ctx.restore()
   }
-  if (entrances?.areaExperiment && el('showEntrances').checked) {
+  if (baseAreas && el('showEntrances').checked) {
     ctx.save()
     ctx.lineWidth = 2 * unit
     ctx.font = `bold ${10 * unit}px system-ui`
-    entrances.areaExperiment.boundaries.forEach((span, index) => {
+    baseAreas.boundaries.forEach((span, index) => {
       const bypassed = span.removedEdgeCount > span.separatedEdgeCount
-      ctx.strokeStyle = !span.removedEdgeCount ? '#a0a5af' : bypassed ? '#ffc15a' : '#72ffac'
+      const remoteFromBuildable = span.buildableNearMidpoint === false
+      ctx.globalAlpha = remoteFromBuildable ? 0.55 : 1
+      ctx.strokeStyle = remoteFromBuildable || !span.removedEdgeCount ? '#a0a5af' : bypassed ? '#ffc15a' : '#72ffac'
       ctx.fillStyle = ctx.strokeStyle
       ctx.setLineDash(bypassed ? [3 * unit, 2 * unit] : [])
       const [[x1, y1], [x2, y2]] = span.endpoints.map(([x, y]) => [x / 8, y / 8])
@@ -1006,7 +1078,7 @@ function drawOverlay() {
       ctx.moveTo(x1, y1)
       ctx.lineTo(x2, y2)
       ctx.stroke()
-      ctx.fillText(`E${index + 1}`, (x1 + x2) / 2 + 3 * unit, (y1 + y2) / 2 - 4 * unit)
+      ctx.fillText(span.kind === 'ramp' ? `R${span.rampId}${span.rampEnd === 'lower' ? 'L' : 'U'}` : `E${index + 1}`, (x1 + x2) / 2 + 3 * unit, (y1 + y2) / 2 - 4 * unit)
     })
     ctx.restore()
   }
