@@ -246,20 +246,26 @@ results by options.
 Candidate centers lie within the first `max_distance_pixels` logical pixels (default 1024,
 valid 256..4096). Profiles need 128px of route behind and 192px ahead, including tangent checks;
 that lookahead may extend beyond the center limit. At each eligible route cell it estimates
-direction from nearby points, quantizes that direction to eight headings, and casts perpendicular rays to measure a cross-section. One normal
-is held fixed across the candidate's entire comparison window. Each ray stops at a blocker, the
-map edge, or 80 walk steps. Cardinal spans count 8 pixels per crossed cell; diagonal spans use
+direction from nearby points, quantizes that direction to eight headings, and casts perpendicular
+rays to measure a cross-section. One normal is held fixed across the candidate's entire comparison
+window. Each ray stops at a blocker, the map edge, or 80 walk steps. Cardinal spans count 8 pixels per crossed cell; diagonal spans use
 the same 1.414 approximation as routes. These are sampled raster spans, not exact physical widths
 or engine collision measurements. Returned span endpoints are in logical pixels.
 
 Samples behind the candidate must show a confined approach over 96px, ending at an opening
 64..640px wide. The maximum approach span may be at most 130% of the candidate span. Samples
-96, 128, and 160px ahead must all widen by at least 64px and `min_widening_percent` (default 25,
-valid 0..200). The inside samples must hit terrain on both sides; map-edge and scan-limit hits
-cannot supply those walls. Outward measurements may be lower bounds, explicitly marked in the
-result. Direction checks reject sharp bends through the comparison window. Candidates within
-256px of route distance compete, favoring smaller spans and stronger widening, with at most four
-returned in outward order.
+96 and 128px ahead must both widen by at least 64px and `min_widening_percent` (default 25,
+valid 0..200). The 160px sample must also pass whenever its tangent remains aligned. A sharp
+turn at that last station instead excludes it from width and lower-bound evidence; the
+`outward_sample_count` / JSON `outwardSampleCount` field then reports two rather than three
+samples. Earlier samples through 128px must still pass the tangent test, and missing tangent
+support near route endpoints still rejects the profile. The inside samples must hit terrain on
+both sides; map-edge and scan-limit hits cannot supply those walls. Outward measurements may be lower bounds, explicitly marked in the
+result. Direction checks reject sharp bends through the required comparison window. Candidates within
+256px of route distance compete. Full three-sample profiles rank before two-sample fallbacks,
+then smaller spans and stronger widening win, with later route position breaking ties. This
+evidence preference also applies to the four-candidate cap, so four full profiles can exclude
+a distant fallback. Selected candidates are returned in outward order.
 
 The WASM `entrancesJson(startX, startY, endX, endY, minWideningPercent?)` adapter always uses the
 terrain-only grid. Its coordinates and route points are walk cells; candidate endpoints, spans,
@@ -297,10 +303,10 @@ base changes, obstacle modes, and stale replies across map replacement.
 
 ## Base-area boundary experiment
 
-**Test base areas at A and B** shades the terrain components containing the selected bases after
-candidate entrance crossings are closed for partitioning. Ordinary routes and clearance regions
-stay unchanged. This is a way to evaluate proposed base boundaries, not a finished map-wide
-region classifier or a wall-placement solver.
+**Analyze all base areas** surveys the map once and caches a terrain partition made from
+candidate entrance boundaries. Selecting A and B highlights their components without changing
+the partition or rerunning searches. Ordinary routes and clearance regions stay unchanged.
+This remains an experimental boundary detector, not a main/natural classifier or wall solver.
 
 `TerrainGrid::partition_by_spans(&[BoundarySpan])` accepts up to 256 finite segments in logical
 pixel coordinates. It removes only existing legal walk-graph edges crossing those segments and
@@ -334,29 +340,220 @@ call `free()` when done. Invalid inputs leave the source analysis unchanged. The
 partition is lazily cached on the immutable terrain snapshot; returned snapshots share its
 read-only storage while `labels()` still returns a fresh owned array.
 
-The demo surveys the selected pair plus each selected base's three nearest anchored bases in
-both directions (at most 14 directed surveys submitted as one batch). Nearest means
-squared straight-line anchor distance with base-ID tie breaking, not a strategic neighbor claim.
-Exact duplicate spans are consolidated while preserving their source surveys. All proposed spans
-are then applied together. The selected areas are cyan and purple, or amber if they share a
-component. Green span lines separate components; dashed amber lines retain bypassed crossings;
-gray lines cross no legal graph edges. The summary reports area IDs, sizes, other known base
-anchors in each component, and shrinkage relative to uncut terrain connectivity. Threshold, map,
-base, and obstacle changes invalidate both area data and cached textures; stale replies cannot
-restore them. Region prominence settings do not affect the experiment.
+The demo chooses each anchored base's three nearest other anchors in the same original terrain
+component and surveys each chosen connection in both directions. Nearest means squared
+straight-line anchor distance with base-ID tie breaking, not a strategic neighbor claim. Islands
+therefore do not consume unreachable neighbor slots. The query set is independent of A/B selection.
+Each origin is submitted separately, sharing one search among its destinations; result routes are
+released after extracting candidate evidence. Progress counts completed origins, including isolated
+anchors with no neighbors. The worker yields between origin batches so cancellation can be handled
+outside its serialized job queue. A synchronous search or partition cannot be interrupted midway;
+a cancellation detected afterward discards its result before publishing or caching it.
+
+Exact span duplicates are consolidated first. Nearby observations can then share a group only
+when their corresponding endpoints are within 32 pixels and their directions differ by at most
+15 degrees. Every pair in a group must pass, preventing chains of increasingly distant observations
+from collapsing into one boundary. A known base anchor strictly between the supporting lines,
+within both spans' extents, prevents consolidation. The narrowest measured member represents the
+group, with endpoint ordering breaking ties; no averaged geometry is invented. Source pairs are
+retained and sorted. This geometric heuristic reduces duplicate cuts, but does not prove that two
+observations describe the same strategic entrance. More than 256 provisional boundaries fails
+explicitly rather than silently dropping evidence.
+
+Before partitioning, conflicting cuts whose interiors cross are resolved greedily: narrower
+observed spans win, with canonical endpoint order breaking equal-width ties. Touching endpoints
+and collinear overlaps do not count as crossing conflicts. Rejected spans are counted separately
+and their sources are not attributed to winners; the pair inspector still exposes the raw
+directional evidence. This prevents crossing room-spanning hypotheses from manufacturing tiny
+regions, but is a selection heuristic rather than proof that the retained cut is strategically
+correct. The 256-boundary cap applies before this filtering.
+
+A provisional partition then exposes consecutive cuts through the same passage. A second,
+conservative pass considers only chains of three or four spans whose intervening components have
+no base anchor and exactly two incident boundaries. Every span must fully separate a single pair
+of components and be a bridge in the full boundary multigraph, excluding alternate loops. Chains
+must have distinct outer components and at most 384 pixels of total midpoint-to-midpoint length.
+A single raster scan measures each intermediate component along and across its two span midpoints.
+Its transverse extent must be at most 1.5 times the smaller span width plus 16 pixels; longitudinal
+extent must be at most the midpoint distance plus half that width plus 16 pixels. Cell extents are
+included. These guards reject broad rooms and long pockets rather than relying on empty base lists
+alone. Failing a geometry guard rejects the whole candidate chain, not a smaller fragment of it.
+
+Within an accepted chain, spans within eight pixels of its narrowest width are treated as near ties.
+The representative minimizes summed midpoint distance to all chain members, with endpoint order
+breaking ties. This favors a central neck over a similarly narrow oblique cut farther inside the
+base. It uses an observed span, never an averaged line. All original observations and source pairs
+remain attached as diagnostics. The partition is recomputed with only retained spans: discarded
+cuts no longer trim base regions. Provisional labels and assessments are never published.
+
+With terrain flags available, a further pass handles close parallel duplicates, including pairs.
+Their intervening component must have no base anchor, exactly two incident boundaries, no ramp
+cells, and one elevation throughout. Both cuts must fully separate a single component pair; unlike
+the longer serial-chain rule, they may participate in a larger bypass loop. Entire cycles are
+rejected. Groups contain two to four spans, every pair within 128 pixels at corresponding endpoints
+and within 15 degrees of parallel. This complete-link rule prevents transitive long-chain merging.
+
+The component must fit a slab aligned with the cuts, including walk-cell extents. Across the cuts,
+the endpoint envelope allows 32 pixels of tolerance; along them, wall nooks may extend by at most
+the larger of 32 pixels or one quarter of the narrower width. Measuring relative to the cuts avoids
+mistaking sideways-shifted endpoints for a long corridor. The same near-minimum-width central
+representative rule preserves original observations. Members of an accepted longer serial chain
+are excluded from this pass, so provisional metadata remains sufficient for both decisions and
+only one final repartition is needed. Ramp/elevation flag bits are immutable terrain attributes;
+obstacle-dependent walkability flags do not affect this consolidation.
+
+Ramp detection is independent of the confined-approach/widening predicate. `TerrainGrid::ramps()`
+finds legal 8-connected components of walkable ramp-flagged cells and samples those cells plus their
+immediate legal walkable border. It requires exactly two adjacent elevations, a direct elevation
+transition, and at least 12 flagged cells. The ascent heading is the low-to-high centroid vector
+quantized to eight directions using integer comparisons. Component cells are projected along and
+across that heading. The longitudinal extent must be at least six projection units; a diagonal step
+changes projection by two, while a cardinal step changes it by one.
+
+Each end first examines a two-projection-unit band and selects the wall-bounded section nearest
+its lateral centroid, then nearest its longitudinal extreme, then narrowest, with coordinate ties.
+That initial section can already lie on the flat terrain beyond a ramp. A bounded inward search
+examines central finite sections up to eight projection units from the extreme and accepts the
+first that is at least 64 pixels and 25% narrower. It chooses centrality before testing width,
+avoiding off-center nooks, and reserves the required gap between both ends. A consistently wide
+ramp retains its original ends.
+
+Ramp flags can also cover only the middle of the slope. For an unbuildable end, a bounded refinement
+walks outward along the ascent axis for at most 16 legal steps, requiring the same elevation and
+a buildable landing at that elevation. It samples full wall sections on the intervening unbuildable
+cells. The first opening must widen by at least 64 pixels and 75%, and remain within both 384 pixels
+and four times the original width. A larger or unbounded opening retains the last narrow section;
+it does not search beyond that opening for another cut. Without a verified landing, the original
+flagged end remains. These bounds prevent the flat unbuildable terrain around a ramp from pulling
+its boundary across an unrelated room. Refined centers can lie outside the ramp-flagged cells.
+
+Both sections need real terrain wall contacts, distinct geometry, and separation of at least four
+projection units. Edges and scan caps cannot supply walls. The existing entrance ray sampler
+supplies full unclipped endpoints, including the same diagonal corner rules. This refinement is
+still heuristic: it does not promise the exact visual or buildability boundary of a slope. Ambiguous,
+short, or unusual flagged shapes may be missed; these are structural terrain observations, not
+certified connectivity or walling claims.
+
+The WASM `rampsJson()` adapter lazily caches terrain-only evidence independently of obstacle mode.
+Each recognized ramp has an ID, elevation pair, flagged-cell count, and `lower`/`upper` spans with
+walk-cell positions and pixel endpoints/widths. The map-wide demo adds both ends after consolidating
+directional entrance observations, labels them `R{id}L`/`R{id}U`, and protects them from serial/flat
+duplicate removal. Ramp spans take priority over generic widening spans in crossing conflicts.
+The 256-span limit includes both ends. A difficult crossing between two structural ramps remains
+a geometric conflict rather than a guarantee that every recognized ramp survives intact.
+
+A nearby ordinary mouth can be replaced by a ramp end when both cuts fully separate components
+and share an anchor-free exterior approach. The region between that ramp's own two ends cannot
+qualify. The mouth must be at least twice as wide, or have corresponding endpoints within 32 pixels
+and direction within 15 degrees of the structural end. Proximity uses finite segment distance,
+at most 224 pixels, rather than midpoint distance. Every corner of the absorbed approach's bounding
+box must lie within 512 pixels of the ramp midpoint. A broad approach with only the mouth and
+matching ramp as exits can instead bound each corner within 512 pixels of either cut's midpoint.
+This includes a strict multipart star whose additional inner components are mouth-only leaves,
+as described below. It accommodates a turn and pockets behind minerals without extending the
+exception to branched approaches or near-coincident replacements.
+
+A multipart mouth is eligible only when its component pairs form a star with one common outer
+component. One inner component must meet only the mouth and matching ramp; every other inner
+component must be a leaf incident only to that mouth. All inner components must be anchor-free
+and satisfy the same bounds. This permits tiny terrain pockets without absorbing another exit.
+Near-coincident spans can also produce a three-component triangle: both cuts have two component
+pairs, one pair is shared, and their union has exactly three distinct pairs. Within the same
+32-pixel/15-degree envelope, the generic cut may be removed if that entire possible union contains
+at most one anchored component and every unanchored component is locally bounded. The selector
+reserves the whole union against other removals; it does not infer which shared edges would be
+restored. A fresh partition establishes the actual result.
+
+Proposals rank by segment distance and canonical endpoints. They cannot reuse a mouth, logical
+ramp end, or absorbed component, or absorb another selected proposal's outer component. Removed
+mouths do not contribute their widening evidence to the ramp. Exact coincident geometry is also
+retained only once, preferring structural evidence.
+
+A further ramp-end duplicate case permits up to 64 pixels of perpendicular offset and 15 degrees
+of angular difference, with projected overlap covering at least 75% of the shorter section and
+a maximum width ratio of 1.5. Both ordinary-cut components must be anchor-free, and the shared
+approach must have exactly two ports: the ordinary cut and this ramp end. The opposite ramp end
+cannot also touch the approach. The same local bounds and reservation rules apply; parallel
+geometry alone never permits removal.
+
+Replacement runs at most twice, repartitioning after each changed pass. The fresh anchor labels
+allow a near-coincident cut to be removed first and then expose a second redundant approach inside
+the base, without allowing a chain of simultaneous removals to join known base components.
+
+After ramp-mouth replacement, the demo can collapse generic cuts sealed between the lower and
+upper ends of one ramp. It builds a graph of fully separating ordinary cuts and accepts only
+anchor-free components with at most eight ordinary boundaries and exactly two structural ports,
+both belonging to that ramp. Every pair on every removed boundary must lie inside the component;
+every pair on each retained ramp port must cross from inside to outside. A multipart ramp port
+may additionally touch an anchor-free leaf whose only incident boundary is that same port. Such
+leaves enter the validation set and must satisfy the same elevation and local bounds; their
+structural cut remains. This matters for multipart spans that also intersect unrelated terrain: the entire physical cut is retained unless all of it
+qualifies. The merged interior must contain ramp cells, contain only the ramp's two elevations,
+and fit within 512 pixels of either ramp-end midpoint. All component statistics share one raster
+scan, and a single fresh partition applies the accepted removals. Both structural ends remain.
+
+Finally, the demo can remove an internal junction cut whose two adjacent components contain no
+ramp cells. Without base anchors, their union must have one elevation. At most one of the two
+components may contain base anchors; in that case, both components must share an elevation
+covering at least 99% of each component's cells. This tolerates a few differently flagged edge
+cells, not a substantial slope. The removed cut must also be at least as wide as every retained
+exterior port, preventing this rule from removing a narrower entrance into a base. The ordinary cut must
+fully separate one component pair. At least three other retained physical spans must lead to at least
+three distinct exterior components; each must be a full single-pair boundary within 384 pixels of
+the candidate midpoint. Every corner of each adjacent region's bounding box must lie within
+512 pixels of the candidate midpoint for unanchored unions, or of the finite candidate segment
+for a union containing an anchored component. Port midpoints retain the 384-pixel midpoint bound
+in both cases. Region bounds and terrain attributes are collected once, avoiding per-proposal grid
+scans. Candidates rank widest first with canonical endpoint ties. Selected pairs are disjoint and
+reserve all their exterior ports so simultaneous removals cannot erase the exits used as evidence.
+A final partition reflects the merged junctions. This is a bounded heuristic for open junctions,
+not proof that every remaining segment is a strategic chokepoint.
+
+A second junction case handles a small flat area outside a base with two connections to the same
+exterior region. The area must be unanchored, single-elevation, free of ramp cells, and bounded
+within 512 pixels of the candidate midpoint. It must have exactly three fully separating ordinary
+cuts: two toward one exterior region, and one toward a distinct anchored base component. A wide
+cut may be removed only when it is at least twice the width of the other connection to the same
+exterior, and both retained port midpoints are within 384 pixels. The narrow connection and the
+base-facing entry stay. Candidate areas and their retained ports are reserved, and no selected
+area may be another proposal's exterior. The exterior itself may be large or contain anchors;
+only the small unanchored area is absorbed. Repartitioning can mark the retained narrow bridge
+as bypassable, since the wide connection is now open; the displayed assessment reflects that.
+
+All retained spans are applied together. The selected areas are cyan and purple, or amber if they
+share a component. Green span lines separate components; dashed amber lines retain bypassed
+crossings; gray lines cross no legal graph edges. Sections with no terrain-buildable cell within
+64 pixels (two build tiles) of their midpoint are also muted gray, retaining their bypass dash
+pattern. This is a presentation hint and never changes the partition. The test measures distance
+to cell rectangles, ignores occupancy and elevation, and does not check building footprints,
+creep, resource exclusion, or wall feasibility. Buildability near the midpoint does not establish
+that a section can be walled. Ramp ends and unbuildable passages still carry terrain-topology
+information. The summary reports area IDs, sizes, other known base anchors in each component, and shrinkage relative to uncut terrain connectivity. A successful
+result contains metadata for every anchored base, not just the highlighted pair.
+
+The worker retains one completed result keyed by widening threshold and the base-anchor catalog
+on its terrain snapshot. Transferable labels are copied for delivery so the cached buffer remains
+owned. Failed or cancelled runs never replace it. The page keeps its own result for selection-only
+redraws. Changing threshold or rediscovering bases clears displayed areas; replacing terrain clears
+both caches. Terrain-only areas survive obstacle toggles and region prominence changes. Separate
+A/B entrance surveys do not change the map-wide result. Worker identity, terrain/catalog snapshots,
+and request revisions gate progress and final replies after invalidation or map replacement.
 
 On Python 1.3 and 1.6 at 25% widening, the selected left and top naturals produce components of
 5706 and 6040 walk cells, each containing only its own known base anchor. The right natural gives
 5495 cells. Main-ramp spans provide the inner boundaries and the widening spans provide the outer
 boundaries. A sampled span toward the center remains bypassable and is marked accordingly.
-These are regression observations, not authoritative human base-area labels.
+The bottom natural's three outer cuts consolidate to the middle horizontal span at pixel y=3388,
+restoring 1295 walk cells and increasing its area from 4768 to 6063 cells on both versions. Its
+main-ramp boundaries remain separate. These are regression observations, not authoritative human
+base-area labels.
 
-Coverage remains deliberately local: bases without route anchors are skipped, nearby disconnected
-bases can consume survey slots, and other exits can be missed. Parallel but nonidentical spans
-can leave small intermediate components; this checkpoint does not merge or classify those.
-Containing only one known base anchor does not prove a strategically correct base area. The next
-step is evaluating and consolidating boundary evidence across more approaches before feeding it
-into the general region partition.
+Coverage remains deliberately local even though it is sampled across the map: bases without route
+anchors are skipped and three neighboring bases do not expose every possible exit. Parallel but
+nonidentical spans can still leave small intermediate components. Containing only one known base
+anchor does not prove a strategically correct base area, and shared components are reported without
+forcing an arbitrary split. Main/natural classification and wall-placement legality remain separate
+future work.
 
 ## Resource bases and depot candidates
 
