@@ -89,9 +89,11 @@ pub struct EntranceCandidate {
     pub width_pixels: f64,
     /// Maximum cross-section width in the 96px approach window.
     pub approach_max_width_pixels: f64,
-    /// Minimum cross-section width at the three outward samples (96/128/160px).
+    /// Minimum cross-section width at +96/+128px, and also +160px when that station remains straight.
     pub outward_min_width_pixels: f64,
-    /// True when an outward ray ended at the map edge or ray cap, so its span is a lower bound.
+    /// Number of outward stations used for [Self::outward_min_width_pixels] (two or three).
+    pub outward_sample_count: u8,
+    /// True when a used outward ray ended at the map edge or ray cap, so its span is a lower bound.
     pub outward_width_is_lower_bound: bool,
     /// Physical arclength from the supplied route start.
     pub distance_from_start_pixels: f64,
@@ -434,13 +436,19 @@ impl TerrainGrid {
                 continue;
             };
             let normal = (-tangent.1, tangent.0);
-            if !profile_tangents_are_smooth(route, arclengths, &sample_indices, tangent) {
+            let Some(outward_sample_count) =
+                profile_outward_sample_count(route, arclengths, &sample_indices, tangent)
+            else {
                 continue;
-            }
-            // +32/+64 still participate in tangent smoothness above, but their widths
-            // do not feed any filter. Cast only the four inner and three outer sections.
-            let sections = [0, 1, 2, 3, 6, 7, 8]
+            };
+            // +32/+64 only validate a stable profile. The +160px station contributes widening
+            // evidence only while its own tangent remains smooth; otherwise a turn makes that
+            // fixed-normal cross-section geometrically meaningless. The validated +96/+128px
+            // stations still provide two bounded outward observations in that case.
+            let sections = [0, 1, 2, 3, 6, 7]
                 .map(|slot| self.cross_section(route.points[sample_indices[slot]], normal));
+            let far_section = (outward_sample_count == 3)
+                .then(|| self.cross_section(route.points[sample_indices[8]], normal));
             let candidate = &sections[3];
             // The approach samples and candidate itself must contact actual terrain blockers.
             // The positive samples are the widening evidence, so they may already lie in an
@@ -462,9 +470,9 @@ impl TerrainGrid {
             if approach_max.saturating_mul(100) > candidate.width_fixed.saturating_mul(130) {
                 continue;
             }
-            let outward = &sections[4..];
+            let outward = sections[4..].iter().chain(far_section.iter());
             let outward_min = outward
-                .iter()
+                .clone()
                 .map(|section| section.width_fixed)
                 .min()
                 .unwrap_or(candidate.width_fixed);
@@ -487,12 +495,33 @@ impl TerrainGrid {
                     width_pixels: fixed_to_pixels(candidate.width_fixed),
                     approach_max_width_pixels: fixed_to_pixels(approach_max),
                     outward_min_width_pixels: fixed_to_pixels(outward_min),
-                    outward_width_is_lower_bound: outward.iter().any(CrossSection::is_lower_bound),
+                    outward_sample_count,
+                    outward_width_is_lower_bound: outward.clone().any(CrossSection::is_lower_bound),
                     distance_from_start_pixels: fixed_to_pixels(distance),
                 },
             });
         }
         non_maximum_suppression(raw)
+    }
+
+    /// Shared raster geometry for structural ramp spans. Width uses 1000 units per 8 pixels.
+    /// Only real terrain wall contacts qualify; map edges and capped rays are not walls.
+    pub(crate) fn bounded_wall_span(
+        &self,
+        center: WalkPosition,
+        normal: (i32, i32),
+    ) -> Option<(u64, [PixelPosition; 2])> {
+        if normal == (0, 0)
+            || !(-1..=1).contains(&normal.0)
+            || !(-1..=1).contains(&normal.1)
+            || !self.cell(center).is_some_and(|cell| cell.walkable)
+        {
+            return None;
+        }
+        let section = self.cross_section(center, normal);
+        section
+            .actual_blockers_both_sides()
+            .then_some((section.width_fixed, section.endpoints))
     }
 
     fn cross_section(&self, center: WalkPosition, normal: (i32, i32)) -> CrossSection {
@@ -642,19 +671,33 @@ fn quantize_tangent(delta_x: i64, delta_y: i64) -> Option<(i32, i32)> {
     }
 }
 
-fn profile_tangents_are_smooth(
+fn tangents_are_smooth(reference: (i32, i32), sample: (i32, i32)) -> bool {
+    let dot = reference.0 * sample.0 + reference.1 * sample.1;
+    let cross = reference.0 * sample.1 - reference.1 * sample.0;
+    dot > 0 && cross.abs() <= dot
+}
+
+/// Returns the number of valid outward stations. Samples through +128px must retain the
+/// fixed-normal profile direction. A present but turning +160px sample is omitted rather than
+/// measured, because its width could follow the turn instead of the candidate's outward side.
+/// A missing +160px tangent still rejects the profile, preserving the old endpoint requirement.
+fn profile_outward_sample_count(
     route: &Route,
     arclengths: &[u64],
     samples: &[usize; 9],
     tangent: (i32, i32),
-) -> bool {
-    samples.iter().all(|&index| {
-        let Some(sample_tangent) = route_tangent(route, arclengths, index, 32) else {
-            return false;
-        };
-        let dot = tangent.0 * sample_tangent.0 + tangent.1 * sample_tangent.1;
-        let cross = tangent.0 * sample_tangent.1 - tangent.1 * sample_tangent.0;
-        dot > 0 && cross.abs() <= dot
+) -> Option<u8> {
+    for &index in &samples[..8] {
+        let sample_tangent = route_tangent(route, arclengths, index, 32)?;
+        if !tangents_are_smooth(tangent, sample_tangent) {
+            return None;
+        }
+    }
+    let final_tangent = route_tangent(route, arclengths, samples[8], 32)?;
+    Some(if tangents_are_smooth(tangent, final_tangent) {
+        3
+    } else {
+        2
     })
 }
 
@@ -729,8 +772,12 @@ struct RawCandidate {
 
 fn non_maximum_suppression(mut raw: Vec<RawCandidate>) -> Vec<EntranceCandidate> {
     raw.sort_unstable_by(|left, right| {
-        left.width_fixed
-            .cmp(&right.width_fixed)
+        // Prefer the full outward window; late-turn profiles are fallback evidence.
+        right
+            .candidate
+            .outward_sample_count
+            .cmp(&left.candidate.outward_sample_count)
+            .then_with(|| left.width_fixed.cmp(&right.width_fixed))
             .then_with(|| {
                 let left_ratio = u128::from(left.outward_min_fixed) * u128::from(right.width_fixed);
                 let right_ratio =
@@ -780,6 +827,43 @@ mod tests {
 
     fn point(x: u32, y: u32) -> WalkPosition {
         WalkPosition { x, y }
+    }
+
+    fn route_from_points(points: Vec<WalkPosition>) -> (Route, Vec<u64>) {
+        let mut arclengths = Vec::with_capacity(points.len());
+        let mut distance = 0;
+        for (index, &position) in points.iter().enumerate() {
+            if index != 0 {
+                distance += step_cost(points[index - 1], position);
+            }
+            arclengths.push(distance);
+        }
+        (
+            Route {
+                points,
+                distance_pixels: fixed_to_pixels(distance),
+            },
+            arclengths,
+        )
+    }
+
+    fn late_turn_route() -> (Route, Vec<u64>) {
+        // Start close enough that an earlier full-window candidate cannot suppress this mouth.
+        let mut points: Vec<_> = (24..=56).map(|x| point(x, 50)).collect();
+        points.push(point(57, 50));
+        points.extend((35..50).rev().map(|y| point(57, y)));
+        route_from_points(points)
+    }
+
+    fn late_turn_terrain(room_before_turn: bool) -> TerrainGrid {
+        grid(100, 200, move |x, y| {
+            let corridor = (1..=56).contains(&x) && (45..=55).contains(&y);
+            let room = room_before_turn && (41..=56).contains(&x) && (1..=100).contains(&y);
+            // The post-turn column reaches the ray cap. Its lower-bound width must not leak
+            // into a profile truncated before this turn.
+            let post_turn = (57..=99).contains(&x);
+            corridor || room || post_turn
+        })
     }
 
     #[test]
@@ -1065,6 +1149,7 @@ mod tests {
         );
         assert!((96.0..=160.0).contains(&candidate.width_pixels));
         assert!(candidate.outward_min_width_pixels >= candidate.width_pixels + 64.0);
+        assert_eq!(candidate.outward_sample_count, 3);
         assert!(
             candidate
                 .endpoints
@@ -1161,6 +1246,133 @@ mod tests {
         assert!(
             analysis.candidates.is_empty(),
             "open terrain has no actual inner wall contacts"
+        );
+    }
+
+    #[test]
+    fn full_profiles_win_suppression_and_the_candidate_cap() {
+        let make = |index: usize, samples: u8| {
+            let distance = index as u64 * FIXED_PER_PIXEL;
+            RawCandidate {
+                route_index: index,
+                arclength_fixed: distance,
+                width_fixed: if samples == 3 { 128 } else { 96 } * FIXED_PER_PIXEL,
+                outward_min_fixed: 512 * FIXED_PER_PIXEL,
+                candidate: EntranceCandidate {
+                    position: point(index as u32, 0),
+                    endpoints: [PixelPosition { x: 0, y: 0 }; 2],
+                    width_pixels: if samples == 3 { 128.0 } else { 96.0 },
+                    approach_max_width_pixels: 96.0,
+                    outward_min_width_pixels: 512.0,
+                    outward_sample_count: samples,
+                    outward_width_is_lower_bound: false,
+                    distance_from_start_pixels: index as f64,
+                },
+            }
+        };
+        let candidates = vec![make(100, 2), make(200, 3), make(500, 2)];
+        let selected = non_maximum_suppression(candidates.clone());
+        assert_eq!(
+            selected.iter().map(|c| c.position.x).collect::<Vec<_>>(),
+            [200, 500],
+            "full evidence beats a narrower nearby fallback; a distant fallback survives"
+        );
+        assert_eq!(
+            selected,
+            non_maximum_suppression(candidates.into_iter().rev().collect())
+        );
+        let selected = non_maximum_suppression(vec![
+            make(0, 2),
+            make(300, 3),
+            make(600, 3),
+            make(900, 3),
+            make(1200, 3),
+        ]);
+        assert_eq!(selected.len(), 4);
+        assert!(selected.iter().all(|c| c.outward_sample_count == 3));
+    }
+
+    #[test]
+    fn late_turn_truncates_to_two_valid_outward_samples() {
+        let terrain = late_turn_terrain(true);
+        let (route, arclengths) = late_turn_route();
+        let candidate = terrain
+            .profile_entrances(&route, &arclengths, &EntranceOptions::default())
+            .into_iter()
+            .find(|candidate| candidate.position == point(40, 50))
+            .expect("the mouth has two straight, widening outward samples");
+        let expected_minimum = [point(52, 50), point(56, 50)]
+            .map(|position| terrain.cross_section(position, (0, 1)).width_fixed)
+            .into_iter()
+            .min()
+            .unwrap();
+        assert_eq!(candidate.outward_sample_count, 2);
+        assert_eq!(
+            candidate.outward_min_width_pixels,
+            fixed_to_pixels(expected_minimum)
+        );
+        assert!(
+            !candidate.outward_width_is_lower_bound,
+            "the post-turn ray cap must not affect the truncated evidence"
+        );
+    }
+
+    #[test]
+    fn widening_only_after_a_late_turn_is_not_entrance_evidence() {
+        let terrain = late_turn_terrain(false);
+        let (route, arclengths) = late_turn_route();
+        assert!(
+            terrain
+                .profile_entrances(&route, &arclengths, &EntranceOptions::default())
+                .iter()
+                .all(|candidate| candidate.position != point(40, 50)),
+            "the two valid outward stations remain confined"
+        );
+    }
+
+    #[test]
+    fn bend_before_required_outward_samples_remains_rejected() {
+        let terrain = late_turn_terrain(true);
+        let mut points: Vec<_> = (20..=52).map(|x| point(x, 50)).collect();
+        points.extend((30..50).rev().map(|y| point(52, y)));
+        let (route, arclengths) = route_from_points(points);
+        assert!(
+            terrain
+                .profile_entrances(&route, &arclengths, &EntranceOptions::default())
+                .iter()
+                .all(|candidate| candidate.position != point(40, 50)),
+            "a turn visible from the +128px tangent cannot truncate the profile"
+        );
+    }
+
+    #[test]
+    fn missing_final_outward_tangent_still_rejects_the_profile() {
+        let points: Vec<_> = (20..=60).map(|x| point(x, 50)).collect();
+        let (route, arclengths) = route_from_points(points);
+        let candidate_index = 20;
+        let samples = profile_sample_indices(&arclengths, candidate_index).unwrap();
+        let tangent = route_tangent(&route, &arclengths, candidate_index, 64).unwrap();
+        assert_eq!(
+            profile_outward_sample_count(&route, &arclengths, &samples, tangent),
+            None,
+            "+160px must retain its +32px tangent lookahead"
+        );
+    }
+    #[test]
+    fn straight_outward_bulge_that_renarrows_at_160px_remains_rejected() {
+        let terrain = grid(100, 110, |x, y| {
+            let left_corridor = (1..=40).contains(&x) && (45..=55).contains(&y);
+            let bulge = (41..=56).contains(&x) && (1..=100).contains(&y);
+            let right_corridor = (57..=98).contains(&x) && (45..=55).contains(&y);
+            left_corridor || bulge || right_corridor
+        });
+        let (route, arclengths) = route_from_points((20..=80).map(|x| point(x, 50)).collect());
+        assert!(
+            terrain
+                .profile_entrances(&route, &arclengths, &EntranceOptions::default())
+                .iter()
+                .all(|candidate| candidate.position != point(40, 50)),
+            "a smooth +160px re-narrowing remains part of the widening minimum"
         );
     }
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use broodmap::chk::{placed_units::PlacedUnitsError, sprites::SpriteError};
 use broodmap_analysis::{
-    EntranceSurvey, SpanPartition, TerrainGrid, WalkPosition, melee_obstacles,
+    EntranceSurvey, Ramp, SpanPartition, TerrainGrid, WalkPosition, melee_obstacles,
 };
 use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 use broodmap_render::{AssetRequest, DatKind};
@@ -15,6 +15,7 @@ use crate::MapRenderer;
 mod areas;
 mod bases;
 mod entrances;
+mod ramps;
 mod regions;
 
 pub use areas::AreaSnapshot;
@@ -109,6 +110,7 @@ pub struct TerrainAnalysis {
     base_inputs: Option<bases::BaseInputs>,
     base_catalog: Option<bases::BaseCatalog>,
     entrance_survey: OnceLock<EntranceSurvey>,
+    ramps: OnceLock<Vec<Ramp>>,
     empty_partition: OnceLock<Arc<SpanPartition>>,
 }
 
@@ -227,6 +229,7 @@ impl TerrainAnalysis {
             base_inputs: None,
             base_catalog: None,
             entrance_survey: OnceLock::new(),
+            ramps: OnceLock::new(),
             empty_partition: OnceLock::new(),
         }
     }

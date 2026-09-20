@@ -34,6 +34,7 @@ struct Candidate {
     width_pixels: f64,
     approach_max_width_pixels: f64,
     outward_min_width_pixels: f64,
+    outward_sample_count: u8,
     outward_width_is_lower_bound: bool,
     distance_from_start_pixels: f64,
 }
@@ -83,6 +84,7 @@ fn entrance_result(options: EntranceOptions, analysis: EntranceAnalysis) -> Entr
                 width_pixels: candidate.width_pixels,
                 approach_max_width_pixels: candidate.approach_max_width_pixels,
                 outward_min_width_pixels: candidate.outward_min_width_pixels,
+                outward_sample_count: candidate.outward_sample_count,
                 outward_width_is_lower_bound: candidate.outward_width_is_lower_bound,
                 distance_from_start_pixels: candidate.distance_from_start_pixels,
             })
@@ -114,6 +116,7 @@ impl TerrainAnalysis {
     /// obstacle toggle: resources and neutral objects do not define geological entrances.
     /// `minWideningPercent` defaults to 25 and accepts integral values from 0 through 200.
     /// Candidate centers lie within the first 1024 logical pixels; profiles may look 192px farther.
+    /// `outwardSampleCount` is 3 normally, or 2 when a late turn excludes the +160px sample.
     /// Cross-section endpoints in the JSON are logical pixels; route points are walk cells. Spans
     /// are raster approximations, not certified chokepoints, construction legality, unit fit, or
     /// shortest movement routes.
@@ -266,6 +269,7 @@ mod tests {
         assert!(!json["candidates"].as_array().unwrap().is_empty());
         let candidate = &json["candidates"][0];
         assert!(candidate["widthPixels"].as_f64().unwrap() >= 64.0);
+        assert_eq!(candidate["outwardSampleCount"], 3);
         assert!(
             candidate["endpoints"][0][0].as_u64().unwrap() > 100,
             "cross-section coordinates are pixels, not walk cells"

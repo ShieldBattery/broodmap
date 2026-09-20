@@ -20,6 +20,7 @@ pub mod bases;
 pub mod clearance;
 pub mod entrances;
 pub mod obstacles;
+pub mod ramps;
 pub mod regions;
 
 pub use areas::{AreaError, BoundaryAssessment, BoundarySpan, PartitionArea, SpanPartition};
@@ -32,6 +33,7 @@ pub use entrances::{
     EntranceAnalysis, EntranceCandidate, EntranceError, EntranceOptions, EntranceSurvey,
 };
 pub use obstacles::{PixelRect, StaticObstacle, melee_obstacle_objects, melee_obstacles};
+pub use ramps::{Ramp, RampEnd};
 pub use regions::{Passage, Region, RegionAnalysis, RegionError, RegionOptions};
 
 const MAX_TILES_PER_AXIS: usize = 256;

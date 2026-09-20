@@ -179,6 +179,31 @@ fn exercise_regions(grid: &TerrainGrid, data: &[u8]) {
     }
 }
 
+fn exercise_ramps(grid: &TerrainGrid) {
+    let ramps = grid.ramps();
+    assert_eq!(ramps, grid.ramps());
+    for (index, ramp) in ramps.iter().enumerate() {
+        assert_eq!(ramp.id as usize, index + 1);
+        assert_eq!(ramp.upper_elevation, ramp.lower_elevation + 1);
+        assert!(ramp.cell_count >= 12);
+        assert_ne!(ramp.lower.endpoints, ramp.upper.endpoints);
+        assert_ne!(ramp.lower.endpoints, [ramp.upper.endpoints[1], ramp.upper.endpoints[0]]);
+        for end in [&ramp.lower, &ramp.upper] {
+            let cell = grid.cell(end.position).unwrap();
+            assert!(cell.walkable && (cell.ramp || !cell.terrain_buildable));
+            assert!(end.width_pixels.is_finite() && end.width_pixels > 0.0);
+            for point in end.endpoints {
+                assert!(point.x <= grid.width() * 8 && point.y <= grid.height() * 8);
+            }
+            let dx = end.endpoints[0].x.abs_diff(end.endpoints[1].x);
+            let dy = end.endpoints[0].y.abs_diff(end.endpoints[1].y);
+            assert!(dx == 0 || dy == 0 || dx == dy);
+            let expected = f64::from(dx.max(dy)) * if dx != 0 && dy != 0 { 1.414 } else { 1.0 };
+            assert!((end.width_pixels - expected).abs() < 0.00001);
+        }
+    }
+}
+
 fn exercise_entrances(grid: &TerrainGrid, data: &[u8]) {
     let options = EntranceOptions {
         max_distance_pixels: 256 + u32::from(data.first().copied().unwrap_or(0)) * 8,
@@ -221,6 +246,7 @@ fn exercise_entrances(grid: &TerrainGrid, data: &[u8]) {
         assert!(grid.cell(candidate.position).unwrap().walkable);
         assert!((64.0..=640.0).contains(&candidate.width_pixels));
         assert!(candidate.approach_max_width_pixels <= candidate.width_pixels * 1.3 + 0.00001);
+        assert!((2..=3).contains(&candidate.outward_sample_count));
         assert!(candidate.outward_min_width_pixels + 0.00001 >= candidate.width_pixels + 64.0);
         assert!(
             candidate.outward_min_width_pixels * 100.0 + 0.00001
@@ -337,6 +363,7 @@ fn exercise_areas(grid: &TerrainGrid, data: &[u8]) {
 fn exercise_grid(grid: &TerrainGrid, data: &[u8]) {
     exercise_regions(grid, data);
     exercise_entrances(grid, data);
+    exercise_ramps(grid);
     exercise_areas(grid, data);
     let width = grid.width();
     let height = grid.height();
@@ -555,6 +582,7 @@ fuzz_target!(|data: &[u8]| {
             .collect();
         let grid = TerrainGrid::from_cells(96, 96, cells).unwrap();
         exercise_entrances(&grid, data);
+        exercise_ramps(&grid);
     }
     let records = &data[..data.len().min(2048)];
     let units = read_placed_units(records).unwrap();
