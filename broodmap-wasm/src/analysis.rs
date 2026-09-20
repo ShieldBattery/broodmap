@@ -17,9 +17,11 @@ mod bases;
 mod entrances;
 mod ramps;
 mod regions;
+mod topology;
 
 pub use areas::AreaSnapshot;
 pub use regions::RegionSnapshot;
+pub use topology::BaseTopologyJob;
 
 #[wasm_bindgen]
 impl MapRenderer {

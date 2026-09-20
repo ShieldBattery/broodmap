@@ -5,13 +5,17 @@ use broodmap::chk::{
     sprites::read_sprites,
     terrain::{TerrainTileIds, TileId},
 };
+use broodmap_analysis::topology::{
+    BaseTopology, TopologyBase, TopologyError, TopologyJob, TopologyOptions,
+};
 use broodmap_analysis::{
-    BaseSearchOptions, BoundarySpan, DepotFootprint, EntranceOptions, PixelPosition, PixelRect,
-    RegionOptions, ResourceKind, ResourceNode, StaticObstacle, TerrainCell, TerrainGrid,
+    BaseSearchOptions, BoundarySpan, DepotFootprint, EntranceError, EntranceOptions, PixelPosition,
+    PixelRect, RegionOptions, ResourceKind, ResourceNode, StaticObstacle, TerrainCell, TerrainGrid,
     WalkPosition, discover_bases, melee_obstacles,
 };
 use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 use libfuzzer_sys::fuzz_target;
+use std::sync::Arc;
 
 const MAX_METADATA_BYTES: usize = 4096;
 const MAX_TERRAIN_AXIS: usize = 4;
@@ -187,7 +191,10 @@ fn exercise_ramps(grid: &TerrainGrid) {
         assert_eq!(ramp.upper_elevation, ramp.lower_elevation + 1);
         assert!(ramp.cell_count >= 12);
         assert_ne!(ramp.lower.endpoints, ramp.upper.endpoints);
-        assert_ne!(ramp.lower.endpoints, [ramp.upper.endpoints[1], ramp.upper.endpoints[0]]);
+        assert_ne!(
+            ramp.lower.endpoints,
+            [ramp.upper.endpoints[1], ramp.upper.endpoints[0]]
+        );
         for end in [&ramp.lower, &ramp.upper] {
             let cell = grid.cell(end.position).unwrap();
             assert!(cell.walkable && (cell.ramp || !cell.terrain_buildable));
@@ -444,6 +451,190 @@ fn exercise_grid(grid: &TerrainGrid, data: &[u8]) {
     }
 }
 
+fn run_topology_job(
+    grid: &TerrainGrid,
+    bases: Vec<TopologyBase>,
+    options: TopologyOptions,
+) -> BaseTopology {
+    let expected_origins = bases
+        .iter()
+        .filter(|base| base.route_anchor.is_some())
+        .count();
+    let mut job = TopologyJob::new(Arc::new(grid.clone()), bases, options).unwrap();
+    let mut previous = job.progress();
+    assert_eq!(previous.completed_origins, 0);
+    assert_eq!(previous.total_origins, expected_origins);
+    for _ in 0..expected_origins + 16 {
+        if previous.complete {
+            break;
+        }
+        let current = job.advance().unwrap();
+        assert!(current.completed_origins >= previous.completed_origins);
+        assert!(current.completed_origins <= current.total_origins);
+        assert_eq!(current.total_origins, expected_origins);
+        previous = current;
+    }
+    assert!(previous.complete);
+    job.finish().unwrap()
+}
+
+fn assert_topology_invariants(grid: &TerrainGrid, bases: &[TopologyBase], topology: &BaseTopology) {
+    let spans: Vec<_> = topology
+        .boundaries
+        .iter()
+        .map(|boundary| BoundarySpan {
+            endpoints: boundary.boundary.endpoints,
+        })
+        .collect();
+    let repartition = grid.partition_by_spans(&spans).unwrap();
+    assert_eq!(topology.partition, repartition);
+    assert_eq!(
+        topology.boundaries.len(),
+        topology.partition.boundaries().len()
+    );
+    for (analyzed, assessment) in topology
+        .boundaries
+        .iter()
+        .zip(topology.partition.boundaries())
+    {
+        assert_eq!(&analyzed.assessment, assessment);
+    }
+
+    let mut counts = vec![0_u32; topology.partition.areas().len() + 1];
+    for (&label, cell) in topology.partition.labels().iter().zip(grid.cells()) {
+        assert_eq!(label != 0, cell.walkable);
+        assert!((label as usize) < counts.len());
+        if label != 0 {
+            counts[label as usize] += 1;
+        }
+    }
+    for area in topology.partition.areas() {
+        assert_eq!(counts[area.id as usize], area.cell_count);
+    }
+
+    let original = grid.partition_by_spans(&[]).unwrap();
+    let retained: Vec<_> = bases
+        .iter()
+        .filter_map(|base| base.route_anchor.map(|anchor| (base.id, anchor)))
+        .collect();
+    assert_eq!(topology.bases.len(), retained.len());
+    assert_eq!(
+        topology.statistics.skipped_anchor_count,
+        bases
+            .iter()
+            .filter(|base| base.route_anchor.is_none())
+            .count()
+    );
+    for area in &topology.bases {
+        assert_eq!(topology.base(area.base_id), Some(area));
+        let (_, anchor) = retained
+            .iter()
+            .find(|(id, _)| *id == area.base_id)
+            .expect("completed topology retains every anchored base");
+        let index = (anchor.y * grid.width() + anchor.x) as usize;
+        assert_eq!(area.area_id, topology.partition.labels()[index]);
+        assert_eq!(area.cell_count, counts[area.area_id as usize]);
+        assert_eq!(
+            area.original_cell_count,
+            original.areas()[(original.labels()[index] - 1) as usize].cell_count
+        );
+        let mut expected_ids: Vec<_> = retained
+            .iter()
+            .filter_map(|(id, other)| {
+                let other_index = (other.y * grid.width() + other.x) as usize;
+                (topology.partition.labels()[other_index] == area.area_id).then_some(*id)
+            })
+            .collect();
+        expected_ids.sort_unstable();
+        assert_eq!(area.base_ids, expected_ids);
+    }
+}
+
+fn exercise_topology_with_bases(
+    grid: &TerrainGrid,
+    bases: Vec<TopologyBase>,
+    options: TopologyOptions,
+) {
+    assert!(grid.cells().len() <= 4096);
+    let first = run_topology_job(grid, bases.clone(), options);
+    assert_topology_invariants(grid, &bases, &first);
+    let repeated = TopologyJob::new(Arc::new(grid.clone()), bases.clone(), options)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(first, repeated);
+    let reordered = TopologyJob::new(
+        Arc::new(grid.clone()),
+        bases.iter().copied().rev().collect(),
+        options,
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
+    assert_eq!(first, reordered);
+
+    let invalid_nearby = TopologyOptions {
+        nearby_base_count: 0,
+        ..options
+    };
+    assert!(matches!(
+        TopologyJob::new(Arc::new(grid.clone()), bases.clone(), invalid_nearby),
+        Err(TopologyError::InvalidNearbyCount)
+    ));
+    let invalid_entrances = TopologyOptions {
+        entrances: EntranceOptions {
+            max_distance_pixels: 255,
+            ..options.entrances
+        },
+        ..options
+    };
+    assert!(matches!(
+        TopologyJob::new(Arc::new(grid.clone()), bases, invalid_entrances),
+        Err(TopologyError::Entrances(
+            EntranceError::InvalidMaxDistance {
+                max_distance_pixels: 255
+            }
+        ))
+    ));
+}
+
+fn exercise_topology(grid: &TerrainGrid, data: &[u8]) {
+    // This target is capped at 32x32 for the constructed-grid branch. The random anchor sample
+    // covers disconnected and empty jobs. Coherent entrance fixtures belong in unit tests.
+    let walkable: Vec<_> = grid
+        .cells()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cell)| {
+            cell.walkable.then_some(WalkPosition {
+                x: index as u32 % grid.width(),
+                y: index as u32 / grid.width(),
+            })
+        })
+        .collect();
+    let anchor_count = walkable.len().min(4);
+    let mut bases: Vec<_> = (0..anchor_count)
+        .map(|index| TopologyBase {
+            id: index as u32 + 1,
+            route_anchor: Some(walkable[index * walkable.len() / anchor_count]),
+        })
+        .collect();
+    if data.first().is_some_and(|byte| byte & 1 != 0) {
+        bases.push(TopologyBase {
+            id: 5,
+            route_anchor: None,
+        });
+    }
+    let options = TopologyOptions {
+        entrances: EntranceOptions {
+            max_distance_pixels: 256 + u32::from(data.get(1).copied().unwrap_or(0)) * 8,
+            min_widening_percent: u16::from(data.get(2).copied().unwrap_or(0)) % 201,
+        },
+        nearby_base_count: 1 + usize::from(data.get(3).copied().unwrap_or(0) % 4),
+    };
+    exercise_topology_with_bases(grid, bases, options);
+}
+
 fn exercise_bases(grid: &TerrainGrid, data: &[u8], obstacles: &[PixelRect]) {
     let mut resources: Vec<_> = obstacle_rectangles(data)
         .into_iter()
@@ -653,6 +844,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(grid) = TerrainGrid::from_cells(width, height, cells) {
         exercise_bases(&grid, data, &obstacles);
         exercise_grid(&grid, data);
+        exercise_topology(&grid, data);
         exercise_grid(&grid.with_obstacles(&obstacles), data);
     }
 });

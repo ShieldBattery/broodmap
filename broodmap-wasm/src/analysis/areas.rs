@@ -59,6 +59,7 @@ struct BoundaryMetadataEntry<'a> {
     removed_edge_count: u32,
     separated_edge_count: u32,
     region_pairs: &'a [[u32; 2]],
+    incident_area_ids: &'a [u32],
 }
 
 #[wasm_bindgen]
@@ -93,6 +94,7 @@ impl AreaSnapshot {
                     removed_edge_count: boundary.removed_edge_count,
                     separated_edge_count: boundary.separated_edge_count,
                     region_pairs: &boundary.region_pairs,
+                    incident_area_ids: &boundary.incident_area_ids,
                 })
                 .collect(),
         })

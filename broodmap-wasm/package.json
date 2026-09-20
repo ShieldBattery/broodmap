@@ -11,7 +11,8 @@
     "assets:analysis": "cargo run --release -p broodmap-cli -- fetch-assets --analysis-only --out examples/assets",
     "assets": "cargo run --release -p broodmap-cli -- fetch-assets --out examples/assets",
     "dev": "pnpm run build:web && vite",
-    "build:demo": "pnpm run build:web && vite build"
+    "build:demo": "pnpm run build:web && vite build",
+    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs"
   },
   "license": "MIT OR Apache-2.0",
   "devDependencies": {

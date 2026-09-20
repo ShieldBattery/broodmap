@@ -477,3 +477,93 @@ and Circuit Breakers' side bases and retained exits. Browser whole-map analysis 
 for Laplace and 396ms for Circuit Breakers in these single runs, excluding base discovery.
 No Rust changed in this follow-up; native and fuzz validation remains as recorded at the preceding
 Rust checkpoint.
+
+
+## Reusable Rust topology analyzer
+
+The map-wide pipeline now lives in `broodmap_analysis::topology`. `TopologyJob` accepts an
+immutable terrain grid plus caller base IDs and route anchors, and returns owned sections,
+observations, the final partition, and base membership. `base(id)` and `entrances_for_base(id)`
+query that result. Boundary assessments retain all incident area IDs, including bypassable
+crossings, so a per-base query does not silently omit a section just because another route exists.
+No placement or wallability guarantee is introduced.
+
+The demo calls the incremental WASM job and retains only scheduling, cancellation, cache ownership,
+and display hints. All consolidation rules share a Rust partition graph/statistics view. The
+previous JavaScript policy is frozen under `broodmap-wasm/tests/topology-reference/` solely as a
+comparison oracle; it is absent from the production bundle. This checkpoint preserves the existing
+rules rather than introducing new map-specific selection cases.
+
+The optional real-asset harness is:
+
+```text
+node broodmap-wasm/tests/topology-parity.mjs <asset-directory> <map>...
+```
+
+It compares endpoints, provenance, counts, assessments, base membership, display hints, and every
+partition label, then repeats with reversed base input. All nine maps match exactly:
+
+| Map | Retained boundaries |
+| --- | ---: |
+| Python 1.3 | 15 |
+| Python 1.6 | 15 |
+| Hunters 2021 | 29 |
+| Revolver SE 2.0 | 36 |
+| Lemon 1.1 | 29 |
+| Primeval Isles | 0 |
+| Luna 2.1 | 25 |
+| Circuit Breakers 1.0 | 39 |
+| Laplace 1.0 | 35 |
+
+One Node/WASM pass measured 136-400ms for the Rust job and 84-448ms for the reference, excluding
+base discovery. These single observations ran alongside other verification and establish no
+speedup claim. Browser observations were 274ms for Laplace and 446ms for Circuit Breakers. A job
+step is a cooperative scheduling point, not a hard time budget: construction labels original
+terrain, and one later origin search or repartition can still visit the full grid.
+
+Validation passes all 528 workspace tests, strict all-target clippy, formatting, 76 Node tests,
+both WASM builds, and the production demo build. Real-browser checks cover cancellation during
+origin work and after completion in transit, stale replies after map replacement, selection
+cache reuse, threshold invalidation, obstacle-toggle independence, and six-map rendering.
+Laplace and Circuit Breakers additionally assert retained exits and previously merged pockets;
+Laplace's rendered natural areas were visually inspected.
+
+At this extraction checkpoint the fuzz target exercised the full stepped pipeline on bounded
+random grids and a coherent hallway-to-room fixture (the fixed fixture was removed below). It checks reordered/repeated-input determinism, progress completion,
+repartition equality, base membership, invalid options, and nonempty entrance evidence on the
+fixture. Assets and map inputs remain local, uncommitted dependencies.
+
+ASan completed 2697 executions in 61 seconds before the final additive incidence field. With that
+field, a second run replayed 2482 corpus inputs in 124 seconds with no findings; corpus startup
+exceeded the requested 60-second budget, so that run did not reach new mutations. The real-grid
+incidence tests independently cover separating, bypassed, unrelated, and zero-edge sections.
+
+
+### Review follow-up: production selector coverage
+
+Added 23 Rust selector tests: complete-link grouping and anchor projection, narrow/ramp crossing
+precedence, serial anchor/ramp protection and multigraph cycles, ramp-mouth and sealed-interior
+evidence gates, near-flat junction thresholds, bridge pockets, and proposal reservations. Most
+selection fixtures build actual terrain partitions; focused geometry and graph tests isolate the
+remaining predicates. They run in normal workspace CI without local game tables.
+
+The five frozen-reference test suites now live next to their reference modules. `pnpm test` in
+`broodmap-wasm` runs them together with the production demo tests. They remain oracle checks;
+they are not counted as coverage of the Rust selectors.
+
+Equal-cut junction proposals now explicitly rank by region identity after width/geometry, so
+port reservations never depend on proposal insertion order. A test demonstrates the later-removal
+difference that motivated this policy. All nine map comparisons still match the frozen reference,
+including reversed input order. The 8192 raw-observation limit remains an intentional additional
+bound on the Rust job.
+
+Shared geometry normalization replaces duplicate selector helpers, imports name their actual
+module, and private serial selectors use the finite positive widths produced by the pipeline.
+The fixed hallway fixture is no longer repeated in fuzzing; deterministic entrance evidence stays
+in core unit tests. The separate fuzz workspace now passes its formatting check.
+
+Validation passes 551 workspace tests, 76 Node tests, strict all-target/all-feature clippy, both
+WASM builds, and formatting for both workspaces. The fuzz target type-checks on nightly.
+
+A fresh ASan mutation smoke run, starting from the three committed seeds, completed 2157
+executions in 31 seconds without findings after the review fixes.

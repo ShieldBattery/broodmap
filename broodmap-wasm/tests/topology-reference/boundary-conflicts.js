@@ -1,3 +1,4 @@
+// Frozen JavaScript reference from checkpoint 0125c2b; test use only.
 /**
  * Selects a deterministic, non-crossing subset of already bounded candidate spans.
  *

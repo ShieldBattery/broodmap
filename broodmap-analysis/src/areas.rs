@@ -59,6 +59,9 @@ pub struct BoundaryAssessment {
     pub separated_edge_count: u32,
     /// Sorted, unique final component pairs observed across this span's removed edges.
     pub region_pairs: Vec<[u32; 2]>,
+    /// Sorted, unique final component IDs touched by either endpoint of every removed edge.
+    /// Unlike `region_pairs`, this retains the area for bypassable edges whose labels match.
+    pub incident_area_ids: Vec<u32>,
 }
 
 /// Immutable labels and boundary evidence from [`TerrainGrid::partition_by_spans`].
@@ -219,17 +222,21 @@ fn components(grid: &TerrainGrid, cut_masks: &[u16]) -> (Vec<u32>, Vec<Partition
 }
 
 fn boundary_assessment(edges: &[(usize, usize)], labels: &[u32]) -> BoundaryAssessment {
+    let mut incident_area_ids = Vec::with_capacity(edges.len() * 2);
     let mut region_pairs = Vec::new();
     let mut separated_edge_count = 0_u32;
     for &(left, right) in edges {
         let left_label = labels[left];
         let right_label = labels[right];
+        incident_area_ids.extend([left_label, right_label]);
         if left_label == right_label {
             continue;
         }
         separated_edge_count += 1;
         region_pairs.push([left_label.min(right_label), left_label.max(right_label)]);
     }
+    incident_area_ids.sort_unstable();
+    incident_area_ids.dedup();
     region_pairs.sort_unstable();
     region_pairs.dedup();
     BoundaryAssessment {
@@ -237,6 +244,7 @@ fn boundary_assessment(edges: &[(usize, usize)], labels: &[u32]) -> BoundaryAsse
             .expect("validated grid has at most four million graph edges"),
         separated_edge_count,
         region_pairs,
+        incident_area_ids,
     }
 }
 
@@ -440,6 +448,7 @@ mod tests {
         assert_eq!(partition.labels()[3 * 9 + 1], 1);
         assert_eq!(partition.labels()[3 * 9 + 7], 2);
         assert!(partition.boundaries()[0].separated_edge_count > 0);
+        assert_eq!(partition.boundaries()[0].incident_area_ids, vec![1, 2]);
         assert_eq!(terrain.cells(), before_cells);
         assert_eq!(
             terrain
@@ -457,6 +466,18 @@ mod tests {
         assert!(partition.boundaries()[0].removed_edge_count > 0);
         assert_eq!(partition.boundaries()[0].separated_edge_count, 0);
         assert!(partition.boundaries()[0].region_pairs.is_empty());
+        assert_eq!(partition.boundaries()[0].incident_area_ids, vec![1]);
+    }
+
+    #[test]
+    fn span_without_removed_edges_has_no_incident_areas() {
+        let terrain = grid(3, 3, |_, _| false);
+        let partition = terrain.partition_by_spans(&[span(8, 0, 8, 24)]).unwrap();
+        let boundary = &partition.boundaries()[0];
+        assert_eq!(boundary.removed_edge_count, 0);
+        assert_eq!(boundary.separated_edge_count, 0);
+        assert!(boundary.region_pairs.is_empty());
+        assert!(boundary.incident_area_ids.is_empty());
     }
 
     #[test]

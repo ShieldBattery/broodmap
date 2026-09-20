@@ -1,3 +1,4 @@
+// Frozen JavaScript reference from checkpoint 0125c2b; test use only.
 const MAX_GROUP_SPANS = 4
 const MIN_GROUP_SPANS = 3
 const MAX_CHAIN_DISTANCE_PIXELS = 384

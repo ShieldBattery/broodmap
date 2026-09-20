@@ -1,3 +1,4 @@
+// Frozen JavaScript reference from checkpoint 0125c2b; test use only.
 const MAX_PORT_DISTANCE_PIXELS = 384
 const MAX_UNION_RADIUS_PIXELS = 512
 

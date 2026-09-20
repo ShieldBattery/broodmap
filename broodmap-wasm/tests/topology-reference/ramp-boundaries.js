@@ -1,3 +1,4 @@
+// Frozen JavaScript reference from checkpoint 0125c2b; test use only.
 // Replace oversized nearby widening observations with structural ramp evidence.
 // This selects actual observed cuts; it never clips or moves a span.
 const MAX_MOUTH_DISTANCE = 224
