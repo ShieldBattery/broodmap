@@ -11,6 +11,8 @@ use thiserror::Error;
 
 use crate::{DepotFootprint, PixelPosition, PixelRect, TerrainGrid, TilePosition};
 
+pub mod search;
+
 const MAX_WINDOW_AXIS: usize = 1024;
 const MAX_WINDOW_CENTERS: usize = 1_048_576;
 const MAX_BUILDINGS: usize = 32;

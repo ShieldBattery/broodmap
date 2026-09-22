@@ -4,7 +4,8 @@
 //! deterministic clearance-prominent regions, bounded route-local entrance evidence, and
 //! experimental partitions formed by boundary spans. The opt-in [`topology`] analyzer combines
 //! these into map-wide entrance evidence and base-area membership. The opt-in [`walls`] checker
-//! tests proposed layouts and rectangular mover passage under a bounded static model. Neither
+//! tests proposed layouts and rectangular mover passage under a bounded static model;
+//! [`walls::search`] proposes removal-minimal layouts with explicit search budgets. Neither
 //! analyzer simulates moving units, exact game regions, or engine-specific movement rules. In particular,
 //! [`TerrainGrid::from_terrain`] uses VF4/CV5 aggregation checked against OpenBW and an
 //! MTXM bit-15 creep override verified in the inspected game binary (12310g.exe). This is

@@ -453,7 +453,7 @@ mutes sections with no terrain-buildable cell within 64px of their midpoint. Tha
 uses cell rectangles, ignores occupancy/elevation, and never changes the partition. It is not a
 building-footprint or wall-placement test.
 
-Wall-site enumeration and wall-plan validation belong in separate opt-in analyzers consuming this
+Wall-site enumeration and wall-plan validation use separate opt-in analyzers consuming this
 topology and caller-supplied building/movement rules. A site can be useful to attempt without being
 certified wallable. Future simplification should compare against the reference corpus and preserve
 flat-ground entrances, separate base anchors, opposite ramp ends, and truthful bypass evidence.
@@ -624,6 +624,82 @@ Queries are limited to 32 proposed buildings, 8192 obstacle rectangles, and a wi
 1024x1024 pixel centers. Mover and collision extents are bounded; malformed profiles and windows
 return errors before search. The job runs synchronously within those bounds; demo requests run in
 the worker and stale replies are discarded after edits or map/analysis changes.
+
+## Automatic wall-layout search
+
+`broodmap_analysis::walls::search::WallSearch` is an opt-in incremental analyzer that proposes
+layouts under the same `pixel-rect-v1` model as `check_wall`. Callers supply the original terrain,
+exact static obstacle rectangles, a bounded routing window, A/B endpoints, a placement rectangle
+(which may be the whole window), building geometry/inventory, a mover to block, and optionally a
+mover that must still pass.
+It has no dependency on stock unit IDs, renderer, topology selection, or a game runtime.
+
+The inventory is an upper bound: a result can use fewer buildings. Every full footprint must lie
+inside the placement area, and candidates must pass the checker's static placement diagnostics.
+An optional `placement_elevation` restricts every walk cell of the footprint to one terrain level;
+this lets a caller search the high or low side of a ramp without prescribing a rectangular plateau.
+Optional `placement_site` supplies a finite entrance segment and a reach of 0 to 1024 pixels. A
+candidate's footprint center must be within that Euclidean distance of the segment, including its
+ends. Its footprint may extend past the reach, provided the complete footprint fits inside the
+placement rectangle/routing window and passes terrain, height, and obstacle checks. This avoids
+shrinking usable plateau space by half a building's size or spending a centered square below a
+ramp. Its center must also belong to terrain connected to the entrance within the local reach and
+routing window. Walk cells overlapping the finite-segment radius form a conservative raster;
+positive-length overlap with the open entrance segment seeds a flood through legal walkable
+neighbors. Endpoint-only or corner-only touches do not seed a separate ledge, and diagonal moves
+need both side cells in the permitted terrain neighborhood. Paths cannot leave that neighborhood
+and re-enter. The exact center-radius check still applies after the connectivity filter.
+
+The flood ignores buildability, elevation changes, and map objects: walkable unbuildable ramp cells
+can connect both sides, while height and occupancy remain full-footprint checks. Thus ramp
+"either side" remains useful, and a nearby cliff top whose connection lies outside the local reach
+is excluded. This is local terrain connectivity, not base-region membership or unit passage.
+`wall_placement_reach(grid, window, site)` exposes the same bounded walk-cell mask to callers.
+Both requested movers must connect A/B before construction. Search enumeration drops any individual
+placement whose expanded collision covers either endpoint for either mover. Endpoint suggestion
+retains those placements because its old endpoints are ignored. Results must keep both endpoints
+clear, block the requested mover within the routing window, and preserve the optional passage.
+The optional mover's route is included as evidence. These are model-valid candidates, not claims
+of complete game placement legality or global seals; [the model exclusions](wall-model.md) apply.
+
+The job prepares baseline collision grids once. At each open partial layout, a deterministic route
+provides a witness: some additional building must disrupt it for a wall to form. Only placements
+that can block that route (including the side cells required by its diagonal moves) need be tried.
+Footprint conflicts and equivalent permutations of repeated building geometry are pruned. A
+returned wall is removal-minimal: removing any one building restores the blocked mover's route. Search
+order is deterministic: entrance-relative queries prefer centers near the finite segment; other
+queries prefer the A/B midpoint. This is not a globally optimal wall ranking or a promise that a
+small budget will find every useful arrangement.
+
+`step(max_states)` advances the job; `result()` reports explored states, candidate placement count,
+layouts, and one of `Running`, `Exhausted`, `StateLimit`, or `ResultLimit`. Hard limits are six
+inventory slots, 6,144 candidate placements, 100,000 evaluated states, 32 layouts, and 1,000,000 total
+returned allow-route points. The route-evidence cap also returns `ResultLimit`; evidence is never
+silently truncated. Pending DFS storage is limited to one candidate list per inventory depth. Exhaustion refers to this
+placement area, inventory, endpoints, and model. A reached state/result limit leaves unexplored
+possibilities. A state budget is a work-count bound, not a hard CPU deadline: pixel route searches
+and constructor preprocessing have their own costs. Dropping the owned job cancels it.
+
+`suggest_wall_endpoints` optionally chooses A/B from walk-cell centers on opposite sides of a
+supplied entrance line. It ignores the query's old endpoints, but validates its other fields. It
+excludes the union of eligible building collisions, expanded for both movers, when `placement_site`
+is supplied. Points must also lie beyond the requested finite-segment reach, so both cannot sit on
+an unbuildable ramp lip in front of the whole construction zone. It enumerates the same candidates
+as the solver before endpoint filtering, so no permitted building can cover a suggested point. Safe
+ground beyond the reach inside the rectangular bound remains available for A/B. Queries
+without a site retain the conservative whole-rectangle exclusion, including collision protrusion
+and mover extents. The construction exclusion only filters endpoint choices: it is not stamped into
+the baseline connectivity grid. Connected-component labels ensure both requested movers connect
+before construction. Selection prefers extending the entrance normal,
+then nearby points, with deterministic coordinate ties; it can use lateral room space when the map
+edge prevents a straight extension. This is a local geometric suggestion, not proof that the points
+belong to named base regions. The lateral offset ranks ahead of distance, so a farther point can
+win over a nearby off-axis point. Sides use the infinite entrance line; a curved approach crossing
+its extension can place both points on the same strategic side of a wall. Manual A/B selection
+remains available; a valid endpoint pair does not certify a useful wall site. If no safe connected
+pair of sampled walk-cell centers exists in the routing window, it returns an error rather than silently moving points into possible construction.
+It does not exhaust all integer-pixel endpoints. A larger routing window or smaller construction
+area/reach can help. Component labeling costs a bounded full-window pass per mover.
 
 ## Validation and next checkpoints
 

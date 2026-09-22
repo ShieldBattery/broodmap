@@ -724,6 +724,160 @@ fn exercise_walls(grid: &TerrainGrid, data: &[u8]) {
         _ => invalid_obstacles = vec![obstacles[0]; 8193],
     }
     assert!(check_wall(grid, &invalid_obstacles, &invalid).is_err());
+    // The incremental search owns its prepared snapshot. Exercise real input-derived layouts,
+    // budget termination, and chunk-size independence in the same small bounded domain.
+    {
+        use broodmap_analysis::walls::search::{
+            BuildingSpec, WallPlacementSite, WallSearch, WallSearchQuery, suggest_wall_endpoints,
+            wall_placement_reach,
+        };
+        let search_query = WallSearchQuery {
+            window: query.window,
+            placement_area: query.window,
+            placement_site: (byte(22) & 1 != 0).then_some(WallPlacementSite {
+                entrance: [query.start, query.end],
+                max_distance_pixels: byte(23) % 129,
+            }),
+            placement_elevation: (byte(20) & 1 != 0).then_some((byte(21) % 3) as u8),
+            start: query.start,
+            end: query.end,
+            block: mover,
+            allow: (byte(13) & 1 != 0).then_some(CollisionBounds {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            }),
+            buildings: vec![
+                BuildingSpec {
+                    footprint: DepotFootprint {
+                        width_tiles: 1,
+                        height_tiles: 1
+                    },
+                    collision: CollisionBounds {
+                        left: 8 + byte(14) % 9,
+                        top: 8 + byte(15) % 9,
+                        right: 7 + byte(16) % 9,
+                        bottom: 7 + byte(17) % 9,
+                    },
+                };
+                1 + (byte(18) % 2) as usize
+            ],
+            max_states: 1 + byte(19) % 8,
+            max_results: 2,
+        };
+        if let Ok(mut search) = WallSearch::new(grid, &obstacles, search_query.clone()) {
+            let reach = search_query.placement_site.map(|site| {
+                let reach = wall_placement_reach(grid, search_query.window, site).unwrap();
+                assert_eq!(reach.cells.len(), (reach.width * reach.height) as usize);
+                assert!(reach.cells.len() <= 129 * 129);
+                for (i, &reachable) in reach.cells.iter().enumerate() {
+                    if reachable {
+                        let position = WalkPosition {
+                            x: reach.origin.x + i as u32 % reach.width,
+                            y: reach.origin.y + i as u32 / reach.width,
+                        };
+                        assert!(grid.cell(position).unwrap().walkable);
+                    }
+                }
+                reach
+            });
+            let mut batched = WallSearch::new(grid, &obstacles, search_query.clone()).unwrap();
+            while !search.is_done() {
+                search.step(1);
+            }
+            batched.step(search_query.max_states);
+            assert_eq!(search.result(), batched.result());
+            assert!(search.result().explored_states <= search_query.max_states);
+            assert!(search.result().layouts.len() <= search_query.max_results);
+            for layout in &search.result().layouts {
+                for placement in &layout.buildings {
+                    let b = placement.building;
+                    if let Some(reach) = &reach {
+                        assert!(reach.contains_pixel(PixelPosition {
+                            x: b.tile.x * 32 + b.footprint.width_tiles * 16,
+                            y: b.tile.y * 32 + b.footprint.height_tiles * 16,
+                        }));
+                    }
+                    if let Some(site) = search_query.placement_site {
+                        let [a, z] = site.entrance;
+                        let dx = f64::from(z.x) - f64::from(a.x);
+                        let dy = f64::from(z.y) - f64::from(a.y);
+                        let px = f64::from(b.tile.x * 32 + b.footprint.width_tiles * 16)
+                            - f64::from(a.x);
+                        let py = f64::from(b.tile.y * 32 + b.footprint.height_tiles * 16)
+                            - f64::from(a.y);
+                        let t = ((px * dx + py * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+                        assert!(
+                            (px - t * dx).powi(2) + (py - t * dy).powi(2)
+                                <= f64::from(site.max_distance_pixels).powi(2) + 1e-7
+                        );
+                    }
+                    if let Some(height) = search_query.placement_elevation {
+                        for y in b.tile.y * 4..(b.tile.y + b.footprint.height_tiles) * 4 {
+                            for x in b.tile.x * 4..(b.tile.x + b.footprint.width_tiles) * 4 {
+                                assert_eq!(
+                                    grid.cell(WalkPosition { x, y }).unwrap().elevation,
+                                    height
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut verify = query.clone();
+                verify.buildings = layout.buildings.iter().map(|p| p.building).collect();
+                assert!(verify.buildings.len() <= search_query.buildings.len());
+                let checked = check_wall(grid, &obstacles, &verify).unwrap();
+                assert!(checked.placements.iter().all(|p| p.issues.is_empty()));
+                assert_eq!(checked.passage, WallPassage::BlockedWithinWindow);
+                if let Some(allow) = search_query.allow {
+                    verify.mover = allow;
+                    assert_eq!(
+                        check_wall(grid, &obstacles, &verify).unwrap().passage,
+                        WallPassage::Open
+                    );
+                }
+            }
+        }
+        // Input-derived endpoint geometry exercises lateral space and independently checks both
+        // mover baselines. A smaller area leaves possible safe space inside the routing window.
+        let mut endpoint_query = search_query.clone();
+        let area = &mut endpoint_query.placement_area;
+        let inset_x = (area.right - area.left) / 4;
+        let inset_y = (area.bottom - area.top) / 4;
+        area.left += inset_x;
+        area.right -= inset_x;
+        area.top += inset_y;
+        area.bottom -= inset_y;
+        let entrance = [query.start, query.end];
+        if let Ok([start, end]) =
+            suggest_wall_endpoints(grid, &obstacles, &endpoint_query, entrance)
+        {
+            assert_eq!(
+                suggest_wall_endpoints(grid, &obstacles, &endpoint_query, entrance).unwrap(),
+                [start, end]
+            );
+            for mover in [Some(endpoint_query.block), endpoint_query.allow]
+                .into_iter()
+                .flatten()
+            {
+                let verify = WallQuery {
+                    window: query.window,
+                    start,
+                    end,
+                    mover,
+                    buildings: Vec::new(),
+                };
+                assert_eq!(
+                    check_wall(grid, &obstacles, &verify).unwrap().passage,
+                    WallPassage::Open
+                );
+            }
+        }
+        let mut invalid_search = search_query;
+        invalid_search.max_states = 0;
+        assert!(WallSearch::new(grid, &obstacles, invalid_search).is_err());
+    }
     let result = check_wall(grid, &obstacles, &query).unwrap();
     assert_eq!(result, check_wall(grid, &obstacles, &query).unwrap());
     assert_eq!(result.placements.len(), query.buildings.len());
