@@ -18,6 +18,7 @@ mod entrances;
 mod ramps;
 mod regions;
 mod topology;
+mod walls;
 
 pub use areas::AreaSnapshot;
 pub use regions::RegionSnapshot;
@@ -74,6 +75,8 @@ impl MapRenderer {
         let obstacles = melee_obstacles(units, sprites, &definitions);
         analysis.obstructed = Some(analysis.grid.with_obstacles(&obstacles));
         analysis.obstacle_count = obstacles.len();
+        analysis.wall_obstacles = obstacles;
+        analysis.wall_profiles = walls::WallProfiles::from_definitions(&definitions);
         analysis.respect_obstacles = true;
         analysis.base_inputs = Some(bases::BaseInputs::new(units, sprites, &definitions));
         Ok(analysis)
@@ -109,6 +112,8 @@ pub struct TerrainAnalysis {
     obstructed: Option<TerrainGrid>,
     respect_obstacles: bool,
     obstacle_count: usize,
+    wall_obstacles: Vec<broodmap_analysis::PixelRect>,
+    wall_profiles: walls::WallProfiles,
     base_inputs: Option<bases::BaseInputs>,
     base_catalog: Option<bases::BaseCatalog>,
     entrance_survey: OnceLock<EntranceSurvey>,
@@ -228,6 +233,8 @@ impl TerrainAnalysis {
             obstructed: None,
             respect_obstacles: false,
             obstacle_count: 0,
+            wall_obstacles: Vec::new(),
+            wall_profiles: walls::WallProfiles::default(),
             base_inputs: None,
             base_catalog: None,
             entrance_survey: OnceLock::new(),

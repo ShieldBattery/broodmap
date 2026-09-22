@@ -7,6 +7,22 @@ let ready = null
 let jobs = Promise.resolve()
 let baseAreaCache = null
 const areaRequests = new Map()
+const wallSearchRequests = new Map()
+const WALL_SEARCH_SLICE_MS = 8
+const WALL_SEARCH_STEPS_PER_BATCH = 16
+const WALL_SEARCH_MAX_BATCHES_PER_SLICE = 4
+
+function yieldTask() {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel()
+    channel.port1.onmessage = () => {
+      channel.port1.close()
+      channel.port2.close()
+      resolve()
+    }
+    channel.port2.postMessage(null)
+  })
+}
 
 self.onmessage = ({ data }) => {
   // Cancellation must bypass the serialized queue: the running job yields between origins.
@@ -15,11 +31,23 @@ self.onmessage = ({ data }) => {
     if (request) request.cancelled = true
     return
   }
+  if (data.type === 'cancelWallSearch') {
+    const request = wallSearchRequests.get(data.token)
+    if (request) request.cancelled = true
+    return
+  }
+  const wallRequest = data.type === 'findWalls' ? { cancelled: false } : null
+  if (wallRequest) {
+    const previous = wallSearchRequests.get(data.token)
+    if (previous) previous.cancelled = true
+    wallSearchRequests.set(data.token, wallRequest)
+  }
   if (data.type === 'findBaseAreas') areaRequests.set(data.token, { cancelled: false })
-  jobs = jobs.then(() => handle(data)).catch((error) => {
+  jobs = jobs.then(() => handle(data, wallRequest)).catch((error) => {
     self.postMessage({ id: data.id, ok: false, error: message(error) })
   }).finally(() => {
     if (data.type === 'findBaseAreas') areaRequests.delete(data.token)
+    if (wallRequest && wallSearchRequests.get(data.token) === wallRequest) wallSearchRequests.delete(data.token)
   })
 }
 
@@ -116,7 +144,7 @@ async function addAssets(paths, base, allowMissing) {
   return { fetched, skipped }
 }
 
-async function handle({ id, type, ...payload }) {
+async function handle({ id, type, ...payload }, wallRequest) {
   await wasm()
   if (type === 'loadMap') {
     baseAreaCache = null
@@ -170,6 +198,65 @@ async function handle({ id, type, ...payload }) {
     const flags = analysis.cellFlags().buffer
     const clearance = analysis.clearancePixels().buffer
     post(id, { flags, clearance, obstacleCount: analysis.obstacleCount, enabled: Boolean(payload.enabled) }, [flags, clearance])
+    return
+  }
+  if (type === 'wallProfiles') {
+    if (!analysis) throw new Error('Analyze terrain before inspecting wall profiles.')
+    post(id, JSON.parse(analysis.wallProfilesJson()))
+    return
+  }
+  if (type === 'suggestWallEndpoints') {
+    if (!analysis) throw new Error('Analyze terrain before choosing wall endpoints.')
+    post(id, JSON.parse(analysis.suggestWallEndpointsJson(JSON.stringify(payload.query), JSON.stringify(payload.entrance))))
+    return
+  }
+  if (type === 'wallPlacementReach') {
+    if (!analysis) throw new Error('Analyze terrain before inspecting wall placement reach.')
+    const result = JSON.parse(analysis.wallPlacementReachJson(JSON.stringify(payload.query)))
+    const cells = Uint8Array.from(result.cells).buffer
+    post(id, { origin: result.origin, width: result.width, height: result.height, cells }, [cells])
+    return
+  }
+  if (type === 'findWalls') {
+    if (!analysis) throw new Error('Analyze terrain before searching for walls.')
+    const started = performance.now()
+    const checkCancelled = () => {
+      if (!wallRequest || wallRequest.cancelled) throw new Error('Wall search cancelled.')
+    }
+    await yieldTask()
+    checkCancelled()
+    const job = analysis.startWallSearch(JSON.stringify(payload.query))
+    try {
+      let done = false
+      let lastProgress = -Infinity
+      while (!done) {
+        const sliceDeadline = performance.now() + WALL_SEARCH_SLICE_MS
+        for (let batches = 0; !done && batches < WALL_SEARCH_MAX_BATCHES_PER_SLICE; batches++) {
+          checkCancelled()
+          done = job.step(WALL_SEARCH_STEPS_PER_BATCH)
+          const now = performance.now()
+          if (done || now - lastProgress >= 100) {
+            self.postMessage({ id, progress: { exploredStates: job.exploredStates, foundLayouts: job.layoutCount } })
+            lastProgress = now
+          }
+          checkCancelled()
+          if (now >= sliceDeadline) break
+        }
+        if (!done) await yieldTask()
+      }
+      await yieldTask()
+      checkCancelled()
+      post(id, { ...JSON.parse(job.resultJson()), elapsedMs: Math.round(performance.now() - started) })
+    } finally {
+      job.free()
+    }
+    return
+  }
+  if (type === 'checkWall') {
+    if (!analysis) throw new Error('Analyze terrain before checking a wall.')
+    const started = performance.now()
+    const result = JSON.parse(analysis.checkWallJson(JSON.stringify(payload.query)))
+    post(id, { ...result, elapsedMs: Math.round(performance.now() - started) })
     return
   }
   if (type === 'findRegions') {
