@@ -1,76 +1,104 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>broodmap browser terrain inspector</title>
-<style>
-  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10151d; color: #e9eff7; }
-  body { margin: 2rem auto; padding: 0 1rem; max-width: 76rem; }
-  fieldset, .panel { border: 1px solid #5f718544; border-radius: 8px; background: #18212c; margin: 1rem 0; padding: 1rem; }
-  label { margin: .25rem 1rem .25rem 0; display: inline-block; }
-  label[hidden] { display: none; }
-  input, select, button { font: inherit; }
-  button { cursor: pointer; padding: .3rem .7rem; }
-  canvas { image-rendering: pixelated; }
-  #preview, #minimap { max-width: 100%; height: auto; border: 1px solid #72869b88; }
-  #status, #hover, #routeResult, #baseResult, #baseRouteResult, #entranceResult, #baseAreaResult { white-space: pre-line; font-family: ui-monospace, monospace; line-height: 1.45; }
-  .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
-  .row > * { min-width: 0; }
-  #terrainShell { position: relative; width: min(100%, 60rem); background: #080c11; border: 1px solid #72869b88; overflow: hidden; }
-  #terrainShell canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-  #terrainBackdrop { z-index: 0; }
-  #terrainOverlay { z-index: 1; cursor: crosshair; }
-  .note { color: #b8c5d3; max-width: 70ch; }
-  .legend { display: flex; gap: .75rem; flex-wrap: wrap; font-size: .9rem; color: #c7d3df; }
-  .swatch { display: inline-block; width: .8rem; height: .8rem; margin-right: .25rem; border: 1px solid #ffffff66; vertical-align: -.05rem; }
-  h2 { margin-bottom: .4rem; }
-</style>
-</head>
-<body>
-<h1>broodmap browser terrain inspector</h1>
-<p class="note">Parse maps and render previews locally in your browser. Artwork comes from a static directory produced by <code>broodmap-cli fetch-assets</code>.</p>
-
-<fieldset>
-  <legend>Inputs and preview</legend>
-  <label>Map (.scm/.scx): <input type="file" id="map" accept=".scm,.scx"></label>
-  <label>Asset base URL: <input type="text" id="assetBase" value="./assets" size="20"></label>
-  <label>Style: <select id="style"><option value="original" selected>original</option><option value="remastered">remastered</option><option value="cartooned">cartooned</option></select></label>
-  <label>Size: <input type="number" id="size" value="1024" min="64" max="8192" step="64"></label>
-  <button id="render" disabled>Render</button>
-  <button id="analyze" disabled>Analyze terrain</button>
-</fieldset>
-
-<div id="status" role="status">Pick a map file to begin.</div>
-
-<div class="row">
-  <section><h2>Preview</h2><canvas id="preview" width="0" height="0"></canvas></section>
-  <section><h2>Minimap (zero-asset)</h2><canvas id="minimap" width="0" height="0"></canvas></section>
-</div>
-
-<section class="panel" aria-labelledby="terrainHeading">
-  <h2 id="terrainHeading">Terrain inspector</h2>
-  <p class="note">The minimap is the backdrop until rendered artwork is available. Terrain buildability is a CV5 terrain hint, not actual placement legality.</p>
-  <div id="terrainControls" hidden>
-    <label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option><option value="clearance">Clearance radius</option><option value="regions">Terrain regions</option><option value="baseAreas">Experimental base areas</option></select></label>
-    <label id="clearanceScaleControl" hidden>Color scale maximum: <select id="clearanceMax"><option value="64">64px (2 tiles)</option><option value="128">128px (4 tiles)</option><option value="256" selected>256px (8 tiles)</option><option value="512">512px (16 tiles)</option></select></label>
-    <label>Opacity: <input id="opacity" type="range" min="10" max="90" value="45"> <output id="opacityValue">45%</output></label>
-    <label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
-    <span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
-    <button id="resetRoute">Reset route</button>
-    <button id="findBases" disabled>Find bases</button>
-  <label>Peak prominence: <select id="regionProminence" disabled>
-    <option value="16">Finer 16px</option><option value="32" selected>32px</option><option value="64">Coarser 64px</option><option value="96">96px</option>
-  </select></label>
-  <label>Minimum relative narrowing: <select id="regionRelativeProminence" disabled>
-    <option value="0">Off</option><option value="25">25%</option><option value="40" selected>40%</option><option value="55">55%</option>
-  </select></label>
-  <button id="findRegions" disabled>Find regions</button>
-  <label><input id="showPassages" type="checkbox" checked disabled> Show passages</label>
-    <label><input id="showBases" type="checkbox" checked disabled> Show base footprints</label>
-    <span id="baseMode" class="note">Find bases after terrain analysis.</span>
-    <span id="regionResult" class="note">Find regions after terrain analysis.</span>
-    <div id="baseControls" hidden>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>broodmap / Map lab</title><style>
+:root { color-scheme:dark; font-family:Inter,system-ui,sans-serif; color:#dbe6ef; background:#0c1118; font-size:14px; }
+* { box-sizing:border-box; } [hidden] { display:none!important; }
+body { margin:0; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+button,input,select { font:inherit; color:inherit; background:#17232f; border:1px solid #344756; border-radius:5px; padding:7px 9px; }
+button { cursor:pointer; } button:hover:not(:disabled) { background:#243948; border-color:#69bda9; }
+button:disabled,select:disabled { opacity:.45; cursor:default; }
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid #79d4bd; outline-offset:2px; }
+input[type=checkbox] { accent-color:#6bd0ac; } input[type=range] { width:120px; padding:0; accent-color:#6bd0ac; }
+.topbar { display:flex; align-items:center; gap:24px; padding:12px 20px; background:#121c26; border-bottom:1px solid #2a3946; flex-wrap:wrap; }
+.brand { font-size:18px; font-weight:650; letter-spacing:-.5px; white-space:nowrap; }.brand span { font-weight:400; color:#839aa9; }
+.topbar label { font-size:12px; color:#a8bac7; }.topbar input { margin-left:8px; max-width:340px; } #status { font-size:12px; color:#a4c4b9; flex:1; min-width:200px; }
+.workspace { display:grid; grid-template-columns:minmax(0,1fr) 340px; flex:1; min-height:0; }
+.map-panel { display:flex; flex-direction:column; min-width:0; min-height:0; background:#090e14; }
+.map-toolbar { display:flex; align-items:center; gap:7px; padding:10px 14px; border-bottom:1px solid #24333e; flex-wrap:wrap; }
+.map-toolbar label { margin-right:auto; }.map-toolbar button { padding:5px 10px; } #zoomLevel { color:#9bb5c4; min-width:42px; text-align:center; font-variant-numeric:tabular-nums; }
+#mapViewport { flex:1; min-height:400px; position:relative; overflow:hidden; background:#0a1119; }
+#terrainShell { position:absolute; top:0; left:0; transform-origin:0 0; }
+#terrainShell canvas { position:absolute; inset:0; width:100%; height:100%; }
+#terrainBackdrop { z-index:0; image-rendering:pixelated; } #terrainOverlay { z-index:1; cursor:crosshair; }
+#mapAnnotations { position:absolute; inset:0; width:100%; height:100%; z-index:2; pointer-events:none; }
+#placementPreview { position:absolute; inset:0; width:100%; height:100%; z-index:3; pointer-events:none; }
+#mapDropHint { position:absolute; inset:12px; z-index:5; display:grid; place-content:center; text-align:center; background:#102a25e8; border:2px dashed #8ae1bc; border-radius:12px; color:#d4ffea; font-size:22px; font-weight:600; pointer-events:none; }
+#mapDropHint small { display:block; margin-top:8px; color:#a8cabb; font-size:13px; font-weight:400; }
+#mapEmpty { position:absolute; inset:0; display:grid; place-content:center; text-align:center; padding:30px; color:#91a9b9; pointer-events:none; }
+#mapEmpty strong { display:block; font-size:26px; color:#d8eee7; margin-bottom:10px; font-weight:550; } #mapEmpty p { max-width:42ch; line-height:1.7; }
+.map-footer { padding:9px 14px; border-top:1px solid #24333e; color:#91a8b7; font-size:11px; } #hover { margin:6px 0 0; min-height:16px; font-variant-numeric:tabular-nums; }
+.sidebar { overflow:auto; min-height:0; background:#121c26; border-left:1px solid #2a3946; padding:14px; }
+section.tools, details { margin:0 0 12px; border:1px solid #2a3d4a; border-radius:8px; background:#15212c; }
+section.tools { padding:14px; } section.tools h2 { font-size:15px; margin:0 0 12px; font-weight:600; }
+summary { padding:13px 14px; cursor:pointer; color:#c8dce5; font-weight:550; } details[open]>summary { border-bottom:1px solid #2a3d4a; margin-bottom:12px; }
+.detail-body { padding:0 14px 14px; } label { display:block; margin:8px 0; font-size:12px; color:#b1c7d3; }
+.sidebar select,.sidebar input[type=text],.sidebar input[type=number] { display:block; width:100%; margin-top:5px; min-width:0; }
+.sidebar button { margin:4px 2px 4px 0; font-size:12px; } .sidebar input[type=checkbox] { margin:0 5px 0 0; }
+.tool-bar { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; margin:12px 0 8px; }
+.sidebar .tool-bar button { margin:0; padding:8px 3px; }
+.tool-bar button[aria-pressed="true"] { background:#2a574b; border-color:#80debb; color:#e1fff1; font-weight:650; }
+#wallEditor br { display:none; } #checkWall { width:100%; background:#62c4a0; border-color:#80debb; color:#0b2420; font-weight:700; margin-top:12px; padding:10px; }
+#wallResult { border-left:2px solid #61c7a3; padding:8px 10px; background:#0f1b24; line-height:1.6; }
+.note,#wallMode,#baseMode,#obstacleMode,#regionResult { display:block; color:#8fa9b8; font-size:11px; line-height:1.6; }
+p { line-height:1.6; } #wallResult,#routeResult,#baseResult,#baseRouteResult,#entranceResult,#baseAreaResult { white-space:pre-line; font-size:12px; overflow-wrap:anywhere; }
+.legend { font-size:11px; color:#9db1bf; line-height:1.5; }.legend>span { display:block; margin:5px 0; }
+.swatch { display:inline-block; width:9px; height:9px; margin-right:5px; vertical-align:middle; border:1px solid #ffffff55; }
+#preview,#minimap { max-width:100%; height:auto; image-rendering:pixelated; }.visually-hidden { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+@media(max-width:900px) { body { height:auto; overflow:auto; }.workspace { display:flex; flex-direction:column; }.map-panel { height:72dvh; min-height:540px; }.sidebar { border-left:0; border-top:1px solid #2a3946; overflow:visible; }.topbar { gap:10px; }.topbar input { max-width:230px; } #status { flex-basis:100%; }.map-toolbar { padding:8px; } }
+</style></head><body>
+<header class="topbar"><div class="brand">broodmap <span>/ Map lab</span></div><label>Map (.scm/.scx): <input type="file" id="map" accept=".scm,.scx"></label><div id="status" role="status">Pick a map file to begin.</div></header>
+<main class="workspace"><section class="map-panel" aria-labelledby="terrainHeading"><h1 id="terrainHeading" class="visually-hidden">Map workspace</h1>
+<div class="map-toolbar"><label>Mode <select id="workspaceMode"><option value="wall" selected>Wall editor</option><option value="inspect">Terrain &amp; routes</option></select></label><button id="zoomOut" aria-label="Zoom out">&minus;</button><output id="zoomLevel">100%</output><button id="zoomIn" aria-label="Zoom in">+</button><button id="fitMap">Fit map</button><button id="focusWall">Focus wall</button></div>
+<div id="mapViewport" tabindex="0" aria-label="Zoomable map workspace"><div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div><canvas id="mapAnnotations" aria-hidden="true"></canvas><canvas id="placementPreview" aria-hidden="true"></canvas><div id="mapDropHint" hidden>Drop map to open<small>.scm or .scx &mdash; analysis starts automatically</small></div><div id="mapEmpty"><strong>A little closer to the terrain.</strong><p>Drop a map anywhere on this page, or choose a file above. Terrain, bases, entrances, and artwork load automatically.</p></div></div>
+<footer class="map-footer">Scroll to zoom &middot; Middle-drag or Space + drag to pan &middot; Click an entrance to edit<p id="hover">Move over the terrain view after analysis.</p></footer></section>
+<aside class="sidebar" aria-label="Analysis and editing tools"><div id="terrainControls" hidden>
+<section class="tools"><h2>Build a wall</h2><p class="note">Choose an entrance or click a spot on the map. Hover to preview; click to place a centered building.</p><div id="wallControls">
+      <label><input id="wallEnabled" type="checkbox" disabled> Enable wall editing</label>
+      <span id="wallMode" class="note">Analyze terrain to load stock building and mover profiles.</span>
+      <div id="wallEditor" hidden>
+        <label>Entrances: <select id="wallSpanScope" aria-label="Wall entrance scope"><option value="selected">Selected bases</option><option value="all" selected>All entrances</option></select></label>
+        <label>Entrance/window: <select id="wallSpan" aria-label="Wall entrance or manual window"><option value="manual">Manual window (first canvas click centers it)</option></select></label>
+        <label>Window: <select id="wallWindowSize"><option value="512">512px</option><option value="768" selected>768px</option><option value="1024">1024px</option></select></label>
+        <button id="wallCenter" type="button" hidden>Center on selected entrance</button>
+        <button id="wallPickEntrance" type="button">Pick entrance on map</button>
+        <button id="wallManualCenter" type="button">Custom spot</button>
+        <br>
+        <details id="wallSearchPanel" open><summary>Find wall layouts</summary><div class="detail-body">
+          <p class="note">Click near an entrance to select it. Highlighted ground shows building-center reach from the entrance; ramps default to high ground. Footprints can extend beyond the highlight.</p>
+          <label>Supply Depots (up to)<input id="searchDepots" type="number" min="0" max="3" value="2"></label>
+          <label>Barracks (up to)<input id="searchBarracks" type="number" min="0" max="3" value="1"></label>
+          <label>Must block<select id="searchBlock"></select></label>
+          <label>Must still pass<select id="searchAllow"></select></label>
+          <label>Ramp side<select id="searchGround"><option value="high" selected>High ground</option><option value="low">Low ground</option><option value="any">Either side</option></select></label>
+          <label><input id="searchAutoEndpoints" type="checkbox" checked> Keep A/B clear of possible buildings</label>
+          <label>Search reach<select id="searchSize"><option value="256">4 tiles from entrance</option><option value="384" selected>6 tiles from entrance</option><option value="512">8 tiles from entrance</option></select></label>
+          <label>Search budget<select id="searchBudget"><option value="500">500 states</option><option value="2000" selected>2,000 states</option><option value="10000">10,000 states</option></select></label>
+          <button id="findWalls" type="button">Find layouts</button><button id="cancelWallSearch" type="button" hidden>Cancel</button>
+          <p id="wallSearchStatus" class="note" role="status">Choose an entrance or a spot on the map.</p>
+          <div id="wallSearchResults" hidden>
+            <label>Suggestion<select id="wallSuggestion"></select></label>
+            <button id="useWallSuggestion" type="button">Keep this layout</button><button id="dismissWallSuggestion" type="button">Back to my layout</button>
+          </div>
+          <p class="note">Static-model candidates. Power, creep, and full game placement rules are not checked. Search starts from an empty plan.</p>
+        </div></details>
+        <label>Building: <select id="wallBuilding" aria-label="Wall building"></select></label>
+        <label>Mover: <select id="wallMover" aria-label="Wall mover"></select></label>
+        <div id="wallTool" class="tool-bar" role="group" aria-label="Wall editing tools">
+          <button type="button" data-wall-tool="place" aria-pressed="true" title="Place a building">Place</button>
+          <button type="button" data-wall-tool="remove" aria-pressed="false" title="Remove a building">Remove</button>
+          <button type="button" data-wall-tool="start" aria-pressed="false" title="Set test point A">Set A</button>
+          <button type="button" data-wall-tool="end" aria-pressed="false" title="Set test point B">Set B</button>
+        </div>
+        <button id="wallUndo" type="button">Undo</button>
+        <button id="wallClear" type="button">Clear buildings</button>
+        <button id="checkWall" type="button">Check wall</button>
+        <p id="wallResult">Choose an entrance or click the terrain to center a bounded window. Place up to 32 buildings in build-tile cells, then set A/B test points.</p>
+        <p class="note">Solid: footprint. Dashed yellow: collision. Pink: open route. Preview colors are hints; checks apply inside the outlined area. Power, creep, and full game pathing are not checked.</p>
+      </div>
+    </div></section>
+<details><summary>Bases &amp; entrances</summary><div class="detail-body"><label><input id="showBases" type="checkbox" checked disabled> Show base footprints</label>
+<button id="findBases" disabled>Find bases</button>
+<span id="baseMode" class="note">Find bases after terrain analysis.</span>
+<div id="baseControls" hidden>
       <label>Base A: <select id="baseA" aria-label="Base A"></select></label>
       <label>Base B: <select id="baseB" aria-label="Base B"></select></label>
       <button id="compareBases">Compare bases</button>
@@ -83,26 +111,35 @@
       <label><input id="showEntrances" type="checkbox" checked disabled> Show entrance survey</label>
       <span id="entranceResult" class="note" style="white-space:pre-line">Choose two base anchors to inspect terrain entrances.</span>
     </div>
-  </div>
-  <p class="legend">
+<p id="baseAreaResult">Analyze all base areas once, then select bases to highlight them.</p>
+<p id="baseRouteResult">Choose two discovered bases to compare their anchors.</p></div></details>
+<details><summary>Terrain &amp; routes</summary><div class="detail-body"><label>Overlay: <select id="overlay"><option value="walkability">Walkability (red blocked)</option><option value="elevation">Elevation</option><option value="buildability">Terrain buildability (amber unbuildable)</option><option value="ramps">Ramps</option><option value="obstacles">Map obstacles (magenta)</option><option value="clearance">Clearance radius</option><option value="regions">Terrain regions</option><option value="baseAreas">Experimental base areas</option></select></label>
+<label>Opacity: <input id="opacity" type="range" min="10" max="90" value="45"> <output id="opacityValue">45%</output></label>
+<label id="clearanceScaleControl" hidden>Color scale maximum: <select id="clearanceMax"><option value="64">64px (2 tiles)</option><option value="128">128px (4 tiles)</option><option value="256" selected>256px (8 tiles)</option><option value="512">512px (16 tiles)</option></select></label>
+<label><input id="respectObstacles" type="checkbox" checked disabled> Respect map obstacles</label>
+<span id="obstacleMode" class="note">Map obstacle routing is available after analysis.</span>
+<button id="resetRoute">Reset route</button>
+<p id="routeResult">Analyze terrain, then click two walkable cells.</p>
+<label>Peak prominence: <select id="regionProminence" disabled>
+    <option value="16">Finer 16px</option><option value="32" selected>32px</option><option value="64">Coarser 64px</option><option value="96">96px</option>
+  </select></label>
+<label>Minimum relative narrowing: <select id="regionRelativeProminence" disabled>
+    <option value="0">Off</option><option value="25">25%</option><option value="40" selected>40%</option><option value="55">55%</option>
+  </select></label>
+<button id="findRegions" disabled>Find regions</button>
+<label><input id="showPassages" type="checkbox" checked disabled> Show passages</label>
+<span id="regionResult" class="note">Find regions after terrain analysis.</span><p class="legend">
     <span id="baseAreaLegend" hidden><i class="swatch" style="background:#44ccf1"></i>A area <i class="swatch" style="background:#c480f2"></i>B area <i class="swatch" style="background:#f3b446"></i>shared area; green boundary separates, dashed amber has a bypass; muted gray has no buildable terrain within 2 tiles of its midpoint (or crosses no edges); R labels mark lower (L) and upper (U) ramp ends</span>
     <span id="regionLegend" hidden><i class="swatch" style="background:#8aa6e8"></i>regions and candidate passages</span><span id="entranceLegend" hidden><i class="swatch" style="background:#54e7f2"></i>terrain-only entrance survey</span><span id="clearanceLegend" hidden><i class="swatch" style="width:7rem;background:linear-gradient(90deg,#ee642d,#28cdc3,#6256e8)"></i><span id="clearanceLegendText">square radius: 4px (orange), 130px (teal), 256+px (violet)</span></span>
     <span id="elevationLegend" hidden><i class="swatch" style="background:#2372bf"></i>elevation 0 <i class="swatch" style="background:#39ad77"></i>elevation 1 <i class="swatch" style="background:#e7c14a"></i>elevation 2</span>
-  </p>
-  <div id="terrainShell" aria-label="Terrain walk-cell inspector"><canvas id="terrainBackdrop" width="0" height="0"></canvas><canvas id="terrainOverlay" width="0" height="0" aria-label="Click to choose route endpoints"></canvas></div>
-  <p id="hover">Move over the terrain view after analysis.</p>
-  <p id="routeResult">Analyze terrain, then click two walkable cells.</p>
-  <p id="baseResult">Find bases after terrain analysis to inspect mineral fields.</p>
-  <p id="baseAreaResult">Analyze all base areas once, then select bases to highlight them.</p>
-  <p id="baseRouteResult">Choose two discovered bases to compare their anchors.</p>
-  <p class="note">Analyze all base areas surveys each base's three nearest reachable anchored bases in both directions. Close, nearly parallel span observations are consolidated conservatively. The map-wide partition is cached; changing A or B only changes the highlight. Cancellation takes effect between origin searches. Candidate spans block analysis crossings only; normal routes stay unchanged. The overlay floods the resulting components, which may contain multiple bases. Green boundaries separate components with all proposed cuts applied; amber boundaries still have a route around them. This does not establish wallability or exhaustive entrance coverage.</p>
-  <p class="note">Entrance surveys look outward from both A and B, marking width transitions within 32 build tiles of each base. Labels A1/B1 identify the surveyed end; terrain farther ahead supplies widening evidence. It is experimental, can miss other exits, and does not certify walls or engine unit fit.</p>
-  <p class="note">Regions and passages are heuristic summaries of the active terrain. Minimum relative narrowing suppresses room splits where the connecting clearance barely decreases compared with the smaller peak; increase it to merge more regions. Passage radius is a local square-space measure, not corridor width or a unit-fit guarantee. Peak markers show regions with at least 64 cells; hover any cell for its region.</p>
-  <p class="note">Base discovery uses a stock 4x3 depot-footprint heuristic. Orange lines show ground routes; dashed lines show air distance. Terrain defines resource clusters. Sites marked * require clearing small mineral patches or overlapping buildings. Occupied starts clear overlapping objects automatically; current routes keep them present. Candidate scoring balances mineral and gas access. Full placement legality and mover clearance are not established.</p>
-  <p class="note">Clearance shows how far an empty square can extend from each cell center before touching blocked terrain, active map obstacles, or the map edge. Hover to see its radius in pixels. Adjust the color scale to reveal differences in wider areas; values above its maximum share the final color. This measures space in the grid; actual unit passage needs additional movement rules.</p>
-  <p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p>
-</section>
-
-<script type="module" src="./main.js"></script>
-</body>
-</html>
+  </p></div></details>
+<details><summary>All base details</summary><div class="detail-body"><p id="baseResult">Find bases after terrain analysis to inspect mineral fields.</p></div></details></div>
+<details><summary>Assets &amp; setup</summary><div class="detail-body"><p class="note">Map files stay in your browser. Assets come from your local exported directory.</p><label>Asset base URL: <input type="text" id="assetBase" value="./assets" size="20"></label>
+<label>Style: <select id="style"><option value="original" selected>original</option><option value="remastered">remastered</option><option value="cartooned">cartooned</option></select></label>
+<label>Size: <input type="number" id="size" value="4096" min="64" max="8192" step="64"></label>
+<button id="analyze" disabled>Rebuild analysis</button>
+<button id="render" disabled>Refresh artwork</button></div></details>
+<details><summary>Preview &amp; minimap</summary><div class="detail-body"><canvas id="preview" width="0" height="0"></canvas>
+<canvas id="minimap" width="0" height="0"></canvas></div></details>
+<details><summary>How the analysis works</summary><div class="detail-body"><p class="note">The minimap is the backdrop until rendered artwork is available. Terrain buildability is a CV5 terrain hint, not actual placement legality.</p><p class="note">Analyze all base areas surveys each base's three nearest reachable anchored bases in both directions. Close, nearly parallel span observations are consolidated conservatively. The map-wide partition is cached; changing A or B only changes the highlight. Cancellation takes effect between origin searches. Candidate spans block analysis crossings only; normal routes stay unchanged. The overlay floods the resulting components, which may contain multiple bases. Green boundaries separate components with all proposed cuts applied; amber boundaries still have a route around them. This does not establish wallability or exhaustive entrance coverage.</p><p class="note">Entrance surveys look outward from both A and B, marking width transitions within 32 build tiles of each base. Labels A1/B1 identify the surveyed end; terrain farther ahead supplies widening evidence. It is experimental, can miss other exits, and does not certify walls or engine unit fit.</p><p class="note">Regions and passages are heuristic summaries of the active terrain. Minimum relative narrowing suppresses room splits where the connecting clearance barely decreases compared with the smaller peak; increase it to merge more regions. Passage radius is a local square-space measure, not corridor width or a unit-fit guarantee. Peak markers show regions with at least 64 cells; hover any cell for its region.</p><p class="note">Base discovery uses a stock 4x3 depot-footprint heuristic. Orange lines show ground routes; dashed lines show air distance. Terrain defines resource clusters. Sites marked * require clearing small mineral patches or overlapping buildings. Occupied starts clear overlapping objects automatically; current routes keep them present. Candidate scoring balances mineral and gas access. Full placement legality and mover clearance are not established.</p><p class="note">Clearance shows how far an empty square can extend from each cell center before touching blocked terrain, active map obstacles, or the map edge. Hover to see its radius in pixels. Adjust the color scale to reveal differences in wider areas; values above its maximum share the final color. This measures space in the grid; actual unit passage needs additional movement rules.</p><p class="note">When enabled, static resources and grounded neutral buildings are respected. This approximation ignores moving units, mover size, and exact StarCraft engine pathing. Terrain-only mode excludes the static map obstacles; it does not imply every invincible object is removable.</p></div></details>
+</aside></main><script type="module" src="./main.js"></script></body></html>

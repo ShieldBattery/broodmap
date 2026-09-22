@@ -625,6 +625,34 @@ Queries are limited to 32 proposed buildings, 8192 obstacle rectangles, and a wi
 return errors before search. The job runs synchronously within those bounds; demo requests run in
 the worker and stale replies are discarded after edits or map/analysis changes.
 
+WASM exposes `checkWallJson(query)` and `wallProfilesJson()`. The conventional melee palette's
+names and IDs are conveniences; all footprint and collision dimensions come from the caller's
+`units.dat`. Custom callers supply arbitrary normalized dimensions directly:
+
+```js
+const result = JSON.parse(analysis.checkWallJson(JSON.stringify({
+  window: [0, 0, 512, 512],
+  start: [80, 160], end: [400, 160],
+  mover: [8, 8, 7, 7],
+  buildings: [{ tile: [6, 4], footprint: [3, 2], collision: [38, 22, 37, 21] }],
+})))
+```
+
+The obstacle toggle selects whether the original static map rectangles participate. Proposed
+buildings always participate. This checker never changes the ordinary terrain routing grid,
+base catalog, or topology result. The demo can select a detected entrance or work with manually
+positioned test points, shows placement footprints separately from collision bounds, and draws the
+local search window and leak route.
+
+The map-lab demo prepares terrain, base candidates, base areas, and artwork automatically when a
+file is opened. Its map viewport supports pointer-centered wheel zoom, middle-drag or Space-drag
+panning, fit-to-map, and focus-on-wall. Choosing an entrance (or clicking one in the overview)
+frames its test area. Manual centering also frames the selected area. The sidebar keeps placement
+tools beside the map, while analysis tuning and diagnostic output remain available in foldouts.
+A cursor preview and actual placement share a nearest-build-tile center calculation. Green/red
+preview cells are inexpensive terrain/occupancy hints; the Rust check remains the authority for
+static rectangle diagnostics. Preview occupancy is deliberately conservative at walk-cell edges.
+
 ## Automatic wall-layout search
 
 `broodmap_analysis::walls::search::WallSearch` is an opt-in incremental analyzer that proposes
@@ -701,6 +729,46 @@ pair of sampled walk-cell centers exists in the routing window, it returns an er
 It does not exhaust all integer-pixel endpoints. A larger routing window or smaller construction
 area/reach can help. Component labeling costs a bounded full-window pass per mover.
 
+WASM exposes `startWallSearch(queryJson)` returning an owned job with `step(1..16)`, lightweight
+`exploredStates`/`layoutCount` getters, and completed `resultJson()`. JSON uses `window`,
+`placementArea`, optional `placementElevation` (0 through 2), optional `placementSite`
+(`{entrance: [[x1,y1],[x2,y2]], maxDistancePixels}`), `start`, `end`, `block`, optional `allow`,
+`buildings`, `maxStates`, and `maxResults`.
+Building entries contain `footprint` and `collision`, as in the manual checker, with no tile yet.
+`suggestWallEndpointsJson(queryJson, entranceJson)` takes the same query and a pair of pixel
+coordinates (`[[x1, y1], [x2, y2]]`), returning `{start, end}`.
+`wallPlacementReachJson({window, placementSite})` takes a JSON string and returns the local mask
+as `{origin: [walkX,walkY], width, height, cells}` with row-major 0/1 cells. The demo requests this
+mask when entrance geometry changes, debounces changes for 60ms, and allows only one active
+request plus the latest waiting preview. It discards stale replies and hides the highlight while
+pending. It intersects that mask with radius, terrain buildability, elevation, and object hints;
+the Rust search still owns complete footprint validation.
+Results identify each placement's representative inventory slot through `specIndex`; equal
+geometry is interchangeable and uses the first matching slot. The worker processes batches of at
+most 16 states within an approximately 8ms slice (at most four batches), then yields through a
+MessageChannel. One batch can exceed the target; neither a state nor constructor preprocessing is
+preemptible. It also yields before construction and before publishing, always frees the job, and
+discards cancelled results. Analysis and wall controls share a busy state; changing the entrance
+catalog invalidates wall requests and their late progress, success, and failure replies.
+
+The demo starts with up to two Supply Depots and one Barracks, blocking Zealots while allowing
+Marines. These palette dimensions come from the caller's units.dat. **Pick entrance on map**
+selects the nearest finite boundary segment, with a hover highlight. Ramp searches default to the
+upper end and high-ground footprints; low ground and either side are also available. The default
+reach is six tiles from the entrance to building centers, with four/eight-tile alternatives. The
+default budget is 2,000 states; increasing reach adds placements and may need more states. Yellow
+tile hints show terrain/elevation-eligible center locations within that finite-segment reach;
+footprints can extend beyond the highlight, but must stay inside the cyan routing window. Hints do
+not establish that a whole building fits. Custom spots retain a centered 8/12/16-tile rectangle.
+Automatic A/B selection keeps test points clear of every eligible building before searching;
+manually setting A/B disables that option.
+The summary distinguishes individually valid building placements from explored partial layouts:
+route-guided pruning can exhaust a query after very few layouts when its endpoints exclude useful
+walls. Increasing the budget cannot change an exhausted result. Suggestions preview without replacing the manual
+plan; **Keep this layout** replaces the manual plan with the suggestion for further editing. The demo reports budget exhaustion
+separately from completed searches and invalid baselines. Changes to the map, obstacles, query, or
+requirements invalidate pending results. Finding wall sites across every entrance is a later step.
+
 ## Validation and next checkpoints
 
 The [base discovery profiling checkpoint](analysis-performance.md) records native/browser
@@ -740,9 +808,9 @@ Future checkpoints can add per-object identity/removal, movement profiles, and r
 refinement. Base sites, terrain regions, base territory, and a main/natural role relative to a start
 remain distinct concepts.
 
-Wall checking should precede wall search: inspect human-provided placements, choose a mover,
-and show a leak route under a named model. Exact passage and placement legality need their
-own compatibility work against the engine; a bounding box on raw minitiles is insufficient.
+The wall checker and automatic layout search share a named static model. Exact passage and
+placement legality need their own compatibility work against the engine; a bounding box on raw
+minitiles is insufficient.
 The shared solver can remain reusable while neobrood supplies live state and validation.
 
 Implementation references include the local neobrood importer (`gen_rules/src/main.rs`,
