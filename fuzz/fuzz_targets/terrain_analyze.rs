@@ -635,6 +635,153 @@ fn exercise_topology(grid: &TerrainGrid, data: &[u8]) {
     exercise_topology_with_bases(grid, bases, options);
 }
 
+fn exercise_walls(grid: &TerrainGrid, data: &[u8]) {
+    use broodmap_analysis::walls::{
+        CollisionBounds, WallBuilding, WallPassage, WallQuery, check_wall,
+    };
+    let byte = |i| u32::from(data.get(i).copied().unwrap_or(0));
+    let width = (grid.width() * 8).min(48);
+    let height = (grid.height() * 8).min(48);
+    let mover = CollisionBounds {
+        left: byte(0) % 4,
+        top: byte(1) % 4,
+        right: byte(2) % 4,
+        bottom: byte(3) % 4,
+    };
+    let query = WallQuery {
+        window: PixelRect {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        },
+        start: PixelPosition {
+            x: byte(4) % width,
+            y: byte(5) % height,
+        },
+        end: PixelPosition {
+            x: byte(6) % width,
+            y: byte(7) % height,
+        },
+        mover,
+        buildings: if byte(8) & 1 != 0 {
+            vec![WallBuilding {
+                tile: broodmap_analysis::TilePosition {
+                    x: byte(9) % 2,
+                    y: byte(10) % 2,
+                },
+                footprint: DepotFootprint {
+                    width_tiles: 1,
+                    height_tiles: 1,
+                },
+                collision: CollisionBounds {
+                    left: 8,
+                    top: 8,
+                    right: 7,
+                    bottom: 7,
+                },
+            }]
+        } else {
+            vec![]
+        },
+    };
+    let obstacles = [PixelRect {
+        left: byte(11) as i32 % 48,
+        top: -4,
+        right: byte(11) as i32 % 48 + 1,
+        bottom: 12,
+    }];
+    // Exercise rejection paths as well as valid geometry without allocating a large search.
+    let mut invalid = query.clone();
+    let mut invalid_obstacles = obstacles.to_vec();
+    let building = WallBuilding {
+        tile: broodmap_analysis::TilePosition { x: 0, y: 0 },
+        footprint: DepotFootprint {
+            width_tiles: 1,
+            height_tiles: 1,
+        },
+        collision: mover,
+    };
+    match byte(12) % 10 {
+        0 => invalid.mover.right = u32::MAX,
+        1 => {
+            invalid.buildings = vec![building];
+            invalid.buildings[0].footprint.width_tiles = 0;
+        }
+        2 => {
+            invalid.buildings = vec![building];
+            invalid.buildings[0].footprint.height_tiles = u32::MAX;
+        }
+        3 => {
+            invalid.buildings = vec![building];
+            invalid.buildings[0].tile.x = u32::MAX;
+        }
+        4 => invalid.window.left = -1,
+        5 => invalid.window.right = i32::MAX,
+        6 => invalid.end.x = u32::MAX,
+        7 => invalid_obstacles[0].right = invalid_obstacles[0].left,
+        8 => invalid.buildings = vec![building; 33],
+        _ => invalid_obstacles = vec![obstacles[0]; 8193],
+    }
+    assert!(check_wall(grid, &invalid_obstacles, &invalid).is_err());
+    let result = check_wall(grid, &obstacles, &query).unwrap();
+    assert_eq!(result, check_wall(grid, &obstacles, &query).unwrap());
+    assert_eq!(result.placements.len(), query.buildings.len());
+    if result.passage == WallPassage::Open {
+        assert!(result.baseline_passable);
+        assert_eq!(result.route.first(), Some(&query.start));
+        assert_eq!(result.route.last(), Some(&query.end));
+        let clear = |p: PixelPosition| {
+            let rect = PixelRect {
+                left: p.x as i32 - mover.left as i32,
+                top: p.y as i32 - mover.top as i32,
+                right: p.x as i32 + mover.right as i32 + 1,
+                bottom: p.y as i32 + mover.bottom as i32 + 1,
+            };
+            let overlaps = |o: PixelRect| {
+                rect.left < o.right
+                    && rect.right > o.left
+                    && rect.top < o.bottom
+                    && rect.bottom > o.top
+            };
+            assert!(
+                rect.left >= 0
+                    && rect.top >= 0
+                    && rect.right <= grid.width() as i32 * 8
+                    && rect.bottom <= grid.height() as i32 * 8
+            );
+            assert!(!obstacles.iter().copied().any(overlaps));
+            assert!(!result.placements.iter().any(|b| overlaps(b.collision)));
+            for y in rect.top / 8..=(rect.bottom - 1) / 8 {
+                for x in rect.left / 8..=(rect.right - 1) / 8 {
+                    assert!(
+                        grid.cell(WalkPosition {
+                            x: x as u32,
+                            y: y as u32
+                        })
+                        .unwrap()
+                        .walkable
+                    );
+                }
+            }
+        };
+        for &p in &result.route {
+            assert!(p.x < width && p.y < height);
+            clear(p);
+        }
+        for pair in result.route.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(a.x.abs_diff(b.x) <= 1 && a.y.abs_diff(b.y) <= 1 && a != b);
+            if a.x != b.x && a.y != b.y {
+                clear(PixelPosition { x: a.x, y: b.y });
+                clear(PixelPosition { x: b.x, y: a.y });
+            }
+        }
+    } else {
+        assert!(result.route.is_empty());
+    }
+}
+
 fn exercise_bases(grid: &TerrainGrid, data: &[u8], obstacles: &[PixelRect]) {
     let mut resources: Vec<_> = obstacle_rectangles(data)
         .into_iter()
@@ -845,6 +992,7 @@ fuzz_target!(|data: &[u8]| {
         exercise_bases(&grid, data, &obstacles);
         exercise_grid(&grid, data);
         exercise_topology(&grid, data);
+        exercise_walls(&grid, data);
         exercise_grid(&grid.with_obstacles(&obstacles), data);
     }
 });

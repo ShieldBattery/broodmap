@@ -596,6 +596,35 @@ placement dimensions to build tiles and calls `for_each_unit_in_area` at 0x1403a
 `kill_unit_without_death_animation`, including for invincible units. Cleanup applies when a starting
 depot is actually spawned; a map's start marker alone does not establish removal.
 
+## Proposed-wall checker
+
+`broodmap_analysis::walls::check_wall` checks a caller-proposed layout under the explicit
+`pixel-rect-v1` model. It consumes the original `TerrainGrid`, half-open static obstacle rectangles,
+and a `WallQuery`: a bounded pixel window, two pixel-center endpoints, asymmetric inclusive mover
+extents, and buildings with build-tile positions, placement footprints, and collision extents.
+No stock unit IDs or renderer are required. See [the model and engine evidence](wall-model.md).
+
+A building's placement footprint and collision rectangle are distinct. Its center is the middle
+of its build-tile footprint; collision extents produce a half-open rectangle by adding one to the
+inclusive right and bottom coordinates. Static placement checks report out-of-map bounds,
+unwalkable/unbuildable footprint terrain, overlap with static obstacle rectangles, and overlapping
+proposed footprints. These checks do not establish creep, power, add-on, depot/resource spacing,
+builder access, or complete engine legality. The hypothetical collision layout is still checked
+when placements have issues, and the result reports those issues separately.
+
+Passage searches integer pixel centers using eight neighbors and rejects diagonal corner clipping.
+Mover extents expand both terrain blockers and exact object rectangles; objects or terrain outside
+the window can still block a mover whose center is inside it. The window restricts center travel,
+not collision testing. `Open` includes a pixel route. `BlockedWithinWindow` means the baseline
+connected the endpoints but the proposed collisions do not, within this window only.
+`AlreadyDisconnected` identifies a failed baseline; `StartBlocked`/`EndBlocked` request better
+endpoints rather than claiming a successful wall. A failed local search never proves a global seal.
+
+Queries are limited to 32 proposed buildings, 8192 obstacle rectangles, and a window no larger than
+1024x1024 pixel centers. Mover and collision extents are bounded; malformed profiles and windows
+return errors before search. The job runs synchronously within those bounds; demo requests run in
+the worker and stale replies are discarded after edits or map/analysis changes.
+
 ## Validation and next checkpoints
 
 The [base discovery profiling checkpoint](analysis-performance.md) records native/browser

@@ -3,8 +3,9 @@
 //! This crate resolves terrain, optional static collision rectangles, square-clearance fields,
 //! deterministic clearance-prominent regions, bounded route-local entrance evidence, and
 //! experimental partitions formed by boundary spans. The opt-in [`topology`] analyzer combines
-//! these into map-wide entrance evidence and base-area membership. It does not simulate moving units, mover clearance, exact game regions, or engine-specific movement
-//! rules. In particular,
+//! these into map-wide entrance evidence and base-area membership. The opt-in [`walls`] checker
+//! tests proposed layouts and rectangular mover passage under a bounded static model. Neither
+//! analyzer simulates moving units, exact game regions, or engine-specific movement rules. In particular,
 //! [`TerrainGrid::from_terrain`] uses VF4/CV5 aggregation checked against OpenBW and an
 //! MTXM bit-15 creep override verified in the inspected game binary (12310g.exe). This is
 //! useful for analysis and UI previews, not a certified engine pathing implementation.
@@ -23,6 +24,7 @@ pub mod obstacles;
 pub mod ramps;
 pub mod regions;
 pub mod topology;
+pub mod walls;
 
 pub use areas::{AreaError, BoundaryAssessment, BoundarySpan, PartitionArea, SpanPartition};
 pub use bases::{
