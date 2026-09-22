@@ -423,14 +423,22 @@ for every map. Shared base areas are reported rather than forcibly split.
 ### Structural ramps
 
 `TerrainGrid::ramps()` independently finds legal 8-connected ramp-flag components with at least
-12 cells, exactly two adjacent elevations, and a direct elevation transition. Low/high centroids
-determine an eight-direction ascent axis. Central wall-bounded sections near the longitudinal ends
-are refined through bounded shoulder/landing searches, using the same legal diagonal-neighbor rule
-as routes. Both ends require real terrain wall contacts, distinct geometry, and a minimum gap;
+12 cells, exactly two adjacent elevations, and a direct elevation transition. To orient the ascent,
+it searches from the legal non-ramp border for each elevation's nearest buildable landing, within
+16 legal steps through non-ramp cells of that same elevation. The low/high landing centroids
+determine an eight-direction axis. This avoids treating unbuildable high-elevation pockets along
+the slope as its upper landing. If either landing is missing or their centroids coincide, the
+component and immediate-border elevation centroids provide the fallback direction. Central
+wall-bounded sections near the ends are refined through bounded shoulder/landing searches, using
+the same legal diagonal-neighbor rule as routes. Both ends require real terrain wall contacts, distinct geometry, and a minimum gap;
 map edges and scan caps cannot supply walls. Refined centers may lie outside the flagged cells.
 
-A shoulder can move inward up to eight projection units when the section contracts by at least
-64px and 25%. Outward refinement follows at most 16 legal same-elevation unbuildable steps toward
+When the outer two-projection-unit end band has no finite terrain-bounded section, the detector
+tries successive inward stations, stopping at the first central finite section. This shares the
+shoulder limit of eight projection units, further capped to reserve at least four projection units
+between the ends. An open flagged apron can therefore lead to a bounded ramp mouth, but map-edge
+or ray-cap contacts never stand in for walls. If no station qualifies, the ramp remains unreported.
+An already finite shoulder moves inward only when the section contracts by at least 64px and 25%. Outward refinement follows at most 16 legal same-elevation unbuildable steps toward
 a verified buildable landing. The first opening must widen by 64px and 75% while staying within
 384px and four times the original width; otherwise the last narrow section is retained. Ambiguous
 or short ramps may be missed. These are heuristic terrain sections, not exact visual ramp limits.

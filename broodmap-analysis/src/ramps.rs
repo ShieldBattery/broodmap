@@ -33,7 +33,7 @@ pub struct RampEnd {
 
 /// Two terrain-bounded ends of one flagged ramp component.
 ///
-/// `lower` and `upper` are ordered along the elevation-centroid ascent direction. They are not
+/// `lower` and `upper` are ordered along the inferred ascent direction. They are not
 /// route directions and do not claim unit fit, a wall, or global connectivity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ramp {
@@ -74,8 +74,11 @@ impl TerrainGrid {
     /// Components use legal 8-neighbor movement: diagonal neighbors connect only when both
     /// cardinal side cells are walkable. Each component adds its immediate legal walkable border
     /// to its elevation samples, then requires exactly two adjacent elevations and at least one
-    /// direct transition between them. The ascent direction is the quantized vector from the low
-    /// elevation centroid to the high elevation centroid.
+    /// direct transition between them. When both elevations have a nearby legal, non-ramp,
+    /// terrain-buildable landing, ascent runs from the low landing centroid to the high landing
+    /// centroid. This avoids an unbuildable side pocket skewing a real slope toward its cliff
+    /// face. Components whose local landings are missing or have coincident centroids use the
+    /// elevation-centroid fallback.
     ///
     /// Component cells are projected onto that ascent axis and its perpendicular. At each end,
     /// this examines only cells in a two-projection-unit longitudinal band, chooses the most central
@@ -83,9 +86,10 @@ impl TerrainGrid {
     /// are rejected by the shared wall-ray sampler. Integer projections use `x * axis.x + y * axis.y`
     /// for an eight-way unit heading: one diagonal step changes the longitudinal projection by two.
     /// Components need 12 cells and longitudinal extent six; selected ends need separation four.
-    /// If an initial section lies on an apron, this looks up to eight projection units inward for
-    /// the first central finite section at least 64 pixels and 25% narrower. Centrality is chosen
-    /// before testing width, and the search reserves the required separation between the ends.
+    /// An unbounded initial end band may use the first central finite section found up to eight
+    /// projection units inward. A finite initial section moves only to one at least 64 pixels and
+    /// 25% narrower. Centrality is chosen before testing width, and the search reserves the
+    /// required separation between the ends.
     /// For an unbuildable selected end, a legal same-elevation extension is inspected for at most
     /// 16 cells and is accepted only after a same-elevation buildable landing. The first finite
     /// local opening is retained when it is at least 64 pixels and 75% wider than the flagged
@@ -151,12 +155,22 @@ impl TerrainGrid {
 
             let lower_index = usize::from(*lower_elevation);
             let upper_index = usize::from(*upper_elevation);
-            let axis = quantized_centroid_direction(
-                elevation_sums[lower_index],
-                elevation_counts[lower_index],
-                elevation_sums[upper_index],
-                elevation_counts[upper_index],
-            );
+            let axis = self
+                .landing_direction(
+                    &component,
+                    *lower_elevation,
+                    *upper_elevation,
+                    &mut sample_marks,
+                    &mut sample_epoch,
+                )
+                .or_else(|| {
+                    quantized_centroid_direction(
+                        elevation_sums[lower_index],
+                        elevation_counts[lower_index],
+                        elevation_sums[upper_index],
+                        elevation_counts[upper_index],
+                    )
+                });
             let Some(axis) = axis else {
                 continue;
             };
@@ -174,11 +188,6 @@ impl TerrainGrid {
                 continue;
             }
 
-            let lower = self.select_end(&component, axis, normal, minimum, transverse_sum, true);
-            let upper = self.select_end(&component, axis, normal, maximum, transverse_sum, false);
-            let (Some(lower), Some(upper)) = (lower, upper) else {
-                continue;
-            };
             let lower = self.initial_shoulder(
                 &component,
                 EndSearch {
@@ -188,7 +197,7 @@ impl TerrainGrid {
                     transverse_sum,
                     lower: true,
                 },
-                lower,
+                self.select_end(&component, axis, normal, minimum, transverse_sum, true),
             );
             let upper = self.initial_shoulder(
                 &component,
@@ -199,8 +208,11 @@ impl TerrainGrid {
                     transverse_sum,
                     lower: false,
                 },
-                upper,
+                self.select_end(&component, axis, normal, maximum, transverse_sum, false),
             );
+            let (Some(lower), Some(upper)) = (lower, upper) else {
+                continue;
+            };
             let lower = self.refine_end(lower, axis, normal, (-axis.0, -axis.1));
             let upper = self.refine_end(upper, axis, normal, axis);
             if upper.longitudinal.saturating_sub(lower.longitudinal) < MIN_END_SEPARATION_CELLS
@@ -300,12 +312,96 @@ impl TerrainGrid {
         })
     }
 
+    fn landing_direction(
+        &self,
+        component: &[WalkPosition],
+        lower_elevation: u8,
+        upper_elevation: u8,
+        marks: &mut [u32],
+        epoch: &mut u32,
+    ) -> Option<(i32, i32)> {
+        let (lower_sum, lower_count) =
+            self.nearest_buildable_landing(component, lower_elevation, marks, epoch)?;
+        let (upper_sum, upper_count) =
+            self.nearest_buildable_landing(component, upper_elevation, marks, epoch)?;
+        quantized_centroid_direction(lower_sum, lower_count, upper_sum, upper_count)
+    }
+
+    fn nearest_buildable_landing(
+        &self,
+        component: &[WalkPosition],
+        elevation: u8,
+        marks: &mut [u32],
+        epoch: &mut u32,
+    ) -> Option<((i64, i64), u64)> {
+        *epoch = epoch.wrapping_add(1);
+        if *epoch == 0 {
+            marks.fill(0);
+            *epoch = 1;
+        }
+        let mut frontier = Vec::new();
+        for &position in component {
+            for (neighbor, _) in self.neighbors(position) {
+                let Some(index) = self.index(neighbor) else {
+                    continue;
+                };
+                let cell = self.cells[index];
+                if marks[index] == *epoch || cell.ramp || cell.elevation != elevation {
+                    continue;
+                }
+                marks[index] = *epoch;
+                frontier.push((neighbor, 1_u32));
+            }
+        }
+
+        let mut cursor = 0;
+        let mut nearest_distance = None;
+        let mut sum = (0_i64, 0_i64);
+        let mut count = 0_u64;
+        while let Some(&(position, distance)) = frontier.get(cursor) {
+            cursor += 1;
+            if nearest_distance.is_some_and(|nearest| distance > nearest) {
+                break;
+            }
+            let cell = self
+                .cell(position)
+                .expect("frontier positions are legal terrain neighbors");
+            if cell.terrain_buildable {
+                if nearest_distance.is_none() {
+                    nearest_distance = Some(distance);
+                }
+                sum.0 += i64::from(position.x);
+                sum.1 += i64::from(position.y);
+                count += 1;
+                continue;
+            }
+            if nearest_distance.is_some() || distance >= MAX_LANDING_STEPS {
+                continue;
+            }
+            for (neighbor, _) in self.neighbors(position) {
+                let Some(index) = self.index(neighbor) else {
+                    continue;
+                };
+                let neighbor_cell = self.cells[index];
+                if marks[index] == *epoch
+                    || neighbor_cell.ramp
+                    || neighbor_cell.elevation != elevation
+                {
+                    continue;
+                }
+                marks[index] = *epoch;
+                frontier.push((neighbor, distance + 1));
+            }
+        }
+        (count != 0).then_some((sum, count))
+    }
+
     fn initial_shoulder(
         &self,
         component: &[WalkPosition],
         search: EndSearch,
-        original: EndCandidate,
-    ) -> EndCandidate {
+        original: Option<EndCandidate>,
+    ) -> Option<EndCandidate> {
         let Some(count) = i64::try_from(component.len()).ok() else {
             return original;
         };
@@ -370,14 +466,19 @@ impl TerrainGrid {
             let Some(candidate) = candidate else {
                 continue;
             };
-            if candidate
-                .width_fixed
-                .saturating_add(MIN_OPENING_INCREASE_FIXED)
-                <= original.width_fixed
-                && candidate.width_fixed.saturating_mul(100)
-                    <= original.width_fixed.saturating_mul(75)
-            {
-                return candidate;
+            match original {
+                None => return Some(candidate),
+                Some(original)
+                    if candidate
+                        .width_fixed
+                        .saturating_add(MIN_OPENING_INCREASE_FIXED)
+                        <= original.width_fixed
+                        && candidate.width_fixed.saturating_mul(100)
+                            <= original.width_fixed.saturating_mul(75) =>
+                {
+                    return Some(candidate);
+                }
+                Some(_) => {}
             }
         }
         original
@@ -625,6 +726,33 @@ mod tests {
         TerrainGrid::from_cells(APRON_SIZE, APRON_SIZE, cells).unwrap()
     }
 
+    fn ramp_with_unbounded_outer_apron(axis: (i32, i32), apron_end: i32) -> TerrainGrid {
+        const APRON_SIZE: u32 = 201;
+        let center = 100_i32;
+        let normal = (-axis.1, axis.0);
+        let mut cells = Vec::new();
+        for y in 0..APRON_SIZE {
+            for x in 0..APRON_SIZE {
+                let dx = i32::try_from(x).unwrap() - center;
+                let dy = i32::try_from(y).unwrap() - center;
+                let longitudinal = dx * axis.0 + dy * axis.1;
+                let transverse = dx * normal.0 + dy * normal.1;
+                let corridor = (-12..=12).contains(&longitudinal) && (-8..=8).contains(&transverse);
+                let apron =
+                    (-8..=apron_end).contains(&longitudinal) && (-200..=200).contains(&transverse);
+                let walkable = corridor || apron;
+                let ramp =
+                    walkable && (-7..=7).contains(&longitudinal) && (-3..=3).contains(&transverse);
+                cells.push(TerrainCell {
+                    walkable,
+                    terrain_buildable: true,
+                    elevation: u8::from(longitudinal >= 0),
+                    ramp,
+                });
+            }
+        }
+        TerrainGrid::from_cells(APRON_SIZE, APRON_SIZE, cells).unwrap()
+    }
     fn short_double_apron_grid() -> TerrainGrid {
         const SHORT_SIZE: u32 = 65;
         let center = 32_i32;
@@ -742,6 +870,70 @@ mod tests {
         grid
     }
 
+    fn asymmetric_landing_grid(axis: (i32, i32)) -> TerrainGrid {
+        const LANDING_SIZE: u32 = 81;
+        let center = 40_i32;
+        let normal = (-axis.1, axis.0);
+        let mut cells = Vec::new();
+        for y in 0..LANDING_SIZE {
+            for x in 0..LANDING_SIZE {
+                let dx = i32::try_from(x).unwrap() - center;
+                let dy = i32::try_from(y).unwrap() - center;
+                let longitudinal = dx * axis.0 + dy * axis.1;
+                let transverse = dx * normal.0 + dy * normal.1;
+                let corridor = (-14..=14).contains(&longitudinal) && (-3..=3).contains(&transverse);
+                let ramp =
+                    corridor && (-5..=5).contains(&longitudinal) && (-1..=1).contains(&transverse);
+                // This high, unbuildable pocket touches the low-side shoulder but is separated
+                // from the real high landing by low terrain. It biases immediate samples.
+                let high_pocket = corridor && transverse == 2 && (-6..=2).contains(&longitudinal);
+                cells.push(TerrainCell {
+                    walkable: corridor,
+                    terrain_buildable: corridor && longitudinal.unsigned_abs() >= 10,
+                    elevation: u8::from(longitudinal >= 6 || high_pocket),
+                    ramp,
+                });
+            }
+        }
+        TerrainGrid::from_cells(LANDING_SIZE, LANDING_SIZE, cells).unwrap()
+    }
+
+    fn landing_probe_grid(overrides: &[(u32, u32, u8, bool, bool)]) -> TerrainGrid {
+        const PROBE_SIZE: u32 = 20;
+        let mut cells = vec![
+            TerrainCell {
+                walkable: false,
+                terrain_buildable: false,
+                elevation: 0,
+                ramp: false,
+            };
+            usize::try_from(PROBE_SIZE * PROBE_SIZE).unwrap()
+        ];
+        let component_index = usize::try_from(PROBE_SIZE + 1).unwrap();
+        cells[component_index] = TerrainCell {
+            walkable: true,
+            terrain_buildable: false,
+            elevation: 0,
+            ramp: true,
+        };
+        for &(x, y, elevation, ramp, terrain_buildable) in overrides {
+            let index = usize::try_from(y * PROBE_SIZE + x).unwrap();
+            cells[index] = TerrainCell {
+                walkable: true,
+                terrain_buildable,
+                elevation,
+                ramp,
+            };
+        }
+        TerrainGrid::from_cells(PROBE_SIZE, PROBE_SIZE, cells).unwrap()
+    }
+
+    fn probe_landing(grid: &TerrainGrid) -> Option<((i64, i64), u64)> {
+        let component = [point(1, 1)];
+        let mut marks = vec![0; grid.cells.len()];
+        let mut epoch = 0;
+        grid.nearest_buildable_landing(&component, 0, &mut marks, &mut epoch)
+    }
     fn inferred_axis(ramp: &Ramp) -> (i32, i32) {
         quantize(
             i64::from(ramp.upper.position.x) - i64::from(ramp.lower.position.x),
@@ -765,6 +957,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn buildable_landing_axis_overrides_an_unbuildable_side_pocket_in_all_orientations() {
+        for axis in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
+            let grid = asymmetric_landing_grid(axis);
+            let component = grid.ramp_component(point(40, 40), &mut vec![false; 81 * 81]);
+            let mut marks = vec![0; 81 * 81];
+            let mut epoch = 0;
+            assert_eq!(
+                grid.landing_direction(&component, 0, 1, &mut marks, &mut epoch),
+                Some(axis),
+                "axis={axis:?}"
+            );
+            let mut sample_marks = vec![0; 81 * 81];
+            let mut counts = [0; 3];
+            let mut sums = [(0, 0); 3];
+            for &position in &component {
+                grid.add_elevation_sample(position, 1, &mut sample_marks, &mut counts, &mut sums);
+                for (neighbor, _) in grid.neighbors(position) {
+                    grid.add_elevation_sample(
+                        neighbor,
+                        1,
+                        &mut sample_marks,
+                        &mut counts,
+                        &mut sums,
+                    );
+                }
+            }
+            assert_ne!(
+                quantized_centroid_direction(sums[0], counts[0], sums[1], counts[1]),
+                Some(axis),
+                "phantom pocket must defeat the old centroid axis for axis={axis:?}"
+            );
+            let ramp = grid.ramps().pop().unwrap();
+            assert_eq!(inferred_axis(&ramp), axis, "axis={axis:?}");
+            assert_eq!((ramp.lower_elevation, ramp.upper_elevation), (0, 1));
+        }
+    }
+
+    #[test]
+    fn landing_search_respects_the_bounded_legal_nearest_frontier() {
+        let at_limit = (2..=17)
+            .map(|x| (x, 1, 0, false, x == 17))
+            .collect::<Vec<_>>();
+        let beyond_limit = (2..=18)
+            .map(|x| (x, 1, 0, false, x == 18))
+            .collect::<Vec<_>>();
+        let corner_only = vec![(2, 2, 0, false, true)];
+        let through_higher_elevation = vec![(2, 1, 1, false, false), (3, 1, 0, false, true)];
+        let through_another_ramp = vec![(2, 1, 0, true, false), (3, 1, 0, false, true)];
+        let tied_nearest = vec![
+            (2, 1, 0, false, false),
+            (1, 2, 0, false, false),
+            (2, 2, 0, false, false),
+            (3, 1, 0, false, true),
+            (1, 3, 0, false, true),
+            (3, 2, 0, false, false),
+            (4, 2, 0, false, true),
+        ];
+
+        for (name, overrides, expected) in [
+            (
+                "accepts a landing at sixteen steps",
+                at_limit,
+                Some(((17, 1), 1)),
+            ),
+            ("rejects a landing at seventeen steps", beyond_limit, None),
+            ("rejects a corner-only diagonal", corner_only, None),
+            (
+                "does not cross another elevation",
+                through_higher_elevation,
+                None,
+            ),
+            ("does not cross another ramp", through_another_ramp, None),
+            (
+                "keeps every nearest tied landing and ignores farther cells",
+                tied_nearest,
+                Some(((4, 4), 2)),
+            ),
+        ] {
+            assert_eq!(
+                probe_landing(&landing_probe_grid(&overrides)),
+                expected,
+                "{name}"
+            );
+        }
+    }
     #[test]
     fn cardinal_and_diagonal_rotations_emit_two_distinct_finite_ends() {
         for axis in [
@@ -824,6 +1111,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unbounded_outer_aprons_use_the_first_reserved_finite_station() {
+        for axis in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
+            let grid = ramp_with_unbounded_outer_apron(axis, -3);
+            let ramp = grid.ramps().pop().unwrap();
+            let component = grid.ramp_component(point(100, 100), &mut vec![false; 201 * 201]);
+            let minimum = component
+                .iter()
+                .copied()
+                .map(|position| project(position, axis))
+                .min()
+                .unwrap();
+            let lower_distance = project(ramp.lower.position, axis) - minimum;
+            assert!((3..=5).contains(&lower_distance), "axis={axis:?}");
+            assert!(
+                component
+                    .iter()
+                    .copied()
+                    .filter(|position| project(*position, axis) - minimum < lower_distance)
+                    .all(|position| grid
+                        .bounded_wall_span(position, (-axis.1, axis.0))
+                        .is_none()),
+                "axis={axis:?}"
+            );
+            assert!(
+                grid.bounded_wall_span(ramp.lower.position, (-axis.1, axis.0))
+                    .is_some()
+            );
+            assert_eq!(inferred_axis(&ramp), axis, "axis={axis:?}");
+        }
+    }
+
+    #[test]
+    fn unbounded_outer_aprons_without_a_reserved_finite_station_are_rejected() {
+        for axis in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
+            assert!(
+                ramp_with_unbounded_outer_apron(axis, -1).ramps().is_empty(),
+                "axis={axis:?}"
+            );
+        }
+    }
     #[test]
     fn short_double_apron_keeps_two_separated_outer_ends() {
         let ramp = short_double_apron_grid().ramps().pop().unwrap();
