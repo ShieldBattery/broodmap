@@ -3,7 +3,9 @@
 //! This crate resolves terrain, optional static collision rectangles, square-clearance fields,
 //! deterministic clearance-prominent regions, bounded route-local entrance evidence, and
 //! experimental partitions formed by boundary spans. The opt-in [`topology`] analyzer combines
-//! these into map-wide entrance evidence and base-area membership. The opt-in [`walls`] checker
+//! these into map-wide entrance evidence and base-area membership. [`analyze_bases`] resolves a
+//! melee map's terrain, resources, obstacles, and starts and discovers resource bases in one call;
+//! [`discover_bases`] accepts the same inputs already normalized. The opt-in [`walls`] checker
 //! tests proposed layouts and rectangular mover passage under a bounded static model;
 //! [`walls::search`] proposes removal-minimal layouts with explicit search budgets. Neither
 //! analyzer simulates moving units, exact game regions, or engine-specific movement rules. In particular,
@@ -18,6 +20,7 @@ use broodmap_formats::{Cv5, MiniTileFlags, TileGroupFlags, Vf4};
 use thiserror::Error;
 
 pub mod areas;
+pub mod base_analysis;
 pub mod bases;
 pub mod clearance;
 pub mod entrances;
@@ -28,6 +31,10 @@ pub mod topology;
 pub mod walls;
 
 pub use areas::{AreaError, BoundaryAssessment, BoundarySpan, PartitionArea, SpanPartition};
+pub use base_analysis::{
+    AnalysisAssets, BaseAnalysis, BaseAnalysisError, BaseDiscoveryOutcome, DiscoverySkipReason,
+    MeleeBaseInputs, StartLocation, analyze_bases, melee_base_inputs,
+};
 pub use bases::{
     BaseCandidate, BaseDiscovery, BaseError, BaseSearchOptions, DepotFootprint, PixelPosition,
     ResourceKind, ResourceNode, TilePosition, discover_bases,

@@ -1,128 +1,12 @@
-//! Stock-map resource adapter and serialized base queries. The spatial solver stays game-agnostic.
+//! Serialized base queries over the shared melee adapter. The spatial solver stays game-agnostic.
 
-use broodmap::chk::{
-    placed_units::{PlacedUnit, UnitState},
-    sprites::{Sprite, SpriteFlags},
-};
 use broodmap_analysis::{
-    BaseDiscovery, BaseSearchOptions, DepotFootprint, PixelPosition, PixelRect, ResourceKind,
-    ResourceNode, StaticObstacle, discover_bases, melee_obstacle_objects,
+    BaseDiscovery, BaseSearchOptions, DepotFootprint, ResourceKind, ResourceNode, StaticObstacle,
+    discover_bases,
 };
-use broodmap_formats::UnitsDat;
 use wasm_bindgen::prelude::*;
 
 use super::TerrainAnalysis;
-
-pub(super) struct BaseInputs {
-    resources: Vec<ResourceNode>,
-    starts: Vec<PixelPosition>,
-    start_players: Vec<Option<u8>>,
-    obstacles: Vec<StaticObstacle>,
-    ignored_resources: usize,
-}
-
-impl BaseInputs {
-    pub(super) fn new(units: &[PlacedUnit], sprites: &[Sprite], definitions: &UnitsDat) -> Self {
-        // The solver adds resource occupancy itself so it can omit only explicitly clearable
-        // mineral nodes. Keep every non-resource object, including overlapping rectangles.
-        let other_units: Vec<_> = units
-            .iter()
-            .filter(|unit| !is_resource_node(unit.unit_id, definitions))
-            .cloned()
-            .collect();
-        let other_sprites: Vec<_> = sprites
-            .iter()
-            .filter(|sprite| !is_resource_node(sprite.id, definitions))
-            .cloned()
-            .collect();
-        let obstacles = melee_obstacle_objects(&other_units, &other_sprites, definitions);
-        let mut result = Self {
-            resources: Vec::new(),
-            starts: Vec::new(),
-            start_players: Vec::new(),
-            obstacles,
-            ignored_resources: 0,
-        };
-        for unit in units {
-            if unit.unit_id == 214 {
-                result.starts.push(PixelPosition {
-                    x: unit.x.into(),
-                    y: unit.y.into(),
-                });
-                result
-                    .start_players
-                    .push(unit.owner.filter(|&owner| owner < 8).map(|owner| owner + 1));
-            } else if !unit
-                .state
-                .intersects(UnitState::HALLUCINATED | UnitState::IN_TRANSIT)
-            {
-                result.add_resource(
-                    unit.unit_id,
-                    unit.x,
-                    unit.y,
-                    unit.resource_amount,
-                    definitions,
-                );
-            }
-        }
-        for sprite in sprites {
-            if sprite.owner == 11 && !sprite.flags.contains(SpriteFlags::DRAW_AS_SPRITE) {
-                result.add_resource(sprite.id, sprite.x, sprite.y, None, definitions);
-            }
-        }
-        result
-    }
-
-    fn add_resource(
-        &mut self,
-        id: u16,
-        x: u16,
-        y: u16,
-        amount: Option<u32>,
-        definitions: &UnitsDat,
-    ) {
-        let kind = match id {
-            176..=178 => ResourceKind::Mineral,
-            188 => ResourceKind::Gas,
-            _ => return,
-        };
-        let bounds = definitions.entry(id).and_then(|entry| {
-            // Follow the static obstacle adapter's grounded-resource policy. Amount marks
-            // potential clearing prerequisites; the current routing grid still includes the node.
-            if entry.special_ability_flags & 0x2004 != 0x2000 {
-                return None;
-            }
-            let (left, top, right, bottom) = entry.bounds;
-            if [left, top, right, bottom].iter().any(|&extent| extent < 0) {
-                return None;
-            }
-            Some(PixelRect {
-                left: i32::from(x) - i32::from(left),
-                top: i32::from(y) - i32::from(top),
-                right: i32::from(x) + i32::from(right) + 1,
-                bottom: i32::from(y) + i32::from(bottom) + 1,
-            })
-        });
-        if let Some(bounds) = bounds {
-            self.resources.push(ResourceNode {
-                bounds,
-                kind,
-                amount,
-            });
-        } else {
-            self.ignored_resources += 1;
-        }
-    }
-}
-
-fn is_resource_node(id: u16, definitions: &UnitsDat) -> bool {
-    matches!(id, 176..=178 | 188)
-        && definitions.entry(id).is_some_and(|entry| {
-            let (l, t, r, b) = entry.bounds;
-            entry.special_ability_flags & 0x2004 == 0x2000
-                && [l, t, r, b].iter().all(|&extent| extent >= 0)
-        })
-}
 
 #[derive(serde::Deserialize, Copy, Clone, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -233,7 +117,7 @@ impl TerrainAnalysis {
             &self.grid,
             &inputs.resources,
             &inputs.obstacles,
-            &inputs.starts,
+            &inputs.start_positions(),
             &BaseSearchOptions {
                 depot: DepotFootprint {
                     width_tiles: options.depot_width_tiles,
@@ -262,7 +146,10 @@ impl TerrainAnalysis {
                 let mut start_players: Vec<_> = base
                     .start_indices
                     .iter()
-                    .filter_map(|&index| inputs.start_players[index])
+                    .filter_map(|&index| {
+                        let owner = inputs.starts[index].owner?;
+                        (owner < 8).then_some(owner + 1)
+                    })
                     .collect();
                 start_players.sort_unstable();
                 start_players.dedup();
@@ -337,7 +224,7 @@ impl TerrainAnalysis {
 mod tests {
     use super::*;
     use crate::MapRenderer;
-    use broodmap_formats::parse_units_dat;
+    use broodmap_analysis::{MeleeBaseInputs, PixelPosition, PixelRect, StartLocation};
 
     fn definitions() -> Vec<u8> {
         let mut bytes = vec![0; 19876];
@@ -349,26 +236,6 @@ mod tests {
             }
         }
         bytes
-    }
-
-    #[test]
-    fn resource_adapter_uses_stock_ids_and_inclusive_bounds() {
-        let definitions = parse_units_dat(&definitions());
-        let mut inputs = BaseInputs::new(&[], &[], &definitions);
-        inputs.add_resource(176, 100, 200, Some(1), &definitions);
-        inputs.add_resource(188, 300, 400, Some(0), &definitions);
-        inputs.add_resource(110, 500, 600, None, &definitions); // Refinery is not a raw resource node.
-        assert_eq!(inputs.resources.len(), 2);
-        assert_eq!(
-            inputs.resources[0].bounds,
-            PixelRect {
-                left: 85,
-                top: 185,
-                right: 116,
-                bottom: 216
-            }
-        );
-        assert_eq!(inputs.resources[1].kind, ResourceKind::Gas);
     }
 
     #[test]
@@ -403,60 +270,6 @@ mod tests {
         assert_eq!(analysis.find_bases_json("{}").unwrap(), catalog);
         assert!(analysis.base_route_json(0, 0).is_ok());
     }
-    #[test]
-    fn tiny_mineral_metadata_keeps_overlapping_non_resource_objects() {
-        use broodmap::chk::placed_units::UnitInstanceId;
-        let mut bytes = definitions();
-        bytes[7032 + 190 * 4..7036 + 190 * 4].copy_from_slice(&1u32.to_le_bytes());
-        for side in 0..4 {
-            let offset = 12580 + 190 * 8 + side * 2;
-            bytes[offset..offset + 2].copy_from_slice(&15i16.to_le_bytes());
-        }
-        let definitions = parse_units_dat(&bytes);
-        let mineral = PlacedUnit {
-            instance_id: UnitInstanceId(1),
-            x: 160,
-            y: 160,
-            unit_id: 176,
-            owner: None,
-            hp_percent: None,
-            shield_percent: None,
-            energy_percent: None,
-            resource_amount: Some(1),
-            hangar_count: None,
-            state: UnitState::empty(),
-            linked_id: None,
-        };
-        let building = PlacedUnit {
-            unit_id: 190,
-            resource_amount: None,
-            ..mineral
-        };
-        let sprite = Sprite {
-            id: 178,
-            x: 256,
-            y: 256,
-            owner: 11,
-            flags: SpriteFlags::empty(),
-        };
-        let inputs = BaseInputs::new(&[mineral, building], &[sprite], &definitions);
-        assert_eq!(inputs.resources.len(), 2);
-        assert_eq!(inputs.resources[0].amount, Some(1));
-        assert_eq!(inputs.resources[1].amount, None);
-        assert_eq!(
-            inputs.obstacles,
-            vec![StaticObstacle {
-                bounds: inputs.resources[0].bounds,
-                destructible: true
-            }]
-        );
-        // A modded stock resource ID with only BUILDING must remain a static object.
-        bytes[7032 + 176 * 4..7036 + 176 * 4].copy_from_slice(&1u32.to_le_bytes());
-        let inputs = BaseInputs::new(&[mineral], &[], &parse_units_dat(&bytes));
-        assert!(inputs.resources.is_empty());
-        assert_eq!(inputs.obstacles.len(), 1);
-    }
-
     #[test]
     fn conditional_catalog_does_not_remove_minerals_from_current_routes() {
         use broodmap_analysis::{TerrainCell, TerrainGrid};
@@ -503,10 +316,12 @@ mod tests {
         analysis.obstructed = Some(obstructed);
         analysis.respect_obstacles = true;
         analysis.obstacle_count = 5;
-        analysis.base_inputs = Some(BaseInputs {
+        analysis.base_inputs = Some(MeleeBaseInputs {
             resources,
-            starts: vec![PixelPosition { x: 384, y: 304 }],
-            start_players: vec![Some(1)],
+            starts: vec![StartLocation {
+                position: PixelPosition { x: 384, y: 304 },
+                owner: Some(0),
+            }],
             obstacles: Vec::new(),
             ignored_resources: 0,
         });
@@ -591,10 +406,12 @@ mod tests {
         analysis.obstructed = Some(obstructed);
         analysis.respect_obstacles = true;
         analysis.obstacle_count = 5;
-        analysis.base_inputs = Some(BaseInputs {
+        analysis.base_inputs = Some(MeleeBaseInputs {
             resources,
-            starts: vec![PixelPosition { x: 384, y: 304 }],
-            start_players: vec![Some(1)],
+            starts: vec![StartLocation {
+                position: PixelPosition { x: 384, y: 304 },
+                owner: Some(0),
+            }],
             obstacles: vec![building],
             ignored_resources: 0,
         });

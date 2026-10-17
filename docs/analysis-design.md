@@ -554,11 +554,26 @@ gas-only groups do not count as bases. Elongated fields and unusual layouts can 
 heuristic. Scoring approximates access, not optimal gathering; it does not certify mover clearance,
 creep/power, full placement legality, base territory, or main/natural roles.
 
-The WASM adapter classifies minerals 176-178 and raw geysers 188 using caller-supplied units.dat
-collision bounds and the grounded-resource/UNIT/THG2 policy used by static obstacles. UNIT amount
-overrides are retained; THG2 resource amounts are unknown. Refineries are not raw resource nodes;
-their special resource-container exclusion is not modeled beyond static occupancy. Mods with
-different IDs should use the normalized Rust API. `findBasesJson` accepts optional `depotWidthTiles`,
+`melee_base_inputs` is the shared stock-map adapter. It classifies minerals 176-178 and raw geysers
+188 using caller-supplied units.dat collision bounds and the grounded-resource/UNIT/THG2 policy used
+by static obstacles; every other static melee object becomes a non-resource obstacle, and every
+UNIT start marker (214) becomes a start with its raw owner. UNIT amount overrides are retained; THG2
+resource amounts are unknown. Stock resource placements whose definition is not a grounded resource
+container with non-negative extents are counted in `ignored_resources` instead. Refineries are not
+raw resource nodes; their special resource-container exclusion is not modeled beyond static
+occupancy. Mods with different IDs should use the normalized Rust API.
+
+`analyze_bases(chk, AnalysisAssets { cv5, vf4, units }, options)` is the one-call entry point:
+it resolves CHK terrain with the map tileset's CV5/VF4, runs the adapter (missing UNIT/THG2 chunks
+contribute nothing), and runs discovery. The returned `BaseAnalysis` owns the unobstructed terrain
+grid and the normalized inputs that discovery indices refer to. Exceeding the 512-resource or
+64-start limit is not an error: discovery is reported as `Skipped` with the reason
+(`DenseResourceField` or `TooManyStarts`), while terrain, starts, and resource counts are still
+returned. Missing terrain, CV5/VF4 entries absent for a map tile, and invalid options remain errors.
+`BaseAnalysis::from_inputs` applies the same policy to caller-normalized inputs. `discover_bases`
+itself still rejects inputs over its limits.
+
+The WASM adapter uses `melee_base_inputs`. `findBasesJson` accepts optional `depotWidthTiles`,
 `depotHeightTiles`, `maxMineralBlockerAmount` (default 8; null disables mineral clearing),
 `allowDestructibleClearing`,
 and `allowStartObstacleClearing` (both default true). JSON candidates include `requiredMinerals`
