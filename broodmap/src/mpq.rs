@@ -9,6 +9,7 @@ use crate::limits::{
 use bitflags::bitflags;
 use nom::combinator::{map, verify};
 use nom::{IResult, Parser};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::io::Read;
 
@@ -458,10 +459,25 @@ fn mpq_sector_table(
 }
 
 // TODO(tec27): Support more compression algorithms, this is not a complete list of what BW supports
+// NOTE: Huffman (0x01), ADPCM (0x40/0x80), sparse (0x20) and LZMA (exactly 0x12) are also defined by
+// the MPQ format, but are only used for sound or non-SC archives, so they are rejected as
+// unsupported
+const COMPRESSION_ZLIB: u8 = 0x02;
 const COMPRESSION_IMPLODE: u8 = 0x08;
+const COMPRESSION_BZIP2: u8 = 0x10;
+/// LZMA is identified by this exact mask value, rather than by being a combination of the zlib and
+/// bzip2 bits.
+const COMPRESSION_LZMA: u8 = 0x12;
 
-/// Decompresses a file sector using the algorithm it specifies. Sectors specify an algorithm with
-/// the first byte of their data.
+/// The compression types a sector's mask can combine, in the order they are decompressed (the
+/// reverse of the order they were applied in when compressing), matching Storm.
+const DECOMPRESSION_ORDER: [u8; 3] = [COMPRESSION_BZIP2, COMPRESSION_IMPLODE, COMPRESSION_ZLIB];
+
+/// Size of the scratch buffer decompressors write into before output is bounds-checked.
+const DECOMPRESSION_CHUNK_SIZE: usize = 4096;
+
+/// Decompresses a file sector using the algorithms it specifies. Sectors specify a mask of the
+/// algorithms that were applied to them with the first byte of their data.
 fn decompress_sector_into(
     data: &[u8],
     max_output: usize,
@@ -472,9 +488,96 @@ fn decompress_sector_into(
         return Err(MpqError::MalformedSectorTable);
     }
 
-    match data[0] {
-        COMPRESSION_IMPLODE => explode_into(&data[1..], max_output, max_append, output),
-        a => Err(MpqError::UnsupportedCompressionType(a)),
+    let mask = data[0];
+    let supported = DECOMPRESSION_ORDER.iter().fold(0, |acc, c| acc | c);
+    if mask == COMPRESSION_LZMA || mask & !supported != 0 {
+        return Err(MpqError::UnsupportedCompressionType(mask));
+    }
+
+    let stages: SmallVec<[u8; 3]> = DECOMPRESSION_ORDER
+        .iter()
+        .copied()
+        .filter(|&c| mask & c != 0)
+        .collect();
+    let Some((&last, intermediate)) = stages.split_last() else {
+        return Err(MpqError::UnsupportedCompressionType(mask));
+    };
+
+    let mut input = Cow::from(&data[1..]);
+    for &compression in intermediate {
+        // Each intermediate result is bounded by the same per-sector ceiling as the final output
+        let mut next = Vec::new();
+        decompress_with(
+            compression,
+            input.as_ref(),
+            &mut SectorOutput::new(max_output, max_output, &mut next),
+        )?;
+        input = Cow::from(next);
+    }
+
+    let mut sink = SectorOutput::new(max_output, max_append, output);
+    decompress_with(last, input.as_ref(), &mut sink)?;
+    Ok(sink.decompressed_len)
+}
+
+fn decompress_with(
+    compression: u8,
+    data: &[u8],
+    sink: &mut SectorOutput<'_>,
+) -> Result<(), MpqError> {
+    match compression {
+        COMPRESSION_BZIP2 => bunzip_to(data, sink),
+        COMPRESSION_IMPLODE => explode_to(data, sink),
+        COMPRESSION_ZLIB => inflate_to(data, sink),
+        c => Err(MpqError::UnsupportedCompressionType(c)),
+    }
+}
+
+/// Receives the output of a decompressor, enforcing the per-sector output ceiling as data is
+/// produced and appending at most `max_append` bytes of it to `output`.
+struct SectorOutput<'a> {
+    max_output: usize,
+    max_append: usize,
+    decompressed_len: usize,
+    appended_len: usize,
+    output: &'a mut Vec<u8>,
+}
+
+impl<'a> SectorOutput<'a> {
+    fn new(max_output: usize, max_append: usize, output: &'a mut Vec<u8>) -> Self {
+        Self {
+            max_output,
+            max_append,
+            decompressed_len: 0,
+            appended_len: 0,
+            output,
+        }
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<(), MpqError> {
+        self.decompressed_len =
+            self.decompressed_len
+                .checked_add(data.len())
+                .ok_or(ResourceLimitError::Exceeded {
+                    resource: Resource::MpqSectorOutput,
+                    observed: usize::MAX,
+                    limit: self.max_output,
+                })?;
+        ensure_within(
+            Resource::MpqSectorOutput,
+            self.decompressed_len,
+            self.max_output,
+        )?;
+
+        let append_len = data
+            .len()
+            .min(self.max_append.saturating_sub(self.appended_len));
+        self.output
+            .try_reserve(append_len)
+            .map_err(|_| allocation_error(Resource::MpqFileBytes, append_len))?;
+        self.output.extend_from_slice(&data[..append_len]);
+        self.appended_len += append_len;
+        Ok(())
     }
 }
 
@@ -484,33 +587,73 @@ fn explode_into(
     max_append: usize,
     output: &mut Vec<u8>,
 ) -> Result<usize, MpqError> {
+    let mut sink = SectorOutput::new(max_output, max_append, output);
+    explode_to(data, &mut sink)?;
+    Ok(sink.decompressed_len)
+}
+
+fn explode_to(data: &[u8], sink: &mut SectorOutput<'_>) -> Result<(), MpqError> {
     let mut reader = explode::ExplodeReader::new(data);
-    let mut buffer = [0u8; 4096];
-    let mut decompressed_len = 0usize;
-    let mut appended_len = 0usize;
+    let mut buffer = [0u8; DECOMPRESSION_CHUNK_SIZE];
 
     loop {
         let read = reader.read(&mut buffer).map_err(map_explode_reader_error)?;
         if read == 0 {
-            return Ok(decompressed_len);
+            return Ok(());
         }
+        sink.write(&buffer[..read])?;
+    }
+}
 
-        decompressed_len =
-            decompressed_len
-                .checked_add(read)
-                .ok_or(ResourceLimitError::Exceeded {
-                    resource: Resource::MpqSectorOutput,
-                    observed: usize::MAX,
-                    limit: max_output,
-                })?;
-        ensure_within(Resource::MpqSectorOutput, decompressed_len, max_output)?;
+/// Decompresses zlib-wrapped deflate data (including verifying its checksum).
+fn inflate_to(data: &[u8], sink: &mut SectorOutput<'_>) -> Result<(), MpqError> {
+    use miniz_oxide::inflate::stream::{InflateState, inflate};
+    use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
-        let append_len = read.min(max_append.saturating_sub(appended_len));
-        output
-            .try_reserve(append_len)
-            .map_err(|_| allocation_error(Resource::MpqFileBytes, append_len))?;
-        output.extend_from_slice(&buffer[..append_len]);
-        appended_len += append_len;
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut input = data;
+    let mut buffer = [0u8; DECOMPRESSION_CHUNK_SIZE];
+
+    loop {
+        let result = inflate(&mut state, input, &mut buffer, MZFlush::None);
+        input = &input[result.bytes_consumed.min(input.len())..];
+        sink.write(&buffer[..result.bytes_written])?;
+
+        match result.status {
+            Ok(MZStatus::StreamEnd) => return Ok(()),
+            Ok(_) if result.bytes_consumed == 0 && result.bytes_written == 0 => {
+                return Err(MpqError::TruncatedCompressedData);
+            }
+            Ok(_) => {}
+            // In streaming mode, this means the input ran out before the end of the stream
+            Err(MZError::Buf) => return Err(MpqError::TruncatedCompressedData),
+            Err(e) => return Err(MpqError::ZlibError(e)),
+        }
+    }
+}
+
+fn bunzip_to(data: &[u8], sink: &mut SectorOutput<'_>) -> Result<(), MpqError> {
+    let mut decompress = bzip2::Decompress::new(false);
+    let mut input = data;
+    let mut buffer = [0u8; DECOMPRESSION_CHUNK_SIZE];
+
+    loop {
+        let (in_before, out_before) = (decompress.total_in(), decompress.total_out());
+        let status = decompress
+            .decompress(input, &mut buffer)
+            .map_err(MpqError::Bzip2Error)?;
+        // Both deltas are bounded by the lengths of the slices just passed in
+        let consumed = (decompress.total_in() - in_before) as usize;
+        let written = (decompress.total_out() - out_before) as usize;
+        input = &input[consumed.min(input.len())..];
+        sink.write(&buffer[..written.min(buffer.len())])?;
+
+        match status {
+            bzip2::Status::StreamEnd => return Ok(()),
+            bzip2::Status::MemNeeded => return Err(MpqError::Bzip2OutOfMemory),
+            _ if consumed == 0 && written == 0 => return Err(MpqError::TruncatedCompressedData),
+            _ => {}
+        }
     }
 }
 
@@ -567,6 +710,14 @@ pub enum MpqError {
     ExplodeError(explode::Error),
     #[error("I/O error while decompressing with explode: {0}")]
     ExplodeIoError(std::io::Error),
+    #[error("problem decompressing with zlib: {0:?}")]
+    ZlibError(miniz_oxide::MZError),
+    #[error("problem decompressing with bzip2: {0}")]
+    Bzip2Error(bzip2::Error),
+    #[error("bzip2 decompressor could not allocate its working memory")]
+    Bzip2OutOfMemory,
+    #[error("compressed sector data ended before the end of its stream")]
+    TruncatedCompressedData,
     #[error(transparent)]
     ResourceLimit(#[from] ResourceLimitError),
     #[error("parser error")]
@@ -1475,5 +1626,231 @@ mod tests {
             decompress_sector(&[COMPRESSION_IMPLODE], 4096),
             Err(MpqError::MalformedSectorTable)
         ));
+    }
+
+    /// Encodes `data` as a PKWARE implode stream made only of literals (binary mode, 1 KiB
+    /// dictionary), which is enough to exercise implode as a stage of a multi-compressed sector.
+    fn implode_literals(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x04];
+        let mut bit_buf = 0u32;
+        let mut bit_count = 0;
+        let mut put_bits = |out: &mut Vec<u8>, value: u32, count: u32| {
+            bit_buf |= value << bit_count;
+            bit_count += count;
+            while bit_count >= 8 {
+                out.push(bit_buf as u8);
+                bit_buf >>= 8;
+                bit_count -= 8;
+            }
+        };
+        for &byte in data {
+            // A 0 flag bit followed by the raw literal byte
+            put_bits(&mut out, (byte as u32) << 1, 9);
+        }
+        // End of stream: a 1 flag bit, the (inverted) 7-bit code for length symbol 15, then 8
+        // extra bits of 0xFF, giving the reserved length 519
+        put_bits(&mut out, 1, 1);
+        put_bits(&mut out, 0, 7);
+        put_bits(&mut out, 0xFF, 8);
+        put_bits(&mut out, 0, 7);
+        out
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+    }
+
+    fn bzip2(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        bzip2::read::BzEncoder::new(data, bzip2::Compression::best())
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn sector(mask: u8, payload: &[u8]) -> Vec<u8> {
+        let mut sector = vec![mask];
+        sector.extend_from_slice(payload);
+        sector
+    }
+
+    fn sample_data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 % 23) as u8 + b'A').collect()
+    }
+
+    #[test]
+    fn implode_literal_helper_round_trips() {
+        let data = sample_data(300);
+        assert_eq!(
+            assert_ok!(explode_data(&implode_literals(&data), 4096)),
+            data
+        );
+    }
+
+    #[test]
+    fn zlib_sector_decompresses() {
+        let data = sample_data(4096);
+        let result = decompress_sector(&sector(COMPRESSION_ZLIB, &zlib(&data)), 4096);
+        assert_eq!(assert_ok!(result), data);
+    }
+
+    #[test]
+    fn bzip2_sector_decompresses() {
+        let data = sample_data(4096);
+        let result = decompress_sector(&sector(COMPRESSION_BZIP2, &bzip2(&data)), 4096);
+        assert_eq!(assert_ok!(result), data);
+    }
+
+    #[rstest]
+    #[case::implode_zlib(COMPRESSION_IMPLODE | COMPRESSION_ZLIB)]
+    #[case::bzip2_implode(COMPRESSION_BZIP2 | COMPRESSION_IMPLODE)]
+    #[case::bzip2_implode_zlib(COMPRESSION_BZIP2 | COMPRESSION_IMPLODE | COMPRESSION_ZLIB)]
+    fn multi_compressed_sector_decompresses_in_storm_order(#[case] mask: u8) {
+        let data = sample_data(2000);
+        // Compression is applied in the reverse of the decompression order: zlib, implode, bzip2
+        let mut payload = data.clone();
+        if mask & COMPRESSION_ZLIB != 0 {
+            payload = zlib(&payload);
+        }
+        if mask & COMPRESSION_IMPLODE != 0 {
+            payload = implode_literals(&payload);
+        }
+        if mask & COMPRESSION_BZIP2 != 0 {
+            payload = bzip2(&payload);
+        }
+
+        let result = decompress_sector(&sector(mask, &payload), 4096);
+        assert_eq!(assert_ok!(result), data);
+    }
+
+    #[rstest]
+    #[case::none(0x00)]
+    #[case::huffman(0x01)]
+    #[case::huffman_zlib(0x01 | COMPRESSION_ZLIB)]
+    #[case::sparse(0x20)]
+    #[case::adpcm_mono(0x40)]
+    #[case::adpcm_stereo(0x80)]
+    #[case::lzma(COMPRESSION_LZMA)]
+    fn unsupported_compression_mask_is_an_error(#[case] mask: u8) {
+        let result = decompress_sector(&sector(mask, &zlib(b"data")), 4096);
+        assert!(
+            matches!(result, Err(MpqError::UnsupportedCompressionType(m)) if m == mask),
+            "{result:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::zlib(COMPRESSION_ZLIB, zlib(&[0u8; 65536]))]
+    #[case::bzip2(COMPRESSION_BZIP2, bzip2(&[0u8; 65536]))]
+    // The intermediate (bzip2) stage is bounded too, not just the final one
+    #[case::intermediate(
+        COMPRESSION_BZIP2 | COMPRESSION_IMPLODE,
+        bzip2(&implode_literals(&[0u8; 8192]))
+    )]
+    fn decompressed_output_is_bounded_while_streaming(#[case] mask: u8, #[case] payload: Vec<u8>) {
+        assert!(matches!(
+            decompress_sector(&sector(mask, &payload), 4096),
+            Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MpqSectorOutput,
+                limit: 4096,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn decompressed_output_is_truncated_to_max_append() {
+        let data = sample_data(4096);
+        let mut output = Vec::new();
+        let decompressed_len = assert_ok!(decompress_sector_into(
+            &sector(COMPRESSION_ZLIB, &zlib(&data)),
+            4096,
+            100,
+            &mut output,
+        ));
+        assert_eq!(decompressed_len, 4096);
+        assert_eq!(output, &data[..100]);
+    }
+
+    #[rstest]
+    #[case::zlib(COMPRESSION_ZLIB, zlib(&sample_data(4096)))]
+    #[case::bzip2(COMPRESSION_BZIP2, bzip2(&sample_data(4096)))]
+    fn truncated_stream_is_an_error(#[case] mask: u8, #[case] payload: Vec<u8>) {
+        let truncated = &payload[..payload.len() / 2];
+        assert!(matches!(
+            decompress_sector(&sector(mask, truncated), 4096),
+            Err(MpqError::TruncatedCompressedData)
+        ));
+    }
+
+    #[test]
+    fn corrupt_zlib_stream_is_an_error() {
+        let mut payload = zlib(&sample_data(4096));
+        // Break the Adler-32 checksum at the end of the stream
+        *payload.last_mut().unwrap() ^= 0xFF;
+        assert!(matches!(
+            decompress_sector(&sector(COMPRESSION_ZLIB, &payload), 4096),
+            Err(MpqError::ZlibError(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_bzip2_stream_is_an_error() {
+        let mut payload = bzip2(&sample_data(4096));
+        // Break the stream magic
+        payload[0] = b'X';
+        assert!(matches!(
+            decompress_sector(&sector(COMPRESSION_BZIP2, &payload), 4096),
+            Err(MpqError::Bzip2Error(_))
+        ));
+    }
+
+    #[test]
+    fn read_file_with_zlib_sectors() {
+        // 512-byte sectors (shift 0); the file spans one full sector plus a partial one
+        let contents = sample_data(700);
+        let sectors = [
+            sector(COMPRESSION_ZLIB, &zlib(&contents[..512])),
+            sector(COMPRESSION_ZLIB, &zlib(&contents[512..])),
+        ];
+        let table_len = 3 * 4;
+        let mut data = Vec::new();
+        let mut offset = table_len as u32;
+        data.extend_from_slice(&offset.to_le_bytes());
+        for s in &sectors {
+            offset += s.len() as u32;
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        for s in &sectors {
+            data.extend_from_slice(s);
+        }
+
+        let mpq = Mpq {
+            data: &data,
+            header: MpqHeader {
+                offset: 0,
+                sector_size_shift: 0,
+                hash_table_pos: 0,
+                block_table_pos: 0,
+                hash_table_size: 1,
+                block_table_size: 1,
+            },
+            hash_table: vec![MpqHashTableEntry {
+                hash_a: hash_str(CHK_PATH, MpqHashType::NameA),
+                hash_b: hash_str(CHK_PATH, MpqHashType::NameB),
+                locale: 0,
+                platform: 0,
+                block_index: 0,
+            }],
+            block_table: vec![MpqBlockTableEntry {
+                offset: 0,
+                compressed_size: offset,
+                size: contents.len() as u32,
+                flags: MpqBlockFlags::COMPRESSED | MpqBlockFlags::EXISTS,
+            }],
+            limits: ResourceLimits::default(),
+        };
+
+        assert_eq!(assert_ok!(mpq.read_file(CHK_PATH, None)), contents);
     }
 }
