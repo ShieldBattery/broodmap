@@ -290,6 +290,18 @@ impl Chk {
         self.raw_triggers_private().as_ref()
     }
 
+    /// Returns whether the map's triggers (`TRIG`) use EUDs: a Deaths condition or SetDeaths
+    /// action whose player id is neither a player (0-11) nor a player group (13-26), or whose unit
+    /// id is past the unit types and unit groups (above 232). BW uses such ids directly as offsets
+    /// into its death table, so these conditions/actions read or write memory outside of it.
+    ///
+    /// Disabled conditions/actions count. Ones that fail to parse (e.g. an unknown comparison or
+    /// number operation) don't, and neither do mission briefing triggers (`MBRF`).
+    pub fn uses_eud(&self) -> bool {
+        self.raw_triggers()
+            .is_ok_and(|triggers| triggers.iter().any(RawTrigger::uses_eud))
+    }
+
     // NOTE(tec27): This is private because we don't generally want to return references to the
     // Result, just their contents. Triggers are sort of weird because we don't provide a non-raw
     // vresion of them, and thus do expose the raw version. So we need a different name here
@@ -1306,6 +1318,33 @@ mod tests {
         data.extend(chunk(*b"STR ", &0u16.to_le_bytes()));
         data.extend_from_slice(extra);
         data
+    }
+
+    #[test]
+    fn uses_eud() {
+        for chk_bytes in [LT_CHK, SECRET_BOUND_CHK] {
+            let chk = assert_ok!(Chk::from_bytes(chk_bytes.into(), None));
+            assert!(!chk.uses_eud());
+        }
+
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&[]), None));
+        assert!(!chk.uses_eud());
+
+        // A SetDeaths action for player 27, split across two appended TRIG chunks.
+        let mut trigger = vec![0u8; 2400];
+        let action = &mut trigger[320..352];
+        action[16..20].copy_from_slice(&27u32.to_le_bytes());
+        action[26] = 45;
+        action[27] = 7;
+        let (first, second) = trigger.split_at(1000);
+
+        let briefing = chunk(*b"MBRF", &trigger);
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&briefing), None));
+        assert!(!chk.uses_eud());
+
+        let triggers = [chunk(*b"TRIG", first), chunk(*b"TRIG", second)].concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&triggers), None));
+        assert!(chk.uses_eud());
     }
 
     #[test]

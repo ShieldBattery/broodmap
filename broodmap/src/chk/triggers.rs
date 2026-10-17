@@ -232,6 +232,20 @@ impl TryFrom<u16> for ScoreKind {
     }
 }
 
+/// Returns whether a Deaths condition / SetDeaths action player id is outside the ids BW resolves
+/// to players (0-11) or expands as player groups (13-26). BW uses such an id directly as an offset
+/// into its death table, which is how EUD triggers address arbitrary memory.
+fn is_extended_deaths_player(player: u32) -> bool {
+    player == PlayerGroup::None as u32 || player > PlayerGroup::NonAlliedVictoryPlayers as u32
+}
+
+/// Returns whether a Deaths condition / SetDeaths action unit id is past BW's unit types and unit
+/// groups (229-232: any unit, men, buildings, factories), and so addresses memory outside the
+/// death table.
+fn is_extended_deaths_unit(unit_id: u16) -> bool {
+    unit_id > 232
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeathsTriggerCondition {
     Normal {
@@ -424,8 +438,8 @@ impl TriggerCondition {
                 amount,
             },
             15 => {
-                let player_extended = player_group == 12 || player_group > 26;
-                let unit_extended = unit_id > 232;
+                let player_extended = is_extended_deaths_player(player_group);
+                let unit_extended = is_extended_deaths_unit(unit_id);
                 let mask = if eud_mask {
                     Some(location_or_bitmask)
                 } else {
@@ -1137,8 +1151,8 @@ impl RawTriggerAction {
                 location: location_or_bitmask,
             },
             45 => {
-                let player_extended = player_group_a == 12 || player_group_a > 26;
-                let unit_extended = unit_id_or_type > 232;
+                let player_extended = is_extended_deaths_player(player_group_a);
+                let unit_extended = is_extended_deaths_unit(unit_id_or_type);
                 let mask = if eud_mask {
                     Some(location_or_bitmask)
                 } else {
@@ -1327,6 +1341,33 @@ pub struct RawTrigger {
     pub enabled_for: [bool; 27],
 }
 
+impl RawTrigger {
+    /// Returns whether any of this trigger's conditions or actions (including disabled ones) is a
+    /// Deaths condition or SetDeaths action with an extended player or unit id, i.e. one that
+    /// reads or writes memory outside BW's death table.
+    pub fn uses_eud(&self) -> bool {
+        self.conditions.iter().any(|c| {
+            matches!(
+                c.condition,
+                TriggerCondition::Deaths(
+                    DeathsTriggerCondition::ExtendedUnit { .. }
+                        | DeathsTriggerCondition::ExtendedPlayer { .. }
+                        | DeathsTriggerCondition::ExtendedBoth { .. }
+                )
+            )
+        }) || self.actions.iter().any(|a| {
+            matches!(
+                a.action,
+                RawTriggerAction::SetDeaths(
+                    SetDeathsAction::ExtendedUnit { .. }
+                        | SetDeathsAction::ExtendedPlayer { .. }
+                        | SetDeathsAction::ExtendedBoth { .. }
+                )
+            )
+        })
+    }
+}
+
 fn raw_trigger(input: &[u8]) -> IResult<&[u8], RawTrigger> {
     let mut input = input;
     let mut conditions = Vec::new();
@@ -1469,5 +1510,133 @@ mod tests {
                 }
             }
         }
+    }
+
+    const TRIGGER_SIZE: usize = 2400;
+    const ACTIONS_OFFSET: usize = 16 * 20;
+
+    fn deaths_condition(player: u32, unit_id: u16) -> [u8; 20] {
+        let mut condition = [0u8; 20];
+        condition[4..8].copy_from_slice(&player.to_le_bytes());
+        condition[8..12].copy_from_slice(&5u32.to_le_bytes());
+        condition[12..14].copy_from_slice(&unit_id.to_le_bytes());
+        condition[14] = NumericComparison::AtLeast as u8;
+        condition[15] = 15;
+        condition
+    }
+
+    fn set_deaths_action(player: u32, unit_id: u16) -> [u8; 32] {
+        let mut action = [0u8; 32];
+        action[16..20].copy_from_slice(&player.to_le_bytes());
+        action[20..24].copy_from_slice(&5u32.to_le_bytes());
+        action[24..26].copy_from_slice(&unit_id.to_le_bytes());
+        action[26] = 45;
+        action[27] = NumberOperation::SetTo as u8;
+        action
+    }
+
+    fn trigger_with_condition(slot: usize, condition: &[u8; 20]) -> Vec<u8> {
+        let mut trigger = vec![0u8; TRIGGER_SIZE];
+        trigger[slot * 20..(slot + 1) * 20].copy_from_slice(condition);
+        trigger
+    }
+
+    fn trigger_with_action(slot: usize, action: &[u8; 32]) -> Vec<u8> {
+        let mut trigger = vec![0u8; TRIGGER_SIZE];
+        let start = ACTIONS_OFFSET + slot * 32;
+        trigger[start..start + 32].copy_from_slice(action);
+        trigger
+    }
+
+    fn any_uses_eud(data: &[u8]) -> bool {
+        read_triggers(data)
+            .unwrap()
+            .iter()
+            .any(RawTrigger::uses_eud)
+    }
+
+    #[test]
+    fn uses_eud_false_without_eud_triggers() {
+        assert!(!any_uses_eud(&[]));
+        assert!(!any_uses_eud(&[0u8; TRIGGER_SIZE * 2]));
+
+        let mut data = trigger_with_condition(0, &deaths_condition(0, 0));
+        data.extend(trigger_with_action(
+            0,
+            &set_deaths_action(PlayerGroup::CurrentPlayer as u32, 232),
+        ));
+        assert!(!any_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_detects_extended_deaths_condition() {
+        let data = trigger_with_condition(3, &deaths_condition(0xFFFF_FF1B, 0));
+        assert!(any_uses_eud(&data));
+        let data = trigger_with_condition(15, &deaths_condition(0, 0x1234));
+        assert!(any_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_detects_extended_set_deaths_action() {
+        let data = trigger_with_action(10, &set_deaths_action(12, 0));
+        assert!(any_uses_eud(&data));
+        let data = trigger_with_action(63, &set_deaths_action(0, 233));
+        assert!(any_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_threshold_boundaries() {
+        let cases: [(u32, u16, bool); 10] = [
+            (11, 0, false),
+            (12, 0, true),
+            (13, 0, false),
+            (26, 0, false),
+            (27, 0, true),
+            (0x100, 0, true),
+            (0, 228, false),
+            (0, 232, false),
+            (0, 233, true),
+            (0, u16::MAX, true),
+        ];
+        for (player, unit_id, expected) in cases {
+            let condition = trigger_with_condition(0, &deaths_condition(player, unit_id));
+            assert_eq!(any_uses_eud(&condition), expected, "{player} {unit_id}");
+            let action = trigger_with_action(0, &set_deaths_action(player, unit_id));
+            assert_eq!(any_uses_eud(&action), expected, "{player} {unit_id}");
+        }
+    }
+
+    #[test]
+    fn uses_eud_ignores_other_condition_and_action_types() {
+        // Command (2) and Kill Unit (22) keep player/unit ids at the same offsets.
+        let mut condition = deaths_condition(27, 233);
+        condition[15] = 2;
+        assert!(!any_uses_eud(&trigger_with_condition(0, &condition)));
+        let mut action = set_deaths_action(27, 233);
+        action[26] = 22;
+        assert!(!any_uses_eud(&trigger_with_action(0, &action)));
+    }
+
+    #[test]
+    fn uses_eud_counts_disabled_entries_and_entries_after_empty_slots() {
+        let mut condition = deaths_condition(27, 0);
+        condition[17] = ConditionFlags::DISABLED.bits();
+        assert!(any_uses_eud(&trigger_with_condition(8, &condition)));
+        let mut action = set_deaths_action(27, 0);
+        action[28] = ActionFlags::DISABLED.bits();
+        assert!(any_uses_eud(&trigger_with_action(40, &action)));
+    }
+
+    #[test]
+    fn uses_eud_scans_every_trigger_and_ignores_trailing_partial_trigger() {
+        let eud = trigger_with_action(0, &set_deaths_action(27, 0));
+
+        let mut data = vec![0u8; TRIGGER_SIZE * 2];
+        data.extend(&eud);
+        assert!(any_uses_eud(&data));
+
+        let mut data = vec![0u8; TRIGGER_SIZE];
+        data.extend(&eud[..TRIGGER_SIZE - 1]);
+        assert!(!any_uses_eud(&data));
     }
 }
