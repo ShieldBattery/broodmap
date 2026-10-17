@@ -1,19 +1,20 @@
 #![no_main]
 
 use broodmap::chk::{
-    placed_units::read_placed_units,
-    sprites::read_sprites,
+    placed_units::{PlacedUnit, read_placed_units},
+    sprites::{Sprite, read_sprites},
     terrain::{TerrainTileIds, TileId},
 };
 use broodmap_analysis::topology::{
     BaseTopology, TopologyBase, TopologyError, TopologyJob, TopologyOptions,
 };
 use broodmap_analysis::{
-    BaseSearchOptions, BoundarySpan, DepotFootprint, EntranceError, EntranceOptions, PixelPosition,
-    PixelRect, RegionOptions, ResourceKind, ResourceNode, StaticObstacle, TerrainCell, TerrainGrid,
-    WalkPosition, discover_bases, melee_obstacles,
+    BaseAnalysis, BaseDiscoveryOutcome, BaseError, BaseSearchOptions, BoundarySpan, DepotFootprint,
+    DiscoverySkipReason, EntranceError, EntranceOptions, PixelPosition, PixelRect, RegionOptions,
+    ResourceKind, ResourceNode, StaticObstacle, TerrainCell, TerrainGrid, WalkPosition,
+    discover_bases, melee_base_inputs, melee_obstacles,
 };
-use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
+use broodmap_formats::{UnitsDat, parse_cv5, parse_units_dat, parse_vf4};
 use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 
@@ -1046,6 +1047,94 @@ fn exercise_bases(grid: &TerrainGrid, data: &[u8], obstacles: &[PixelRect]) {
     }
 }
 
+// The one-call melee adapter: normalized UNIT/THG2 inputs, then discovery that degrades at limits.
+fn exercise_melee_bases(
+    grid: &TerrainGrid,
+    units: &[PlacedUnit],
+    sprites: &[Sprite],
+    definitions: &UnitsDat,
+    data: &[u8],
+) {
+    let inputs = melee_base_inputs(units, sprites, definitions);
+    let stock_resource = |id: u16| matches!(id, 176..=178 | 188);
+    let candidates = units.iter().filter(|u| stock_resource(u.unit_id)).count()
+        + sprites.iter().filter(|s| stock_resource(s.id)).count();
+    assert!(inputs.resources.len() + inputs.ignored_resources <= candidates);
+    assert_eq!(
+        inputs.starts.len(),
+        units.iter().filter(|u| u.unit_id == 214).count()
+    );
+    assert_eq!(
+        inputs.mineral_count() + inputs.gas_count(),
+        inputs.resources.len()
+    );
+    let options = BaseSearchOptions {
+        depot: DepotFootprint {
+            width_tiles: u32::from(data.get(2).copied().unwrap_or(4) % 6),
+            height_tiles: u32::from(data.get(3).copied().unwrap_or(3) % 6),
+        },
+        ..BaseSearchOptions::default()
+    };
+    let direct = discover_bases(
+        grid,
+        &inputs.resources,
+        &inputs.obstacles,
+        &inputs.start_positions(),
+        &options,
+    );
+    match (
+        BaseAnalysis::from_inputs(grid.clone(), inputs.clone(), &options),
+        direct,
+    ) {
+        (Ok(analysis), direct) => {
+            assert_eq!(analysis.terrain, *grid);
+            assert_eq!(analysis.inputs, inputs);
+            match (analysis.discovery, direct) {
+                (BaseDiscoveryOutcome::Complete(discovery), Ok(expected)) => {
+                    assert_eq!(discovery, expected);
+                    for base in &discovery.bases {
+                        assert!(base.start_indices.iter().all(|&i| i < inputs.starts.len()));
+                        assert!(
+                            base.resource_indices
+                                .iter()
+                                .all(|&i| i < inputs.resources.len())
+                        );
+                    }
+                }
+                (
+                    BaseDiscoveryOutcome::Skipped(DiscoverySkipReason::DenseResourceField {
+                        maximum,
+                        actual,
+                    }),
+                    Err(BaseError::TooManyResources {
+                        maximum: expected_maximum,
+                        actual: expected_actual,
+                    }),
+                ) => assert_eq!((maximum, actual), (expected_maximum, expected_actual)),
+                (
+                    BaseDiscoveryOutcome::Skipped(DiscoverySkipReason::TooManyStarts {
+                        maximum,
+                        actual,
+                    }),
+                    Err(BaseError::TooManyStarts {
+                        maximum: expected_maximum,
+                        actual: expected_actual,
+                    }),
+                ) => assert_eq!((maximum, actual), (expected_maximum, expected_actual)),
+                (outcome, direct) => panic!("{outcome:?} disagrees with {direct:?}"),
+            }
+        }
+        (Err(error), Err(expected)) => {
+            assert_eq!(error, expected);
+            assert!(matches!(
+                error,
+                BaseError::GridNotTileAligned { .. } | BaseError::InvalidFootprint { .. }
+            ));
+        }
+        (Err(error), Ok(_)) => panic!("{error} but direct discovery succeeded"),
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&w_byte, rest)) = data.split_first() else {
         return;
@@ -1109,6 +1198,7 @@ fuzz_target!(|data: &[u8]| {
     let cv5 = parse_cv5(cv5_bytes);
     let vf4 = parse_vf4(vf4_bytes);
     if let Ok(grid) = TerrainGrid::from_terrain(&terrain, &cv5, &vf4) {
+        exercise_melee_bases(&grid, &units, &sprites, &definitions, data);
         exercise_grid(&grid, data);
         exercise_grid(&grid.with_obstacles(&obstacles), data);
     }
@@ -1144,6 +1234,7 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(grid) = TerrainGrid::from_cells(width, height, cells) {
         exercise_bases(&grid, data, &obstacles);
+        exercise_melee_bases(&grid, &units, &sprites, &definitions, data);
         exercise_grid(&grid, data);
         exercise_topology(&grid, data);
         exercise_walls(&grid, data);
