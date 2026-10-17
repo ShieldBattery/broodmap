@@ -17,6 +17,10 @@ use crate::chk::forces::{
 use crate::chk::format_version::{FormatVersion, FormatVersionError, read_format_version};
 use crate::chk::placed_units::{PlacedUnit, PlacedUnitsError, read_placed_units};
 use crate::chk::player_colors::{PlayerColors, read_colr, read_crgb, resolve_player_colors};
+use crate::chk::players::{
+    PLAYER_SLOT_COUNT, PlayerRacesError, PlayerType, PlayerTypesError, Race, read_player_races,
+    read_player_types,
+};
 use crate::chk::scenario_props::{
     RawScenarioProps, ScenarioProps, ScenarioPropsError, read_scenario_props,
 };
@@ -41,6 +45,7 @@ pub mod forces;
 pub mod format_version;
 pub mod placed_units;
 pub mod player_colors;
+pub mod players;
 pub mod scenario_props;
 pub mod sprites;
 pub mod strings;
@@ -98,6 +103,8 @@ pub struct Chk {
     sprites: OnceLock<Result<Vec<Sprite>, SpriteError>>,
     placed_units: OnceLock<Result<Vec<PlacedUnit>, PlacedUnitsError>>,
     player_colors: OnceLock<PlayerColors>,
+    player_types: OnceLock<Result<[PlayerType; PLAYER_SLOT_COUNT], PlayerTypesError>>,
+    player_races: OnceLock<Result<[Race; PLAYER_SLOT_COUNT], PlayerRacesError>>,
 }
 
 impl Chk {
@@ -170,6 +177,8 @@ impl Chk {
             sprites: OnceLock::new(),
             placed_units: OnceLock::new(),
             player_colors: OnceLock::new(),
+            player_types: OnceLock::new(),
+            player_races: OnceLock::new(),
         })
     }
 
@@ -355,6 +364,32 @@ impl Chk {
                 .and_then(|data| read_crgb(&data).ok());
             resolve_player_colors(colr.as_ref(), crgb.as_ref())
         })
+    }
+
+    /// Returns the controller of each of the 12 player slots, from the `OWNR` chunk. Values are
+    /// returned as stored, without deciding which slots are playable.
+    pub fn player_types(&self) -> Result<&[PlayerType; PLAYER_SLOT_COUNT], &PlayerTypesError> {
+        self.player_types
+            .get_or_init(|| {
+                read_player_types(
+                    &read_chunk_data(&self.data, &self.chunks, ChunkType::OWNR)
+                        .ok_or(PlayerTypesError::ChunkMissing)?,
+                )
+            })
+            .as_ref()
+    }
+
+    /// Returns the race of each of the 12 player slots, from the `SIDE` chunk. Values are
+    /// returned as stored, including ones that are not valid map options.
+    pub fn player_races(&self) -> Result<&[Race; PLAYER_SLOT_COUNT], &PlayerRacesError> {
+        self.player_races
+            .get_or_init(|| {
+                read_player_races(
+                    &read_chunk_data(&self.data, &self.chunks, ChunkType::SIDE)
+                        .ok_or(PlayerRacesError::ChunkMissing)?,
+                )
+            })
+            .as_ref()
     }
 }
 
@@ -1328,5 +1363,158 @@ mod tests {
             chk.player_colors().colors,
             [player_colors::PlayerColor::Default; 8]
         );
+    }
+
+    fn raw_bytes<T: Copy + Into<u8>>(values: &[T; 12]) -> [u8; 12] {
+        values.map(Into::into)
+    }
+
+    #[test]
+    fn lt_player_slots() {
+        use players::{PlayerType, Race};
+
+        let chk = assert_ok!(Chk::from_bytes(LT_CHK.into(), None));
+
+        let types = assert_ok!(chk.player_types());
+        assert_eq!(raw_bytes(types), [6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(types[0], PlayerType::Human);
+        assert_eq!(types[4], PlayerType::Inactive);
+
+        let races = assert_ok!(chk.player_races());
+        assert_eq!(raw_bytes(races), [5, 5, 5, 5, 0, 2, 1, 0, 7, 7, 7, 4]);
+        assert_eq!(races[0], Race::UserSelectable);
+        assert_eq!(races[5], Race::Protoss);
+        assert_eq!(races[6], Race::Terran);
+        assert_eq!(races[8], Race::Inactive);
+        assert_eq!(races[11], Race::Neutral);
+    }
+
+    #[test]
+    fn sniper_seed_player_slots_include_rescuable() {
+        use players::PlayerType;
+
+        let chk = assert_ok!(Chk::from_bytes(SNIPER_SEED.into(), None));
+        let types = assert_ok!(chk.player_types());
+        assert_eq!(raw_bytes(types), [6, 5, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0]);
+        assert_eq!(types[1], PlayerType::Computer);
+        assert_eq!(types[2], PlayerType::RescuePassive);
+        assert_eq!(
+            raw_bytes(assert_ok!(chk.player_races())),
+            [1, 1, 1, 1, 1, 1, 0, 1, 7, 7, 7, 4]
+        );
+    }
+
+    #[test]
+    fn protected_map_decoy_ownr_is_overwritten() {
+        // This map places a junk OWNR chunk ahead of the real one; the later chunk wins.
+        const OCOC_BOUND: &[u8] = include_bytes!("../../assets/OcOc_Bound_2(p).chk");
+        let chk = assert_ok!(Chk::from_bytes(OCOC_BOUND.into(), None));
+
+        let ownr_tag: ChunkTag = ChunkType::OWNR.into();
+        let ownr_chunks = &chk.chunks()[&ownr_tag];
+        assert_eq!(ownr_chunks.len(), 2);
+        let decoy = &chk.data()[ownr_chunks[0].offset..ownr_chunks[0].offset + 12];
+        assert_eq!(decoy, [154, 65, 0, 0, 205, 22, 0, 0, 241, 10, 0, 0]);
+
+        assert_eq!(
+            raw_bytes(assert_ok!(chk.player_types())),
+            [6, 6, 6, 6, 6, 6, 5, 5, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            raw_bytes(assert_ok!(chk.player_races())),
+            [1, 1, 1, 1, 1, 1, 2, 2, 7, 7, 7, 4]
+        );
+    }
+
+    #[test]
+    fn player_slots_keep_undocumented_values() {
+        use players::{PlayerType, Race};
+
+        const DSA: &[u8] = include_bytes!("../../assets/DSA_7.4.3a_Desert_Strike_Angel.chk");
+        let chk = assert_ok!(Chk::from_bytes(DSA.into(), None));
+
+        let types = assert_ok!(chk.player_types());
+        assert_eq!(&types[8..], &[PlayerType::Other(255); 4]);
+        let races = assert_ok!(chk.player_races());
+        assert_eq!(&races[8..], &[Race::Other(255); 4]);
+    }
+
+    #[test]
+    fn player_slots_missing_chunks() {
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&[]), None));
+        assert_eq!(
+            chk.player_types(),
+            Err(&players::PlayerTypesError::ChunkMissing)
+        );
+        assert_eq!(
+            chk.player_races(),
+            Err(&players::PlayerRacesError::ChunkMissing)
+        );
+    }
+
+    #[test]
+    fn player_slots_last_full_chunk_wins() {
+        let ownr_a = [5u8; 12];
+        let ownr_b = [6u8, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let side_a = [0u8; 12];
+        let side_b = [1u8, 2, 5, 6, 7, 7, 7, 7, 7, 7, 7, 4];
+        let extra = [
+            chunk(*b"OWNR", &ownr_a),
+            chunk(*b"SIDE", &side_a),
+            chunk(*b"OWNR", &ownr_b),
+            chunk(*b"SIDE", &side_b),
+        ]
+        .concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&extra), None));
+
+        assert_eq!(raw_bytes(assert_ok!(chk.player_types())), ownr_b);
+        assert_eq!(raw_bytes(assert_ok!(chk.player_races())), side_b);
+    }
+
+    #[test]
+    fn player_slots_ignore_short_chunks() {
+        // A chunk below the 12-byte minimum is skipped, leaving the earlier full chunk in effect
+        // rather than overwriting part of it.
+        let ownr = [6u8, 6, 6, 6, 5, 5, 5, 5, 0, 0, 0, 7];
+        let side = [5u8, 5, 5, 5, 2, 1, 0, 6, 7, 7, 7, 4];
+        let extra = [
+            chunk(*b"OWNR", &ownr),
+            chunk(*b"SIDE", &side),
+            chunk(*b"OWNR", &[0u8; 11]),
+            chunk(*b"SIDE", &[0u8; 8]),
+        ]
+        .concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&extra), None));
+
+        assert_eq!(raw_bytes(assert_ok!(chk.player_types())), ownr);
+        assert_eq!(raw_bytes(assert_ok!(chk.player_races())), side);
+    }
+
+    #[test]
+    fn player_slots_only_short_chunks_are_missing() {
+        let extra = [chunk(*b"OWNR", &[6u8; 8]), chunk(*b"SIDE", &[5u8; 11])].concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&extra), None));
+
+        assert_eq!(
+            chk.player_types(),
+            Err(&players::PlayerTypesError::ChunkMissing)
+        );
+        assert_eq!(
+            chk.player_races(),
+            Err(&players::PlayerRacesError::ChunkMissing)
+        );
+    }
+
+    #[test]
+    fn player_slots_long_chunks_are_cut_off() {
+        let mut ownr = vec![6u8; 12];
+        ownr.extend_from_slice(&[9, 9, 9, 9]);
+        let mut side = vec![1u8; 12];
+        side.extend_from_slice(&[9, 9, 9, 9]);
+        let extra = [chunk(*b"OWNR", &ownr), chunk(*b"SIDE", &side)].concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&extra), None));
+
+        assert_eq!(raw_bytes(assert_ok!(chk.player_types())), [6u8; 12]);
+        assert_eq!(raw_bytes(assert_ok!(chk.player_races())), [1u8; 12]);
     }
 }

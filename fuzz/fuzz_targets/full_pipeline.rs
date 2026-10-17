@@ -35,4 +35,6 @@ fn exercise_lazy_accessors(chk: &broodmap::Chk) {
     let _ = chk.terrain();
     let _ = chk.sprites();
     let _ = chk.placed_units();
+    let _ = chk.player_types();
+    let _ = chk.player_races();
 }
