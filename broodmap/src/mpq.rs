@@ -459,19 +459,17 @@ fn mpq_sector_table(
 }
 
 // TODO(tec27): Support more compression algorithms, this is not a complete list of what BW supports
-// NOTE: Huffman (0x01), ADPCM (0x40/0x80), sparse (0x20) and LZMA (exactly 0x12) are also defined by
-// the MPQ format, but are only used for sound or non-SC archives, so they are rejected as
-// unsupported
+// NOTE: Huffman (0x01), ADPCM (0x40/0x80) and sparse (0x20) are also defined by the MPQ format, but
+// are only used for sound or non-SC archives, so they are rejected as unsupported. Newer MPQ
+// versions also treat the exact mask 0x12 as LZMA, but SC:R's Storm interprets each bit on its own,
+// so 0x12 is decompressed as bzip2 followed by zlib.
 const COMPRESSION_ZLIB: u8 = 0x02;
 const COMPRESSION_IMPLODE: u8 = 0x08;
 const COMPRESSION_BZIP2: u8 = 0x10;
-/// LZMA is identified by this exact mask value, rather than by being a combination of the zlib and
-/// bzip2 bits.
-const COMPRESSION_LZMA: u8 = 0x12;
 
 /// The compression types a sector's mask can combine, in the order they are decompressed (the
-/// reverse of the order they were applied in when compressing), matching Storm.
-const DECOMPRESSION_ORDER: [u8; 3] = [COMPRESSION_BZIP2, COMPRESSION_IMPLODE, COMPRESSION_ZLIB];
+/// reverse of the order they were applied in when compressing), matching SC:R's Storm.
+const DECOMPRESSION_ORDER: [u8; 3] = [COMPRESSION_IMPLODE, COMPRESSION_BZIP2, COMPRESSION_ZLIB];
 
 /// Size of the scratch buffer decompressors write into before output is bounds-checked.
 const DECOMPRESSION_CHUNK_SIZE: usize = 4096;
@@ -490,7 +488,7 @@ fn decompress_sector_into(
 
     let mask = data[0];
     let supported = DECOMPRESSION_ORDER.iter().fold(0, |acc, c| acc | c);
-    if mask == COMPRESSION_LZMA || mask & !supported != 0 {
+    if mask & !supported != 0 {
         return Err(MpqError::UnsupportedCompressionType(mask));
     }
 
@@ -1703,20 +1701,21 @@ mod tests {
 
     #[rstest]
     #[case::implode_zlib(COMPRESSION_IMPLODE | COMPRESSION_ZLIB)]
-    #[case::bzip2_implode(COMPRESSION_BZIP2 | COMPRESSION_IMPLODE)]
-    #[case::bzip2_implode_zlib(COMPRESSION_BZIP2 | COMPRESSION_IMPLODE | COMPRESSION_ZLIB)]
+    #[case::bzip2_zlib(COMPRESSION_BZIP2 | COMPRESSION_ZLIB)]
+    #[case::implode_bzip2(COMPRESSION_IMPLODE | COMPRESSION_BZIP2)]
+    #[case::implode_bzip2_zlib(COMPRESSION_IMPLODE | COMPRESSION_BZIP2 | COMPRESSION_ZLIB)]
     fn multi_compressed_sector_decompresses_in_storm_order(#[case] mask: u8) {
         let data = sample_data(2000);
-        // Compression is applied in the reverse of the decompression order: zlib, implode, bzip2
+        // Compression is applied in the reverse of the decompression order: zlib, bzip2, implode
         let mut payload = data.clone();
         if mask & COMPRESSION_ZLIB != 0 {
             payload = zlib(&payload);
         }
-        if mask & COMPRESSION_IMPLODE != 0 {
-            payload = implode_literals(&payload);
-        }
         if mask & COMPRESSION_BZIP2 != 0 {
             payload = bzip2(&payload);
+        }
+        if mask & COMPRESSION_IMPLODE != 0 {
+            payload = implode_literals(&payload);
         }
 
         let result = decompress_sector(&sector(mask, &payload), 4096);
@@ -1730,7 +1729,6 @@ mod tests {
     #[case::sparse(0x20)]
     #[case::adpcm_mono(0x40)]
     #[case::adpcm_stereo(0x80)]
-    #[case::lzma(COMPRESSION_LZMA)]
     fn unsupported_compression_mask_is_an_error(#[case] mask: u8) {
         let result = decompress_sector(&sector(mask, &zlib(b"data")), 4096);
         assert!(
@@ -1743,10 +1741,7 @@ mod tests {
     #[case::zlib(COMPRESSION_ZLIB, zlib(&[0u8; 65536]))]
     #[case::bzip2(COMPRESSION_BZIP2, bzip2(&[0u8; 65536]))]
     // The intermediate (bzip2) stage is bounded too, not just the final one
-    #[case::intermediate(
-        COMPRESSION_BZIP2 | COMPRESSION_IMPLODE,
-        bzip2(&implode_literals(&[0u8; 8192]))
-    )]
+    #[case::intermediate(COMPRESSION_BZIP2 | COMPRESSION_ZLIB, bzip2(&[0u8; 65536]))]
     fn decompressed_output_is_bounded_while_streaming(#[case] mask: u8, #[case] payload: Vec<u8>) {
         assert!(matches!(
             decompress_sector(&sector(mask, &payload), 4096),
