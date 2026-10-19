@@ -148,7 +148,7 @@ impl TerrainAnalysis {
                     .iter()
                     .filter_map(|&index| {
                         let owner = inputs.starts[index].owner?;
-                        (owner < 8).then_some(owner + 1)
+                        (owner < 8).then(|| owner + 1)
                     })
                     .collect();
                 start_players.sort_unstable();
@@ -236,6 +236,51 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn start_players(map: MapRenderer) -> Vec<serde_json::Value> {
+        let cv5 = vec![0; 52 * 2048];
+        let vf4: Vec<u8> = (0..16).flat_map(|_| 1u16.to_le_bytes()).collect();
+        let mut analysis = map.analyze_map(&cv5, &vf4, &definitions()).unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_str(&analysis.find_bases_json("{}").unwrap()).unwrap();
+        let bases = catalog["bases"].as_array().unwrap();
+        assert!(!bases.is_empty());
+        bases
+            .iter()
+            .flat_map(|base| base["startPlayers"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn out_of_range_start_owners_are_omitted_from_start_players() {
+        let lt = include_bytes!("../../../broodmap/assets/lt.chk");
+        let parse = |bytes: Vec<u8>| MapRenderer {
+            chk: broodmap::chk::Chk::from_bytes(bytes, None).unwrap(),
+            source: broodmap_render::MemorySource::new(),
+            known: Default::default(),
+        };
+        assert!(!start_players(parse(lt.to_vec())).is_empty());
+
+        let mut bytes = lt.to_vec();
+        let mut offset = 0;
+        let mut patched = 0;
+        while offset + 8 <= bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let body = offset + 8;
+            if &bytes[offset..offset + 4] == b"UNIT" {
+                for record in bytes[body..body + len].as_chunks_mut::<36>().0 {
+                    if u16::from_le_bytes([record[8], record[9]]) == 214 {
+                        record[16] = 255;
+                        patched += 1;
+                    }
+                }
+            }
+            offset = body + len;
+        }
+        assert!(patched > 0);
+        assert!(start_players(parse(bytes)).is_empty());
     }
 
     #[test]

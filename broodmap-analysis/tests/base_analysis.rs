@@ -10,8 +10,8 @@ use broodmap::{
 use broodmap_analysis::{
     AnalysisAssets, AnalysisError, BaseAnalysis, BaseAnalysisError, BaseDiscoveryOutcome,
     BaseError, BaseSearchOptions, DepotFootprint, DiscoverySkipReason, MeleeBaseInputs,
-    PixelPosition, PixelRect, ResourceKind, StartLocation, StaticObstacle, TerrainCell,
-    TerrainGrid, analyze_bases, discover_bases, melee_base_inputs,
+    PixelPosition, PixelRect, ResourceKind, ResourceNode, StartLocation, StaticObstacle,
+    TerrainCell, TerrainGrid, analyze_bases, discover_bases, melee_base_inputs,
 };
 use broodmap_formats::{Cv5, UnitsDat, Vf4, parse_cv5, parse_units_dat, parse_vf4};
 
@@ -369,4 +369,71 @@ fn tiny_mineral_keeps_overlapping_non_resource_objects() {
     assert!(inputs.resources.is_empty());
     assert_eq!(inputs.ignored_resources, 1);
     assert_eq!(inputs.obstacles.len(), 1);
+}
+
+#[test]
+fn invalid_options_and_grids_are_errors_even_past_count_limits() {
+    let flat = |width, height| {
+        TerrainGrid::from_cells(
+            width,
+            height,
+            vec![
+                TerrainCell {
+                    walkable: true,
+                    terrain_buildable: true,
+                    elevation: 0,
+                    ramp: false,
+                };
+                (width * height) as usize
+            ],
+        )
+        .unwrap()
+    };
+    let crowded = MeleeBaseInputs {
+        resources: vec![
+            ResourceNode {
+                bounds: PixelRect {
+                    left: 64,
+                    top: 64,
+                    right: 96,
+                    bottom: 80,
+                },
+                kind: ResourceKind::Mineral,
+                amount: None,
+            };
+            513
+        ],
+        starts: vec![
+            StartLocation {
+                position: PixelPosition { x: 64, y: 64 },
+                owner: None,
+            };
+            65
+        ],
+        ..MeleeBaseInputs::default()
+    };
+    let too_many_starts = MeleeBaseInputs {
+        resources: Vec::new(),
+        ..crowded.clone()
+    };
+    let zero_width = BaseSearchOptions {
+        depot: DepotFootprint {
+            width_tiles: 0,
+            height_tiles: 3,
+        },
+        ..BaseSearchOptions::default()
+    };
+    for inputs in [&crowded, &too_many_starts] {
+        assert!(matches!(
+            BaseAnalysis::from_inputs(flat(64, 64), inputs.clone(), &zero_width),
+            Err(BaseError::InvalidFootprint { .. })
+        ));
+        assert!(matches!(
+            BaseAnalysis::from_inputs(flat(63, 64), inputs.clone(), &BaseSearchOptions::default()),
+            Err(BaseError::GridNotTileAligned {
+                width: 63,
+                height: 64
+            })
+        ));
+    }
 }
