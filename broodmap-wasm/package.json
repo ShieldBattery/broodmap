@@ -1,19 +1,50 @@
 {
-  "name": "broodmap-wasm",
+  "name": "@shieldbattery/broodmap",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "WebAssembly bindings for rendering StarCraft: Brood War map previews",
+  "description": "WebAssembly bindings for broodmap: StarCraft: Brood War map summaries, previews and terrain analysis",
+  "main": "pkg-node/broodmap_wasm.js",
+  "types": "pkg/broodmap_wasm.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./pkg/broodmap_wasm.d.ts",
+        "node": "./pkg-node/broodmap_wasm.js",
+        "default": "./pkg/broodmap_wasm.js"
+      },
+      "require": "./pkg-node/broodmap_wasm.js"
+    }
+  },
+  "files": [
+    "pkg/*",
+    "pkg-node/*",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
   "scripts": {
-    "build": "pnpm run build:web && pnpm run build:node",
-    "build:web": "wasm-pack build --target web",
-    "build:node": "wasm-pack build --target nodejs --out-dir pkg-node",
+    "build": "pnpm run build:node && pnpm run build:web",
+    "build:web": "wasm-pack build --target web && node scripts/finalize-package.mjs pkg",
+    "build:node": "wasm-pack build --target nodejs --out-dir pkg-node && node scripts/finalize-package.mjs pkg-node",
     "assets:analysis": "cargo run --release -p broodmap-cli -- fetch-assets --analysis-only --out examples/assets",
     "assets": "cargo run --release -p broodmap-cli -- fetch-assets --out examples/assets",
     "dev": "pnpm run build:web && vite",
     "build:demo": "pnpm run build:web && vite build",
-    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs"
+    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs",
+    "prepublishOnly": "pnpm run build && pnpm test && pnpm run test:package",
+    "test:package": "node --test scripts/package.test.mjs"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShieldBattery/broodmap.git",
+    "directory": "broodmap-wasm"
+  },
+  "keywords": [
+    "starcraft",
+    "map",
+    "parser",
+    "wasm",
+    "webassembly"
+  ],
   "license": "MIT OR Apache-2.0",
   "devDependencies": {
     "vite": "^7.1.5"
