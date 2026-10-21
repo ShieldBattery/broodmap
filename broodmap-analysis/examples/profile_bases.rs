@@ -5,11 +5,13 @@
 //!   broodmap-wasm/examples/assets 10 path/to/map.scx [more-maps...] [--stress] [--memory]
 //! ```
 //!
-//! Input parsing, terrain construction, and UNIT/THG2 normalization happen before timing. Each
-//! case has one unmeasured warmup, then `repetitions` calls to `discover_bases`; every result must
-//! equal the warmup result. `--stress` appends a 256x256-tile synthetic case with 100 destructible
-//! obstacles arranged to create many candidate-clearance groups. It is intentionally capped to one
-//! timed iteration so it remains a quick profiling checkpoint.
+//! Each map is loaded through `analyze_bases`, which also serves as the unmeasured warmup; only the
+//! following `repetitions` calls to `discover_bases` on its normalized inputs are timed, and every
+//! result must equal the warmup result. Maps whose discovery was skipped (for example, dense
+//! resource fields over the solver's limit) are reported as `skipped` rows without timing.
+//! `--stress` appends a 256x256-tile synthetic case with 100 destructible obstacles arranged to
+//! create many candidate-clearance groups. It is intentionally capped to one timed iteration so it
+//! remains a quick profiling checkpoint.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -19,20 +21,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use broodmap::chk::{
-    placed_units::{PlacedUnit, PlacedUnitsError, UnitState},
-    sprites::{Sprite, SpriteError, SpriteFlags},
-    tileset::Tileset,
-};
+use broodmap::chk::tileset::Tileset;
 use broodmap::extract_chk_from_map;
 use broodmap_analysis::{
-    BaseDiscovery, BaseSearchOptions, PixelPosition, PixelRect, ResourceKind, ResourceNode,
-    StaticObstacle, TerrainCell, TerrainGrid, discover_bases, melee_obstacle_objects,
+    AnalysisAssets, BaseAnalysis, BaseDiscovery, BaseDiscoveryOutcome, BaseSearchOptions,
+    MeleeBaseInputs, PixelRect, ResourceKind, ResourceNode, StaticObstacle, TerrainCell,
+    TerrainGrid, analyze_bases, discover_bases,
 };
-use broodmap_formats::{UnitsDat, parse_cv5, parse_units_dat, parse_vf4};
-
-const RESOURCE_FLAG: u32 = 0x2000;
-const RESOURCE_GROUNDED_MASK: u32 = 0x2004;
+use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 
 // Tracking stays disabled for timed iterations. The optional memory pass reports requested bytes
 // relative to the moment tracking was enabled; negative net bytes are possible when the solver
@@ -127,10 +123,7 @@ fn record_delta(delta: i64) {
 
 struct Case {
     name: String,
-    terrain: TerrainGrid,
-    resources: Vec<ResourceNode>,
-    obstacles: Vec<StaticObstacle>,
-    starts: Vec<PixelPosition>,
+    analysis: BaseAnalysis,
 }
 
 fn main() {
@@ -212,9 +205,28 @@ fn parse_args() -> Result<(PathBuf, usize, Vec<PathBuf>, bool, bool), String> {
 }
 
 fn print_case(case: &Case, repetitions: usize, memory: bool) -> Result<(), String> {
-    let (baseline, durations) = benchmark(case, repetitions)?;
+    let terrain = &case.analysis.terrain;
+    let inputs = &case.analysis.inputs;
+    let expected = match &case.analysis.discovery {
+        BaseDiscoveryOutcome::Complete(discovery) => discovery,
+        BaseDiscoveryOutcome::Skipped(reason) => {
+            let placeholders = ["-"; 10].join("\t");
+            println!(
+                "{}\tskipped\t{}x{}\t{}\t{}\t{}\t{placeholders}\t{}",
+                sanitize(&case.name),
+                terrain.width() / 4,
+                terrain.height() / 4,
+                inputs.resources.len(),
+                inputs.obstacles.len(),
+                inputs.starts.len(),
+                sanitize(&reason.to_string()),
+            );
+            return Ok(());
+        }
+    };
+    let durations = benchmark(case, expected, repetitions)?;
     let memory = match memory {
-        true => Some(memory_pass(case, &baseline)?),
+        true => Some(memory_pass(case, expected)?),
         false => None,
     };
     let (allocations, deallocations, net_bytes, peak_bytes) = memory
@@ -230,13 +242,13 @@ fn print_case(case: &Case, repetitions: usize, memory: bool) -> Result<(), Strin
     println!(
         "{}\tok\t{}x{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
         sanitize(&case.name),
-        case.terrain.width() / 4,
-        case.terrain.height() / 4,
-        case.resources.len(),
-        case.obstacles.len(),
-        case.starts.len(),
-        baseline.bases.len(),
-        baseline.unplaced_clusters,
+        terrain.width() / 4,
+        terrain.height() / 4,
+        inputs.resources.len(),
+        inputs.obstacles.len(),
+        inputs.starts.len(),
+        expected.bases.len(),
+        expected.unplaced_clusters,
         repetitions,
         milliseconds(median(&durations)),
         milliseconds(*durations.iter().min().expect("at least one duration")),
@@ -270,28 +282,20 @@ fn load_case(assets: &Path, map: &Path) -> Result<Case, String> {
     let tileset = tileset_stem(chk.tileset());
     let cv5 = parse_cv5(&read_asset(assets, &format!("TileSet/{tileset}.cv5"))?);
     let vf4 = parse_vf4(&read_asset(assets, &format!("TileSet/{tileset}.vf4"))?);
-    let definitions = parse_units_dat(&read_asset(assets, "arr/units.dat")?);
-    let terrain = TerrainGrid::from_terrain(
-        chk.terrain().map_err(|error| error.to_string())?,
-        &cv5,
-        &vf4,
+    let units = parse_units_dat(&read_asset(assets, "arr/units.dat")?);
+    let analysis = analyze_bases(
+        &chk,
+        AnalysisAssets {
+            cv5: &cv5,
+            vf4: &vf4,
+            units: &units,
+        },
+        &BaseSearchOptions::default(),
     )
     .map_err(|error| error.to_string())?;
-    let units = match chk.placed_units() {
-        Ok(units) => units.as_slice(),
-        Err(PlacedUnitsError::ChunkMissing) => &[],
-    };
-    let sprites = match chk.sprites() {
-        Ok(sprites) => sprites.as_slice(),
-        Err(SpriteError::ChunkMissing) => &[],
-    };
-    let (resources, obstacles, starts) = base_inputs(units, sprites, &definitions);
     Ok(Case {
         name: map.to_string_lossy().into_owned(),
-        terrain,
-        resources,
-        obstacles,
-        starts,
+        analysis,
     })
 }
 
@@ -312,119 +316,33 @@ fn tileset_stem(tileset: Tileset) -> &'static str {
     }
 }
 
-fn base_inputs(
-    units: &[PlacedUnit],
-    sprites: &[Sprite],
-    definitions: &UnitsDat,
-) -> (Vec<ResourceNode>, Vec<StaticObstacle>, Vec<PixelPosition>) {
-    let other_units: Vec<_> = units
-        .iter()
-        .filter(|unit| !is_resource_node(unit.unit_id, definitions))
-        .copied()
-        .collect();
-    let other_sprites: Vec<_> = sprites
-        .iter()
-        .filter(|sprite| !is_resource_node(sprite.id, definitions))
-        .copied()
-        .collect();
-    let obstacles = melee_obstacle_objects(&other_units, &other_sprites, definitions);
-    let mut resources = Vec::new();
-    let mut starts = Vec::new();
-    for unit in units {
-        if unit.unit_id == 214 {
-            starts.push(PixelPosition {
-                x: u32::from(unit.x),
-                y: u32::from(unit.y),
-            });
-        } else if !unit
-            .state
-            .intersects(UnitState::HALLUCINATED | UnitState::IN_TRANSIT)
-            && let Some(node) = resource_node(
-                unit.unit_id,
-                unit.x,
-                unit.y,
-                unit.resource_amount,
-                definitions,
-            )
-        {
-            resources.push(node);
-        }
-    }
-    for sprite in sprites {
-        if sprite.owner == 11
-            && !sprite.flags.contains(SpriteFlags::DRAW_AS_SPRITE)
-            && let Some(node) = resource_node(sprite.id, sprite.x, sprite.y, None, definitions)
-        {
-            resources.push(node);
-        }
-    }
-    (resources, obstacles, starts)
-}
-
-fn is_resource_node(id: u16, definitions: &UnitsDat) -> bool {
-    matches!(id, 176..=178 | 188)
-        && definitions.entry(id).is_some_and(|entry| {
-            let (left, top, right, bottom) = entry.bounds;
-            entry.special_ability_flags & RESOURCE_GROUNDED_MASK == RESOURCE_FLAG
-                && [left, top, right, bottom].iter().all(|&extent| extent >= 0)
-        })
-}
-
-fn resource_node(
-    id: u16,
-    x: u16,
-    y: u16,
-    amount: Option<u32>,
-    definitions: &UnitsDat,
-) -> Option<ResourceNode> {
-    let kind = match id {
-        176..=178 => ResourceKind::Mineral,
-        188 => ResourceKind::Gas,
-        _ => return None,
-    };
-    let entry = definitions.entry(id)?;
-    if entry.special_ability_flags & RESOURCE_GROUNDED_MASK != RESOURCE_FLAG {
-        return None;
-    }
-    let (left, top, right, bottom) = entry.bounds;
-    if [left, top, right, bottom].iter().any(|&extent| extent < 0) {
-        return None;
-    }
-    Some(ResourceNode {
-        bounds: PixelRect {
-            left: i32::from(x) - i32::from(left),
-            top: i32::from(y) - i32::from(top),
-            right: i32::from(x) + i32::from(right) + 1,
-            bottom: i32::from(y) + i32::from(bottom) + 1,
-        },
-        kind,
-        amount,
-    })
-}
-
 fn discover(case: &Case) -> Result<BaseDiscovery, String> {
+    let inputs = &case.analysis.inputs;
     discover_bases(
-        &case.terrain,
-        &case.resources,
-        &case.obstacles,
-        &case.starts,
+        &case.analysis.terrain,
+        &inputs.resources,
+        &inputs.obstacles,
+        &inputs.start_positions(),
         &BaseSearchOptions::default(),
     )
     .map_err(|error| error.to_string())
 }
 
-fn benchmark(case: &Case, repetitions: usize) -> Result<(BaseDiscovery, Vec<Duration>), String> {
-    let expected = discover(case)?;
+fn benchmark(
+    case: &Case,
+    expected: &BaseDiscovery,
+    repetitions: usize,
+) -> Result<Vec<Duration>, String> {
     let mut durations = Vec::with_capacity(repetitions);
     for _ in 0..repetitions {
         let started = Instant::now();
         let result = discover(case)?;
         durations.push(started.elapsed());
-        if result != expected {
+        if result != *expected {
             return Err("base discovery returned a non-deterministic result".to_owned());
         }
     }
-    Ok((expected, durations))
+    Ok(durations)
 }
 
 struct MemoryStats {
@@ -522,11 +440,14 @@ fn stress_case() -> Case {
             }
         })
         .collect();
-    Case {
-        name: "synthetic-256-clearance-groups".to_owned(),
-        terrain,
+    let inputs = MeleeBaseInputs {
         resources,
         obstacles,
-        starts: Vec::new(),
+        ..MeleeBaseInputs::default()
+    };
+    Case {
+        name: "synthetic-256-clearance-groups".to_owned(),
+        analysis: BaseAnalysis::from_inputs(terrain, inputs, &BaseSearchOptions::default())
+            .expect("synthetic case is valid"),
     }
 }

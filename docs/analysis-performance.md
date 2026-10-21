@@ -18,14 +18,14 @@ From the repository root, with locally exported game tables:
 cargo run --release -p broodmap-analysis --example profile_bases -- broodmap-wasm/examples/assets 5 "path/to/map.scx" "path/to/another.scm" --stress --memory
 ```
 
-The example normalizes stock resources, starts, and static obstacles like the WASM
-adapter. That normalization is currently duplicated: changes to the stock input policy must
-update both the example and `broodmap-wasm/src/analysis/bases.rs` until a shared adapter is
-extracted. Parsing, asset loading, terrain construction, and input normalization happen
-before timing. Each map receives one warmup followed by the requested number of
-uncached discoveries; every output must equal the warmup output. TSV contains full
-input paths, counts, min/median/max times, and optional allocation statistics. Errors
-produce rows, the remaining cases still run, and the process exits nonzero if any fail.
+The example loads each map through `analyze_bases`, which normalizes stock resources, starts,
+and static obstacles with the same `melee_base_inputs` adapter as WASM. That call is the
+untimed warmup; parsing, asset loading, terrain construction, and input normalization all
+happen before timing. The requested number of uncached `discover_bases` calls then run on the
+normalized inputs; every output must equal the warmup output. TSV contains full input paths,
+counts, min/median/max times, and optional allocation statistics. Maps over discovery's
+resource or start limits produce `skipped` rows with the reason. Errors produce rows, the
+remaining cases still run, and the process exits nonzero if any fail.
 No game assets or maps are bundled with the benchmark.
 
 `--memory` measures an additional discovery with allocation tracking enabled. It
@@ -107,7 +107,7 @@ browser process memory**. Capacity did not shrink after freeing the analysis obj
 Inventorying `C:/Program Files (x86)/StarCraft/Maps` found 323 parseable maps, including
 11 at 256x256. Primeval Isles has the largest supported resource count, 370. **Crystallis
 has 890 resources on a 64x64 map**, exceeding the solver's current 512-resource limit;
-the profiler confirms the explicit rejection. The limit is not a property of valid
+`discover_bases` rejects it explicitly, and `analyze_bases` reports discovery as skipped. The limit is not a property of valid
 StarCraft maps. This checkpoint leaves it unchanged; increasing it should be paired
 with measurements of dense fields and an explicit work budget.
 

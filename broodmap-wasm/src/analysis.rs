@@ -4,7 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use broodmap::chk::{placed_units::PlacedUnitsError, sprites::SpriteError};
 use broodmap_analysis::{
-    EntranceSurvey, Ramp, SpanPartition, TerrainGrid, WalkPosition, melee_obstacles,
+    EntranceSurvey, MeleeBaseInputs, Ramp, SpanPartition, TerrainGrid, WalkPosition,
+    melee_base_inputs, melee_obstacles,
 };
 use broodmap_formats::{parse_cv5, parse_units_dat, parse_vf4};
 use broodmap_render::{AssetRequest, DatKind};
@@ -78,7 +79,7 @@ impl MapRenderer {
         analysis.wall_obstacles = obstacles;
         analysis.wall_profiles = walls::WallProfiles::from_definitions(&definitions);
         analysis.respect_obstacles = true;
-        analysis.base_inputs = Some(bases::BaseInputs::new(units, sprites, &definitions));
+        analysis.base_inputs = Some(melee_base_inputs(units, sprites, &definitions));
         Ok(analysis)
     }
 
@@ -114,7 +115,7 @@ pub struct TerrainAnalysis {
     obstacle_count: usize,
     wall_obstacles: Vec<broodmap_analysis::PixelRect>,
     wall_profiles: walls::WallProfiles,
-    base_inputs: Option<bases::BaseInputs>,
+    base_inputs: Option<MeleeBaseInputs>,
     base_catalog: Option<bases::BaseCatalog>,
     entrance_survey: OnceLock<EntranceSurvey>,
     ramps: OnceLock<Vec<Ramp>>,

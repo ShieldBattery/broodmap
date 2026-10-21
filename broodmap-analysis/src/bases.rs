@@ -148,6 +148,9 @@ pub enum BaseError {
 /// mineral patches at the configured threshold are omitted only when listed in that candidate's
 /// `required_mineral_indices`. Other patches remain blocked. Starts are assigned to one reachable
 /// cluster before selection, and output depot tiles and start associations are unique.
+///
+/// Grid alignment and the depot footprint are validated before the resource and start limits, so
+/// a count-limit error implies the grid and options are valid.
 pub fn discover_bases(
     terrain: &TerrainGrid,
     resources: &[ResourceNode],
@@ -155,18 +158,6 @@ pub fn discover_bases(
     starts: &[PixelPosition],
     options: &BaseSearchOptions,
 ) -> Result<BaseDiscovery, BaseError> {
-    if resources.len() > MAX_RESOURCES {
-        return Err(BaseError::TooManyResources {
-            maximum: MAX_RESOURCES,
-            actual: resources.len(),
-        });
-    }
-    if starts.len() > MAX_STARTS {
-        return Err(BaseError::TooManyStarts {
-            maximum: MAX_STARTS,
-            actual: starts.len(),
-        });
-    }
     if !terrain.width().is_multiple_of(WALK_CELLS_PER_TILE)
         || !terrain.height().is_multiple_of(WALK_CELLS_PER_TILE)
     {
@@ -188,6 +179,18 @@ pub fn discover_bases(
             height_tiles: depot.height_tiles,
             map_width_tiles,
             map_height_tiles,
+        });
+    }
+    if resources.len() > MAX_RESOURCES {
+        return Err(BaseError::TooManyResources {
+            maximum: MAX_RESOURCES,
+            actual: resources.len(),
+        });
+    }
+    if starts.len() > MAX_STARTS {
+        return Err(BaseError::TooManyStarts {
+            maximum: MAX_STARTS,
+            actual: starts.len(),
         });
     }
 
