@@ -25,6 +25,13 @@ test('summarizes a map through the ES module entry point', async () => {
   assert.equal(summary.width, 128)
 })
 
+test('takes resource limits as options', () => {
+  const { summarizeMapJson } = require('@shieldbattery/broodmap')
+  const bytes = readFileSync(mapPath)
+  assert.equal(JSON.parse(summarizeMapJson(bytes, '{"maxChkBytes":268435456}')).width, 128)
+  assert.throws(() => summarizeMapJson(bytes, '{"maxChkBytes":16}'))
+})
+
 test('rejects files that are not maps', () => {
   const { summarizeMapJson } = require('@shieldbattery/broodmap')
   assert.throws(() => summarizeMapJson(new Uint8Array([1, 2, 3])))

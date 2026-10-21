@@ -7,8 +7,10 @@ previews, zero-asset minimaps, and render-plan JSON synchronously from memory.
 
 ## Map summary
 
-`summarizeMapJson(mapBytes)` reads a map's scenario facts without rendering anything or needing
-game assets, for listing and filtering map files cheaply. It returns JSON:
+`summarizeMapJson(mapBytes, options?)` reads a map's scenario facts without rendering anything or
+needing game assets, for listing and filtering map files cheaply. `options` is an optional JSON
+object overriding broodmap's default resource limits (`maxMapBytes`, `maxMpqFileBytes`,
+`maxChkBytes`, `maxMergedChunkBytes`), for callers that accept larger maps. It returns JSON:
 
 | Field | Meaning |
 | ----- | ------- |
@@ -21,7 +23,8 @@ game assets, for listing and filtering map files cheaply. It returns JSON:
 | `triggerActionKinds`, `triggerCount` | The distinct trigger action kinds used (variant names such as `CreateUnit`, sorted), and how many triggers there are. `null` when the triggers can't be read. |
 | `placedUnits`, `playerUnits`, `startLocations` | Placed units (and those owned by one of the 8 player slots), not counting start locations, and the number of start locations. |
 
-It throws if the file isn't a readable map or lacks the name, player or force sections.
+It throws if the file isn't a readable map within those limits, or lacks the name, player or
+force sections.
 
 ## Package
 

@@ -3,11 +3,11 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use broodmap::chk::strings::{LegacyCodePage, StringEncoding};
-use broodmap::extract_chk_from_map;
+use broodmap::{ResourceLimits, extract_chk_from_map_with_limits};
 
 /// The unit placed to mark a start location.
 const START_LOCATION_UNIT: u16 = 214;
@@ -68,6 +68,42 @@ struct ForceSummary {
     name: Option<String>,
 }
 
+/// Overrides of broodmap's default [`ResourceLimits`], as JSON. Every field is optional.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct SummaryOptions {
+    max_map_bytes: Option<usize>,
+    max_mpq_file_bytes: Option<usize>,
+    max_chk_bytes: Option<usize>,
+    max_merged_chunk_bytes: Option<usize>,
+}
+
+impl SummaryOptions {
+    fn parse(json: Option<&str>) -> Result<SummaryOptions, String> {
+        match json.map(str::trim) {
+            None | Some("") => Ok(SummaryOptions::default()),
+            Some(json) => serde_json::from_str(json).map_err(|e| format!("invalid options: {e}")),
+        }
+    }
+
+    fn limits(&self) -> ResourceLimits {
+        let mut limits = ResourceLimits::default();
+        if let Some(bytes) = self.max_map_bytes {
+            limits.max_map_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_mpq_file_bytes {
+            limits.max_mpq_file_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_chk_bytes {
+            limits.max_chk_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_merged_chunk_bytes {
+            limits.max_merged_chunk_bytes = bytes;
+        }
+        limits
+    }
+}
+
 fn string_encoding_name(encoding: StringEncoding) -> &'static str {
     match encoding {
         StringEncoding::Utf8 => "utf8",
@@ -87,8 +123,9 @@ fn action_kind_name(action: &impl std::fmt::Debug) -> String {
         .to_string()
 }
 
-fn summarize(map_bytes: &[u8]) -> Result<MapSummary, String> {
-    let (chk, _mpq) = extract_chk_from_map(map_bytes, None, None).map_err(|e| e.to_string())?;
+fn summarize(map_bytes: &[u8], limits: &ResourceLimits) -> Result<MapSummary, String> {
+    let (chk, _mpq) = extract_chk_from_map_with_limits(map_bytes, None, None, limits)
+        .map_err(|e| e.to_string())?;
 
     let props = chk.scenario_props().map_err(|e| format!("SPRP: {e}"))?;
     let controllers = chk.player_types().map_err(|e| format!("OWNR: {e}"))?;
@@ -154,12 +191,15 @@ fn summarize(map_bytes: &[u8]) -> Result<MapSummary, String> {
     })
 }
 
-/// Summarizes a map file's scenario as JSON (see the README for the fields). Fails if the file
-/// isn't a readable map, or lacks the scenario name, player or force sections every playable map
-/// has.
+/// Summarizes a map file's scenario as JSON (see the README for the fields). `options` is an
+/// optional JSON object raising (or lowering) broodmap's default resource limits:
+/// `{ "maxMapBytes", "maxMpqFileBytes", "maxChkBytes", "maxMergedChunkBytes" }`. Fails if the file
+/// isn't a readable map within those limits, or lacks the scenario name, player or force sections
+/// every playable map has.
 #[wasm_bindgen(js_name = summarizeMapJson)]
-pub fn summarize_map_json(map_bytes: &[u8]) -> Result<String, String> {
-    let summary = summarize(map_bytes)?;
+pub fn summarize_map_json(map_bytes: &[u8], options: Option<String>) -> Result<String, String> {
+    let limits = SummaryOptions::parse(options.as_deref())?.limits();
+    let summary = summarize(map_bytes, &limits)?;
     serde_json::to_string(&summary).map_err(|e| e.to_string())
 }
 
@@ -167,9 +207,13 @@ pub fn summarize_map_json(map_bytes: &[u8]) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn default_summary(map_bytes: &[u8]) -> Result<MapSummary, String> {
+        summarize(map_bytes, &ResourceLimits::default())
+    }
+
     #[test]
     fn summarizes_a_melee_map() {
-        let summary = summarize(include_bytes!("../../broodmap/assets/lt.scm")).unwrap();
+        let summary = default_summary(include_bytes!("../../broodmap/assets/lt.scm")).unwrap();
         assert_eq!((summary.width, summary.height), (128, 128));
         assert!(summary.name.is_some());
         assert_eq!(summary.players.len(), 8);
@@ -183,7 +227,7 @@ mod tests {
     #[test]
     fn summarizes_a_ums_map_with_its_trigger_kinds() {
         let summary =
-            summarize(include_bytes!("../../broodmap/assets/Sniper_Seed_vA.scx")).unwrap();
+            default_summary(include_bytes!("../../broodmap/assets/Sniper_Seed_vA.scx")).unwrap();
         let kinds = summary.trigger_action_kinds.unwrap();
         assert!(!kinds.is_empty());
         assert!(kinds.windows(2).all(|w| w[0] < w[1]), "sorted and distinct");
@@ -192,13 +236,31 @@ mod tests {
 
     #[test]
     fn rejects_files_that_arent_maps() {
-        assert!(summarize(b"not a map").is_err());
-        assert!(summarize_map_json(b"").is_err());
+        assert!(default_summary(b"not a map").is_err());
+        assert!(summarize_map_json(b"", None).is_err());
+    }
+
+    #[test]
+    fn options_set_resource_limits() {
+        let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
+        assert!(summarize_map_json(map_bytes, Some("{}".into())).is_ok());
+        assert!(summarize_map_json(map_bytes, Some(r#"{"maxChkBytes":16}"#.into())).is_err());
+        assert!(summarize_map_json(map_bytes, Some(r#"{"maxChkByte":16}"#.into())).is_err());
+
+        let limits = SummaryOptions::parse(Some(r#"{"maxChkBytes":5,"maxMapBytes":7}"#))
+            .unwrap()
+            .limits();
+        assert_eq!((limits.max_chk_bytes, limits.max_map_bytes), (5, 7));
+        assert_eq!(
+            limits.max_mpq_file_bytes,
+            ResourceLimits::default().max_mpq_file_bytes
+        );
     }
 
     #[test]
     fn json_uses_camel_case() {
-        let json = summarize_map_json(include_bytes!("../../broodmap/assets/lt.scm")).unwrap();
+        let json =
+            summarize_map_json(include_bytes!("../../broodmap/assets/lt.scm"), None).unwrap();
         for key in [
             "\"stringEncoding\"",
             "\"usesEud\"",
