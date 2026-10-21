@@ -7,8 +7,10 @@ rust-version = "1.95"
 
 [dependencies]
 bitflags = "2.13"
+bzip2 = "0.6"
 encoding_rs = "0.8"
 explode = "0.1"
+miniz_oxide = "0.8"
 nom = "8.0"
 smallvec = "1.15"
 thiserror = "2.0"
