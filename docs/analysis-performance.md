@@ -1,5 +1,51 @@
 # Base discovery profiling checkpoint
 
+## 2026-10-21: pruned scoring and lane-parallel sweeps
+
+Native release, same i7-14700KF, benchmarks pinned to P-cores. Times are full `analyze_bases`
+calls (terrain, inputs, discovery), minimum of repeated runs. Baseline: `967a05f`.
+
+| Map set | Baseline total | New total | Median map | Slowest map |
+| --- | ---: | ---: | ---: | ---: |
+| 6 ladder maps (Medusa, FS, Primeval, Hunters, Polypoid, Eclipse) | 550 ms | 22.4 ms | 2.5 ms | 8.9 ms |
+| 323 installed maps | 24.4 s | 0.74 s | - | 9.2 ms (was 370 ms) |
+| 173 ShieldBattery maps (98.5% of a year's games) | 13.4 s | 0.38 s | 2.2 ms (was 79 ms) | 8.5 ms (was 318 ms) |
+| Synthetic 121-clearance-group stress case | 1.23 s | 2.5 ms | - | - |
+
+What changed, roughly in order of impact:
+
+- Branch and bound: each candidate gets a static octile lower bound per resource; an A* probe
+  toward the most promising candidate yields an exact incumbent key, and candidates whose bound
+  cannot beat it are pruned. Remaining floods are A* toward live targets and stop once every
+  wanted candidate settles or passes its pruning threshold. Selection certifies the chosen
+  ordinary candidate against every pruned bound and re-scores the cluster without pruning when a
+  used tile leaves the choice uncertain.
+- Lane-parallel sweeps (`proximity.rs`): when probes find no incumbent or a group's floods exceed
+  2000 settled cells, the whole group is scored exactly with one `i16` lane per resource, raster
+  sweeps iterated to a fixed point, and saturating arithmetic enforcing the cost cap. This bounds
+  the tail that pruning alone left (59 ms on Continental Divide).
+- Clustering uses one labeled multi-source BFS to half the cluster radius per spatial group
+  instead of a 32-step flood per resource.
+- Scoring grids are cluster windows (access rings ± 97 cells) with obstacles stamped directly;
+  the all-object grid is rasterized only in small windows for route anchors and the lazy
+  start-association search. Candidate generation prefilters resources and obstacles once per
+  cluster, and availability is a per-tile prefix table.
+
+Output is byte-identical to the baseline on all three map sets under three option sets, on 3,000
+random maps and 147,000 adversarial ones (contested buildable pockets, switchback mazes, extreme
+amounts and footprints, an overflow-checked build), and the new paths have randomized unit tests
+against exhaustive scoring and reference Dijkstra. A switchback-maze stress map (64 fields) went
+from 228-291 ms to 37-58 ms; it is the slowest known shape for the sweeps.
+
+Measured but not adopted: codegen settings alone (fat LTO with `codegen-units = 1` gave about
+5-10%, worth setting in the server's own release profile), a padded-grid neighbor kernel with a
+two-FIFO Dijkstra (5x alone, superseded), a three-bucket Dial queue (2x alone, superseded), and
+opt-in multithreading across clusters (4.4x at 8 threads on the old code; not merged).
+
+The sections below are the previous checkpoint.
+
+## 2026-09-17: compact scoring queue
+
 Measured on 2026-09-17 (local date), Windows, Intel Core i7-14700KF, Rust 1.98.1
 release builds and headless Chromium. Baseline: `f945a9d`. These are local latency
 observations, not performance guarantees or CI thresholds.

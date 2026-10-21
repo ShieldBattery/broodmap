@@ -541,8 +541,13 @@ The heuristic is bounded and deterministic:
   base-route queries. Ground and air distances use the same anchors. The hypothetical depot itself
   is not inserted as a blocker.
 
-Search scratch state is reused and footprint availability uses a prefix table. Each distinct
-clearing set currently clones and rasterizes a whole grid. At most 625 candidate tiles are searched
+The implementation computes exactly these scores without flooding every resource for every
+candidate: static octile bounds and an incumbent from an A* probe prune candidates that cannot win,
+and groups where pruning stops paying off are scored exhaustively with lane-parallel raster sweeps
+(`proximity.rs`). Selection re-scores a cluster without pruning when a used tile leaves its choice
+uncertified. Scoring grids cover only a cluster's window, and the all-object grid is rasterized
+only in small windows around chosen depots; see [analysis-performance.md](analysis-performance.md).
+At most 625 candidate tiles are searched
 per cluster, but many distinct overlapping blockers can still make large maps expensive; there is
 no separate group-count cutoff. Candidate perimeter buffers are released before global selection. Inputs are limited
 to 512 resources and 64 starts. Grid dimensions must be build-tile aligned and the footprint must
