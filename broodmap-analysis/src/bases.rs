@@ -10,7 +10,10 @@ use std::{
 
 use thiserror::Error;
 
-use crate::{PixelRect, StaticObstacle, TerrainGrid, WalkPosition};
+use crate::{
+    PixelRect, StaticObstacle, TerrainGrid, WalkPosition,
+    proximity::{CellBox, ProximityField, half_cost},
+};
 
 const WALK_CELLS_PER_TILE: u32 = 4;
 const PIXELS_PER_TILE: i64 = 32;
@@ -240,21 +243,23 @@ fn discover(
         });
     }
 
-    let all_resource_bounds: Vec<_> = catalog
-        .iter()
-        .map(|resource| resource.node.bounds)
-        .collect();
     let permanent_bounds: Vec<_> = catalog
         .iter()
         .filter(|resource| !is_clearable(resource.node, options))
         .map(|resource| resource.node.bounds)
         .collect();
-    let obstacle_bounds: Vec<_> = obstacles.iter().map(|obstacle| obstacle.bounds).collect();
-    let current_grid = stamp_obstacles(
-        terrain.clone(),
-        &combined_rects(&obstacle_bounds, &all_resource_bounds),
-    );
     let resource_grid = stamp_obstacles(terrain.clone(), &permanent_bounds);
+    // The all-object grid is only queried near chosen depots, so it is rasterized in local
+    // windows on top of the permanent-resource grid instead of as another full-map copy.
+    let current = CurrentOccupancy::new(
+        &resource_grid,
+        obstacles.iter().map(|obstacle| obstacle.bounds).chain(
+            catalog
+                .iter()
+                .filter(|resource| is_clearable(resource.node, options))
+                .map(|resource| resource.node.bounds),
+        ),
+    );
 
     // Low known minerals never enter a mining cluster and therefore cannot bridge normal fields.
     let mut mining = Vec::new();
@@ -277,53 +282,8 @@ fn discover(
         });
     }
 
-    let mut scratch = SearchScratch::new(terrain.cells().len());
     let mut scoring = ScoringScratch::new(terrain.cells().len());
-    let mut sets = DisjointSet::new(mining.len());
-    // A search reaches only cells within its radius of the source's access cells, and a union
-    // with an already joined resource changes nothing, so flood only toward the rest.
-    let access_boxes: Vec<_> = mining
-        .iter()
-        .map(|resource| bounding_cells(&resource.access))
-        .collect();
-    let mut targets = Vec::new();
-    let mut reached = Vec::new();
-    for source in 0..mining.len() {
-        let root = sets.find(source);
-        targets.clear();
-        for target in source + 1..mining.len() {
-            if chebyshev_gap(access_boxes[source], access_boxes[target])
-                <= u32::from(CLUSTER_RADIUS_CELLS)
-                && sets.find(target) != root
-            {
-                targets.push(target);
-            }
-        }
-        if targets.is_empty() {
-            continue;
-        }
-        scoring.targets.set(
-            terrain,
-            targets
-                .iter()
-                .enumerate()
-                .map(|(id, &target)| (id, mining[target].access.iter().copied())),
-        );
-        scratch.flood_to_targets(
-            terrain,
-            mining[source].access.iter().copied(),
-            CLUSTER_RADIUS_CELLS,
-            &scoring.targets,
-            targets.len(),
-            &mut reached,
-        );
-        for (&target, &reached) in targets.iter().zip(&reached) {
-            if reached {
-                sets.union(source, target);
-            }
-        }
-    }
-    scoring.targets.clear();
+    let mut sets = cluster_sets(terrain, &mining);
     let clusters = clusters_from_sets(&mut sets, mining.len());
     let mut result = BaseDiscovery {
         bases: Vec::new(),
@@ -419,7 +379,7 @@ fn discover(
         selected_cluster_indices.push(cluster_index);
         result.bases.push(BaseCandidate {
             depot_tile: chosen.tile,
-            route_anchor: current_footprint_anchor(chosen.tile, depot, &current_grid),
+            route_anchor: current_footprint_anchor(chosen.tile, depot, &current),
             resource_indices: cluster.resource_indices.clone(),
             required_mineral_indices: chosen.required_mineral_indices.clone(),
             required_obstacle_indices: chosen.required_obstacle_indices.clone(),
@@ -430,53 +390,27 @@ fn discover(
     // A nearby-start label is also exclusive. Exact ownership takes priority; otherwise choose
     // the nearest connected site within the existing association radius.
     let mut associations = vec![None; starts.len()];
-    // Only nearby starts need the route search, which stops once it has reached all of them.
-    let mut checks: Vec<(usize, WalkPosition)> = Vec::new();
-    let mut reached = Vec::new();
     for (base_index, base) in result.bases.iter().enumerate() {
-        let owned_elsewhere = |start: PixelPosition| {
-            start_depot_tile(start, depot)
+        // Only non-exact starts near the depot need the connectivity flood; most bases have none.
+        let mut reach = None;
+        for &(start_index, start) in &valid_starts {
+            let tile = start_depot_tile(start, depot);
+            if tile
                 .and_then(|tile| start_owners.get(&tile))
                 .is_some_and(|owner| owner.2 != selected_cluster_indices[base_index])
-        };
-        checks.clear();
-        reached.clear();
-        if let Some(anchor) = base.route_anchor {
-            for &(start_index, start) in &valid_starts {
-                if owned_elsewhere(start) || !start_near_depot(start, base.depot_tile, depot) {
-                    continue;
-                }
-                if let Some(point) = nearest_walkable(&current_grid, start) {
-                    checks.push((start_index, point));
-                }
-            }
-            if !checks.is_empty() {
-                scoring.targets.set(
-                    &current_grid,
-                    checks
-                        .iter()
-                        .enumerate()
-                        .map(|(id, &(_, point))| (id, [point])),
-                );
-                scratch.flood_to_targets(
-                    &current_grid,
-                    [anchor],
-                    START_RADIUS_CELLS,
-                    &scoring.targets,
-                    checks.len(),
-                    &mut reached,
-                );
-            }
-        }
-        for &(start_index, start) in &valid_starts {
-            if owned_elsewhere(start) {
+            {
                 continue;
             }
-            let exact = start_depot_tile(start, depot) == Some(base.depot_tile);
-            let connected = checks
-                .iter()
-                .zip(&reached)
-                .any(|(&(index, _), &reached)| index == start_index && reached);
+            let exact = tile == Some(base.depot_tile);
+            let connected = !exact
+                && base.route_anchor.is_some_and(|anchor| {
+                    start_near_depot(start, base.depot_tile, depot)
+                        && nearest_walkable(&current, start).is_some_and(|point| {
+                            reach
+                                .get_or_insert_with(|| current.reach(anchor, START_RADIUS_CELLS))
+                                .walkable(point)
+                        })
+                });
             if exact || connected {
                 let dx = i64::from(start.x)
                     - (i64::from(base.depot_tile.x) * 32 + i64::from(depot.width_tiles) * 16);
@@ -646,6 +580,8 @@ type CandidateKey = (u128, u128, u32, u32);
 const PROBE_ATTEMPTS: usize = 3;
 /// A probe is abandoned past 1.5 times its straight-line bound plus this detour.
 const PROBE_SLACK_COST: u32 = 8_000;
+/// Cells a group's pruned floods may settle before the group is swept exhaustively instead.
+const FLOOD_POP_BUDGET: usize = 2_000;
 
 #[derive(Debug, Copy, Clone)]
 struct PrunedCandidate {
@@ -816,9 +752,10 @@ impl ScoringContext<'_> {
             .collect()
     }
 
-    /// Scores a field's candidates. Without `prune`, every candidate is scored as the reference
-    /// algorithm does; with it, ordinary candidates that provably cannot beat the best fully
-    /// scored candidate are left in `pruned` instead.
+    /// Scores a field's candidates. Without `prune`, every group is swept exhaustively, as the
+    /// reference algorithm scores it. With it, ordinary candidates that provably cannot beat the
+    /// best fully scored candidate are left in `pruned` instead; a group where pruning does not
+    /// pay off within the flood budget is swept exhaustively too.
     fn score_cluster(
         &self,
         cluster: Vec<usize>,
@@ -916,6 +853,7 @@ impl ScoringContext<'_> {
         let mut retained = vec![false; candidates.len()];
         for ((cleared, cleared_minerals), members) in groups {
             let member_count = members.len();
+            let pruned_before = pruned.len();
             let mut scores = GroupScores {
                 resources: resource_count,
                 values: Vec::with_capacity(member_count * resource_count),
@@ -963,15 +901,14 @@ impl ScoringContext<'_> {
                 }
             }
 
-            let remaining: Vec<_> = self
+            let mut blockers: Vec<_> = self
                 .obstacles
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| cleared.binary_search(index).is_err())
-                .map(|(_, obstacle)| window.local_rect(obstacle.bounds))
+                .map(|(_, obstacle)| obstacle.bounds)
                 .collect();
-            let mut remaining = remaining;
-            remaining.extend(
+            blockers.extend(
                 self.catalog
                     .iter()
                     .filter(|resource| {
@@ -980,8 +917,25 @@ impl ScoringContext<'_> {
                                 .binary_search(&resource.original_index)
                                 .is_err()
                     })
-                    .map(|resource| window.local_rect(resource.node.bounds)),
+                    .map(|resource| resource.node.bounds),
             );
+            // Exhaustive scoring sweeps every group: its cost does not depend on pruning.
+            if !prune {
+                self.sweep_group(
+                    scoring,
+                    &cluster,
+                    &weights,
+                    &blockers,
+                    &members,
+                    &mut candidates,
+                    &mut retained,
+                );
+                continue;
+            }
+            let remaining: Vec<_> = blockers
+                .iter()
+                .map(|&bounds| window.local_rect(bounds))
+                .collect();
             let scoring_grid = stamp_obstacles(window.extract(self.resource_grid), &remaining);
             let accesses: Vec<_> = cluster
                 .iter()
@@ -1029,9 +983,13 @@ impl ScoringContext<'_> {
             // Probe the most promising ordinary candidate so later floods have a bound. A probe
             // is only a heuristic, so give up on one far beyond its straight-line distance (likely
             // on another level) rather than exhausting the flood, and try the next one.
+            // Pruning can fail to bite (probes on other levels, far exact starts, weak bounds).
+            // Past a pop budget the group's floods would cost more than sweeping it exhaustively.
+            let mut budget = FLOOD_POP_BUDGET;
+            let mut over_budget = false;
             let mut probed = vec![false; member_count];
-            for _ in 0..PROBE_ATTEMPTS {
-                if !prune || incumbent.is_some() {
+            'probes: for _ in 0..PROBE_ATTEMPTS {
+                if incumbent.is_some() {
                     break;
                 }
                 let Some(probe) = (0..member_count)
@@ -1065,7 +1023,13 @@ impl ScoringContext<'_> {
                         PROXIMITY_MAX_COST,
                         &wanted,
                         &give_up,
+                        budget,
                     );
+                    if end == FloodEnd::OverBudget {
+                        over_budget = true;
+                        break 'probes;
+                    }
+                    budget -= scoring.pops;
                     self.record_flood(
                         &mut scores,
                         &members,
@@ -1092,7 +1056,14 @@ impl ScoringContext<'_> {
                 prune_pass(&mut scores, incumbent, &mut pruned);
             }
 
+            // Without an incumbent nothing can be pruned, so floods would cost more than a sweep.
+            if incumbent.is_none() {
+                over_budget = true;
+            }
             for (resource, access) in accesses.iter().enumerate() {
+                if over_budget {
+                    break;
+                }
                 let Some(access) = access else {
                     continue;
                 };
@@ -1107,7 +1078,7 @@ impl ScoringContext<'_> {
                     }
                     give_up[member] = u32::MAX;
                     let candidate = &candidates[members[member]];
-                    if candidate.exact_start || !prune {
+                    if candidate.exact_start {
                         wanted.push(member);
                         continue;
                     }
@@ -1147,7 +1118,13 @@ impl ScoringContext<'_> {
                     PROXIMITY_MAX_COST,
                     &wanted,
                     &give_up,
+                    budget,
                 );
+                if end == FloodEnd::OverBudget {
+                    over_budget = true;
+                    break;
+                }
+                budget -= scoring.pops;
                 self.record_flood(
                     &mut scores,
                     &members,
@@ -1159,22 +1136,38 @@ impl ScoringContext<'_> {
                     end,
                     Some(&mut pruned),
                 );
-                if prune {
-                    for &member in &wanted {
-                        let candidate = &candidates[members[member]];
-                        if scores.status[member] == MemberStatus::Live
-                            && !candidate.exact_start
-                            && scores.settled[member] == resource_count
-                        {
-                            let (deviation, y, x) = tie(candidate);
-                            let key = (scores.bounds[member], deviation, y, x);
-                            incumbent = Some(incumbent.map_or(key, |best| best.min(key)));
-                        }
+                for &member in &wanted {
+                    let candidate = &candidates[members[member]];
+                    if scores.status[member] == MemberStatus::Live
+                        && !candidate.exact_start
+                        && scores.settled[member] == resource_count
+                    {
+                        let (deviation, y, x) = tie(candidate);
+                        let key = (scores.bounds[member], deviation, y, x);
+                        incumbent = Some(incumbent.map_or(key, |best| best.min(key)));
                     }
-                    prune_pass(&mut scores, incumbent, &mut pruned);
                 }
+                prune_pass(&mut scores, incumbent, &mut pruned);
             }
             scoring.targets.clear();
+            if over_budget {
+                // Score the whole group exactly instead. Its pruned entries are superseded, and
+                // its exact keys are valid incumbents.
+                pruned.truncate(pruned_before);
+                let best = self.sweep_group(
+                    scoring,
+                    &cluster,
+                    &weights,
+                    &blockers,
+                    &members,
+                    &mut candidates,
+                    &mut retained,
+                );
+                if let Some(best) = best {
+                    incumbent = Some(incumbent.map_or(best, |old| old.min(best)));
+                }
+                continue;
+            }
 
             for (member, &candidate_index) in members.iter().enumerate() {
                 if scores.status[member] != MemberStatus::Live {
@@ -1227,6 +1220,89 @@ impl ScoringContext<'_> {
         }
     }
 
+    /// Scores every member of one removal-set group exactly, as the reference algorithm does, with
+    /// lane-parallel sweeps, and marks the members it retains. Returns the best selection key
+    /// among fully connected ordinary members.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_group(
+        &self,
+        scoring: &mut ScoringScratch,
+        cluster: &[usize],
+        weights: &[u64],
+        blockers: &[PixelRect],
+        members: &[usize],
+        candidates: &mut [CandidateLocation],
+        retained: &mut [bool],
+    ) -> Option<CandidateKey> {
+        let depot = self.options.depot;
+        let targets = members
+            .iter()
+            .map(|&index| {
+                let (x0, y0, x1, y1) = footprint_cells(candidates[index].tile, depot);
+                CellBox {
+                    x0: i64::from(x0),
+                    y0: i64::from(y0),
+                    x1: i64::from(x1),
+                    y1: i64::from(y1),
+                }
+            })
+            .reduce(CellBox::union)
+            .expect("nonempty group");
+        let resources: Vec<_> = cluster
+            .iter()
+            .zip(weights)
+            .map(|(&index, &weight)| (self.node(index), weight))
+            .collect();
+        let perimeter = footprint_perimeter(TilePosition { x: 0, y: 0 }, depot);
+        if resources.len() <= 8 {
+            sweep_chunks(
+                &mut scoring.narrow,
+                self.resource_grid,
+                blockers,
+                &resources,
+                targets,
+                &perimeter,
+                members,
+                candidates,
+            );
+        } else {
+            sweep_chunks(
+                &mut scoring.wide,
+                self.resource_grid,
+                blockers,
+                &resources,
+                targets,
+                &perimeter,
+                members,
+                candidates,
+            );
+        }
+        let (mineral_total, gas_total) =
+            resources
+                .iter()
+                .fold((0, 0), |(m, g), (node, w)| match node.kind {
+                    ResourceKind::Mineral => (m + w, g),
+                    ResourceKind::Gas => (m, g + w),
+                });
+        let mut best: Option<CandidateKey> = None;
+        for &index in members {
+            let candidate = &candidates[index];
+            let full = candidate.connected == cluster.len();
+            retained[index] = (candidate.exact_start && candidate.connected > 0) || full;
+            if full && !candidate.exact_start {
+                let (deviation, y, x) = tie_of(candidate);
+                let key = (
+                    key_distance(candidate, mineral_total, gas_total),
+                    deviation,
+                    y,
+                    x,
+                );
+                best = Some(best.map_or(key, |old| old.min(key)));
+            }
+        }
+        best
+    }
+
     /// Applies one flood's outcome to every member it wanted.
     #[allow(clippy::too_many_arguments)]
     fn record_flood(
@@ -1267,7 +1343,7 @@ impl ScoringContext<'_> {
                         ),
                     });
                 }
-                FloodEnd::Settled | FloodEnd::Exhausted => {
+                FloodEnd::Settled | FloodEnd::Exhausted | FloodEnd::OverBudget => {
                     if candidate.exact_start {
                         let slot = scores.slot(member, resource);
                         scores.known[slot] = Known::Unreachable;
@@ -1378,12 +1454,6 @@ fn union_cells(a: CellRect, b: CellRect) -> CellRect {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
-fn bounding_cells(points: &[WalkPosition]) -> CellRect {
-    points.iter().fold(EMPTY_CELL_RECT, |bounds, point| {
-        union_cells(bounds, (point.x, point.y, point.x, point.y))
-    })
-}
-
 fn axis_gaps(a: CellRect, b: CellRect) -> (u32, u32) {
     let gap = |a_low: u32, a_high: u32, b_low: u32, b_high: u32| {
         b_low
@@ -1391,12 +1461,6 @@ fn axis_gaps(a: CellRect, b: CellRect) -> (u32, u32) {
             .max(a_low.saturating_sub(b_high))
     };
     (gap(a.0, a.2, b.0, b.2), gap(a.1, a.3, b.1, b.3))
-}
-
-/// The fewest 8-connected steps between any cells of two rectangles, ignoring obstacles.
-fn chebyshev_gap(a: CellRect, b: CellRect) -> u32 {
-    let (dx, dy) = axis_gaps(a, b);
-    dx.max(dy)
 }
 
 /// The cheapest possible octile walk between any cells of two rectangles, ignoring obstacles.
@@ -1517,13 +1581,6 @@ fn stamp_obstacles(mut grid: TerrainGrid, obstacles: &[PixelRect]) -> TerrainGri
         }
     }
     grid
-}
-
-fn combined_rects(objects: &[PixelRect], resources: &[PixelRect]) -> Vec<PixelRect> {
-    let mut result = Vec::with_capacity(objects.len() + resources.len());
-    result.extend_from_slice(objects);
-    result.extend_from_slice(resources);
-    result
 }
 
 fn rect_is_in_map(bounds: PixelRect, width: i64, height: i64) -> bool {
@@ -1688,19 +1745,20 @@ fn footprint_perimeter(tile: TilePosition, depot: DepotFootprint) -> Vec<WalkPos
 fn current_footprint_anchor(
     tile: TilePosition,
     depot: DepotFootprint,
-    terrain: &TerrainGrid,
+    current: &CurrentOccupancy,
 ) -> Option<WalkPosition> {
     let left = tile.x * 4;
     let top = tile.y * 4;
     let width = depot.width_tiles * 4;
     let height = depot.height_tiles * 4;
+    let footprint = current.window(left, top, left + width, top + height);
     let center_x = i64::from(left) * 2 + i64::from(width);
     let center_y = i64::from(top) * 2 + i64::from(height);
     let mut best = None;
     for y in top..top + height {
         for x in left..left + width {
             let point = WalkPosition { x, y };
-            if !terrain.cell(point).is_some_and(|cell| cell.walkable) {
+            if !footprint.walkable(point) {
                 continue;
             }
             let dx = i64::from(x) * 2 + 1 - center_x;
@@ -1729,16 +1787,21 @@ fn start_near_depot(start: PixelPosition, tile: TilePosition, depot: DepotFootpr
     dx * dx + dy * dy <= START_ASSOCIATION_PIXELS * START_ASSOCIATION_PIXELS
 }
 
-fn nearest_walkable(terrain: &TerrainGrid, point: PixelPosition) -> Option<WalkPosition> {
+fn nearest_walkable(current: &CurrentOccupancy, point: PixelPosition) -> Option<WalkPosition> {
     let center = WalkPosition {
         x: point.x / 8,
         y: point.y / 8,
     };
+    let left = center.x.saturating_sub(2);
+    let top = center.y.saturating_sub(2);
+    let right = center.x.saturating_add(2).min(current.grid.width() - 1) + 1;
+    let bottom = center.y.saturating_add(2).min(current.grid.height() - 1) + 1;
+    let nearby = current.window(left, top, right, bottom);
     let mut best = None;
-    for y in center.y.saturating_sub(2)..=center.y.saturating_add(2).min(terrain.height() - 1) {
-        for x in center.x.saturating_sub(2)..=center.x.saturating_add(2).min(terrain.width() - 1) {
+    for y in top..bottom {
+        for x in left..right {
             let candidate = WalkPosition { x, y };
-            if !terrain.cell(candidate).is_some_and(|cell| cell.walkable) {
+            if !nearby.walkable(candidate) {
                 continue;
             }
             let dx = i64::from(x) * 8 + 4 - i64::from(point.x);
@@ -1794,20 +1857,19 @@ impl TileAvailability {
     }
 }
 
+#[cfg(test)]
 struct SearchScratch {
     epoch: u32,
     seen: Vec<u32>,
     distances: Vec<u16>,
-    /// Cells by search priority for `flood_to_targets`.
-    buckets: Vec<Vec<usize>>,
 }
+#[cfg(test)]
 impl SearchScratch {
     fn new(count: usize) -> Self {
         Self {
             epoch: 0,
             seen: vec![0; count],
             distances: vec![0; count],
-            buckets: Vec::new(),
         }
     }
     #[cfg(test)]
@@ -1850,95 +1912,6 @@ impl SearchScratch {
             }
         }
     }
-    /// Reports, in `reached[id]`, whether each of `count` targets has a cell that `flood` with the
-    /// same arguments would reach: one within `maximum` steps of `starts`.
-    ///
-    /// This is A* toward the targets' bounding box, whose Chebyshev distance is consistent for
-    /// unit steps and zero on every target cell. A cell whose step count plus that distance
-    /// exceeds `maximum` cannot lie on such a path, so it is not expanded, and the search stops
-    /// once every target is reached.
-    fn flood_to_targets(
-        &mut self,
-        terrain: &TerrainGrid,
-        starts: impl IntoIterator<Item = WalkPosition>,
-        maximum: u16,
-        targets: &TargetIndex,
-        count: usize,
-        reached: &mut Vec<bool>,
-    ) {
-        reached.clear();
-        reached.resize(count, false);
-        let mut remaining = count;
-        let mut mark = |index: usize, remaining: &mut usize| {
-            for &id in targets.ids_at(index) {
-                if !reached[id as usize] {
-                    reached[id as usize] = true;
-                    *remaining -= 1;
-                }
-            }
-        };
-        let goal = (0..count)
-            .map(|id| targets.boxes[id])
-            .fold(EMPTY_CELL_RECT, union_cells);
-        let heuristic = |point: WalkPosition| {
-            let gap = chebyshev_gap((point.x, point.y, point.x, point.y), goal);
-            u16::try_from(gap).unwrap_or(u16::MAX)
-        };
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.seen.fill(0);
-            self.epoch = 1;
-        }
-        self.buckets.resize_with(usize::from(maximum) + 1, Vec::new);
-        for bucket in &mut self.buckets {
-            bucket.clear();
-        }
-        for start in starts {
-            let Some(index) = terrain.index(start) else {
-                continue;
-            };
-            if self.seen[index] == self.epoch || !terrain.cells()[index].walkable {
-                continue;
-            }
-            self.seen[index] = self.epoch;
-            self.distances[index] = 0;
-            mark(index, &mut remaining);
-            if let Some(bucket) = self.buckets.get_mut(usize::from(heuristic(start))) {
-                bucket.push(index);
-            }
-        }
-        for priority in 0..=maximum {
-            let mut next_entry = 0;
-            while let Some(&index) = self.buckets[usize::from(priority)].get(next_entry) {
-                next_entry += 1;
-                if remaining == 0 {
-                    return;
-                }
-                let position = terrain.position(index);
-                let distance = self.distances[index];
-                if distance.saturating_add(heuristic(position)) != priority || distance == maximum {
-                    continue; // Stale, or a target cell at the limit.
-                }
-                for (next, _) in terrain.neighbors(position) {
-                    let next_index = terrain.index(next).expect("neighbor in map");
-                    if self.seen[next_index] == self.epoch
-                        && self.distances[next_index] <= distance + 1
-                    {
-                        continue;
-                    }
-                    let next_priority = (distance + 1).saturating_add(heuristic(next));
-                    if next_priority > maximum {
-                        continue;
-                    }
-                    self.seen[next_index] = self.epoch;
-                    self.distances[next_index] = distance + 1;
-                    mark(next_index, &mut remaining);
-                    self.buckets[usize::from(next_priority)].push(next_index);
-                }
-            }
-        }
-    }
-
     #[cfg(test)]
     fn reached(&self, index: usize) -> bool {
         self.seen[index] == self.epoch
@@ -2036,6 +2009,10 @@ struct ScoringScratch {
     /// Minimum settled distance per target from the last `flood_targets`.
     target_distances: Vec<Option<u32>>,
     give_up_order: Vec<usize>,
+    /// Cells settled by the last `flood_targets`.
+    pops: usize,
+    narrow: ProximityField<8>,
+    wide: ProximityField<16>,
 }
 
 impl ScoringScratch {
@@ -2049,6 +2026,9 @@ impl ScoringScratch {
             targets: TargetIndex::new(count),
             target_distances: Vec::new(),
             give_up_order: Vec::new(),
+            pops: 0,
+            narrow: ProximityField::new(),
+            wide: ProximityField::new(),
         }
     }
 
@@ -2069,7 +2049,9 @@ impl ScoringScratch {
         maximum_cost: u32,
         wanted: &[usize],
         give_up: &[u32],
+        budget: usize,
     ) -> FloodEnd {
+        self.pops = 0;
         for &id in wanted {
             if self.target_distances.len() <= id {
                 self.target_distances.resize(id + 1, None);
@@ -2135,6 +2117,10 @@ impl ScoringScratch {
             if priority > limit {
                 return FloodEnd::GaveUp(priority);
             }
+            self.pops += 1;
+            if self.pops > budget {
+                return FloodEnd::OverBudget;
+            }
             let ids = self.targets.ids_at(index);
             if !ids.is_empty() {
                 for &id in ids {
@@ -2175,6 +2161,72 @@ impl ScoringScratch {
     }
 }
 
+/// Accumulates each resource's exact capped distance to each candidate's perimeter, `L`
+/// resources per sweep.
+#[allow(clippy::too_many_arguments)]
+fn sweep_chunks<const L: usize>(
+    field: &mut ProximityField<L>,
+    grid: &TerrainGrid,
+    blockers: &[PixelRect],
+    resources: &[(ResourceNode, u64)],
+    targets: CellBox,
+    perimeter: &[WalkPosition],
+    members: &[usize],
+    candidates: &mut [CandidateLocation],
+) {
+    for chunk in resources.chunks(L) {
+        let bounds: Vec<_> = chunk.iter().map(|(node, _)| node.bounds).collect();
+        field.compute(grid, blockers, &bounds, targets);
+        for &index in members {
+            let candidate = &mut candidates[index];
+            let mut best = [i16::MAX; L];
+            let (left, top) = (candidate.tile.x * 4, candidate.tile.y * 4);
+            for point in perimeter {
+                if let Some(lanes) = field.at(left + point.x, top + point.y) {
+                    for (best, &lane) in best.iter_mut().zip(lanes) {
+                        *best = (*best).min(lane);
+                    }
+                }
+            }
+            for (&lane, &(node, weight)) in best.iter().zip(chunk) {
+                let Some(half) = half_cost(lane) else {
+                    continue;
+                };
+                let distance = u64::from(half) * 2;
+                candidate.connected += 1;
+                match node.kind {
+                    ResourceKind::Mineral => {
+                        candidate.mineral_distance += distance * weight;
+                        candidate.reachable_mineral_weight += weight;
+                    }
+                    ResourceKind::Gas => {
+                        candidate.gas_distance += distance * weight;
+                        candidate.reachable_gas_weight += weight;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The distance part of the ordinary selection key, as `ScoredCluster::candidate_key` builds it.
+fn key_distance(candidate: &CandidateLocation, mineral_total: u64, gas_total: u64) -> u128 {
+    if gas_total == 0 {
+        u128::from(candidate.mineral_distance)
+    } else {
+        u128::from(candidate.mineral_distance) * u128::from(gas_total)
+            + u128::from(candidate.gas_distance) * u128::from(mineral_total)
+    }
+}
+
+fn tie_of(candidate: &CandidateLocation) -> (u128, u32, u32) {
+    (
+        candidate.center_deviation,
+        candidate.tile.y,
+        candidate.tile.x,
+    )
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum FloodEnd {
     /// Every wanted target settled.
@@ -2183,6 +2235,338 @@ enum FloodEnd {
     GaveUp(u32),
     /// Every cell within the maximum cost was settled.
     Exhausted,
+    /// More cells than the budget were settled.
+    OverBudget,
+}
+
+/// Calls `visit` for each 8-connected walkable neighbor of `index`, matching
+/// [`TerrainGrid::neighbors`]: a diagonal step needs both orthogonal side cells walkable.
+#[inline(always)]
+fn for_each_walk_neighbor(terrain: &TerrainGrid, index: usize, mut visit: impl FnMut(usize)) {
+    let cells = terrain.cells();
+    let width = terrain.width() as usize;
+    let x = index % width;
+    let up = index >= width && cells[index - width].walkable;
+    let down = index + width < cells.len() && cells[index + width].walkable;
+    let left = x > 0 && cells[index - 1].walkable;
+    let right = x + 1 < width && cells[index + 1].walkable;
+    if up {
+        visit(index - width);
+        if left && cells[index - width - 1].walkable {
+            visit(index - width - 1);
+        }
+        if right && cells[index - width + 1].walkable {
+            visit(index - width + 1);
+        }
+    }
+    if left {
+        visit(index - 1);
+    }
+    if right {
+        visit(index + 1);
+    }
+    if down {
+        visit(index + width);
+        if left && cells[index + width - 1].walkable {
+            visit(index + width - 1);
+        }
+        if right && cells[index + width + 1].walkable {
+            visit(index + width + 1);
+        }
+    }
+}
+
+/// Unions every pair of mining resources whose access cell sets are within
+/// `CLUSTER_RADIUS_CELLS` walk steps of each other.
+///
+/// Instead of one bounded flood per resource, a multi-source BFS labels each cell with a nearest
+/// resource out to half the radius, and unions labels across every edge `(u, v)` with
+/// `d(u) + 1 + d(v) <= CLUSTER_RADIUS_CELLS`. Such an edge closes a path of that length between
+/// the two labels' access sets, so every union is a true pair. Conversely, every cell on a
+/// shortest path of length `L <= CLUSTER_RADIUS_CELLS` between two access sets lies within
+/// `L / 2` steps of one of them, so it is labeled, and each label change along the path is an
+/// edge with `d(u) + 1 + d(v) <= L`; those unions chain the two ends together. The step graph is
+/// undirected, so the components equal those of pairwise per-resource floods.
+fn cluster_sets(terrain: &TerrainGrid, mining: &[MiningResource]) -> DisjointSet {
+    // A cell's state packs `(mining index + 1) << DEPTH_BITS | depth`; zero means unreached.
+    const DEPTH_BITS: u32 = 5;
+    const DEPTH_MASK: u16 = (1 << DEPTH_BITS) - 1;
+    const HALF_RADIUS: u16 = CLUSTER_RADIUS_CELLS / 2;
+    const _: () = assert!(HALF_RADIUS <= DEPTH_MASK);
+    const _: () = assert!((MAX_RESOURCES as u32 + 1) << DEPTH_BITS <= u16::MAX as u32);
+    let cells = terrain.cells();
+    let mut sets = DisjointSet::new(mining.len());
+    let mut states = vec![0_u16; cells.len()];
+    let mut queue = Vec::new();
+    // One search per spatial group keeps each wavefront cache-local. Every step moves at most one
+    // cell per axis, so resources whose access boxes are more than the radius apart (Chebyshev)
+    // are never joined and their half-radius regions are disjoint: the searches don't interact.
+    for group in spatial_groups(mining) {
+        queue.clear();
+        for resource in group {
+            let label = u16::try_from(resource + 1).expect("resource count fits u16") << DEPTH_BITS;
+            for &point in &mining[resource].access {
+                let index = terrain.index(point).expect("access in map");
+                if !cells[index].walkable {
+                    continue;
+                }
+                match states[index] {
+                    0 => {
+                        states[index] = label;
+                        queue.push(index);
+                    }
+                    other => sets.union(usize::from(other >> DEPTH_BITS) - 1, resource),
+                }
+            }
+        }
+        let mut head = 0;
+        let mut last_union = (0, 0);
+        while let Some(&index) = queue.get(head) {
+            head += 1;
+            let state = states[index];
+            let (label, depth) = (state & !DEPTH_MASK, state & DEPTH_MASK);
+            for_each_walk_neighbor(terrain, index, |next| match states[next] {
+                0 => {
+                    if depth < HALF_RADIUS {
+                        states[next] = state + 1;
+                        queue.push(next);
+                    }
+                }
+                other => {
+                    let other_label = other & !DEPTH_MASK;
+                    if other_label != label
+                        && depth + (other & DEPTH_MASK) < CLUSTER_RADIUS_CELLS
+                        && last_union != (label, other_label)
+                    {
+                        last_union = (label, other_label);
+                        sets.union(
+                            usize::from(label >> DEPTH_BITS) - 1,
+                            usize::from(other_label >> DEPTH_BITS) - 1,
+                        );
+                    }
+                }
+            });
+        }
+    }
+    sets
+}
+
+/// Groups mining resources whose access bounding boxes are within `CLUSTER_RADIUS_CELLS`
+/// (Chebyshev) of each other, transitively.
+fn spatial_groups(mining: &[MiningResource]) -> Vec<Vec<usize>> {
+    let radius = u32::from(CLUSTER_RADIUS_CELLS);
+    let bounds: Vec<_> = mining
+        .iter()
+        .map(|resource| {
+            resource.access.iter().fold(
+                (u32::MAX, u32::MAX, 0, 0),
+                |(left, top, right, bottom), point| {
+                    (
+                        left.min(point.x),
+                        top.min(point.y),
+                        right.max(point.x),
+                        bottom.max(point.y),
+                    )
+                },
+            )
+        })
+        .collect();
+    let mut near = DisjointSet::new(mining.len());
+    for (first, a) in bounds.iter().enumerate() {
+        for (second, b) in bounds.iter().enumerate().skip(first + 1) {
+            if a.0 <= b.2.saturating_add(radius)
+                && b.0 <= a.2.saturating_add(radius)
+                && a.1 <= b.3.saturating_add(radius)
+                && b.1 <= a.3.saturating_add(radius)
+            {
+                near.union(first, second);
+            }
+        }
+    }
+    clusters_from_sets(&mut near, mining.len())
+}
+
+/// The walk cells [`TerrainGrid::with_obstacles`] blocks for `rect`, as a half-open
+/// `(left, top, right, bottom)` range clamped to the map.
+fn cell_range(grid: &TerrainGrid, rect: PixelRect) -> Option<(u32, u32, u32, u32)> {
+    if rect.left >= rect.right || rect.top >= rect.bottom {
+        return None;
+    }
+    let max_x = i64::from(grid.width()) * PIXELS_PER_WALK_CELL;
+    let max_y = i64::from(grid.height()) * PIXELS_PER_WALK_CELL;
+    let left = i64::from(rect.left).clamp(0, max_x);
+    let top = i64::from(rect.top).clamp(0, max_y);
+    let right = i64::from(rect.right).clamp(0, max_x);
+    let bottom = i64::from(rect.bottom).clamp(0, max_y);
+    let cell = |value: i64| u32::try_from(value / PIXELS_PER_WALK_CELL).expect("clamped");
+    (left < right && top < bottom).then(|| {
+        (
+            cell(left),
+            cell(top),
+            cell(right + PIXELS_PER_WALK_CELL - 1),
+            cell(bottom + PIXELS_PER_WALK_CELL - 1),
+        )
+    })
+}
+
+/// The current all-object grid: the permanent-resource grid plus every non-resource obstacle
+/// and low mineral, rasterized exactly as [`TerrainGrid::with_obstacles`] would, on demand.
+struct CurrentOccupancy<'a> {
+    grid: &'a TerrainGrid,
+    /// Half-open walk-cell ranges `(left, top, right, bottom)`, already clamped to the map.
+    rects: Vec<(u32, u32, u32, u32)>,
+}
+
+impl<'a> CurrentOccupancy<'a> {
+    fn new(grid: &'a TerrainGrid, rects: impl IntoIterator<Item = PixelRect>) -> Self {
+        let rects = rects
+            .into_iter()
+            .filter_map(|rect| cell_range(grid, rect))
+            .collect();
+        Self { grid, rects }
+    }
+
+    /// Rasterizes the half-open in-map cell window `[left, right) x [top, bottom)`.
+    fn window(&self, left: u32, top: u32, right: u32, bottom: u32) -> LocalGrid {
+        let width = (right - left) as usize;
+        let height = (bottom - top) as usize;
+        let stride = width + 1;
+        let mut differences = vec![0_i64; stride * (height + 1)];
+        for &(x0, y0, x1, y1) in &self.rects {
+            let x0 = x0.max(left);
+            let y0 = y0.max(top);
+            let x1 = x1.min(right);
+            let y1 = y1.min(bottom);
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            let (x0, y0) = ((x0 - left) as usize, (y0 - top) as usize);
+            let (x1, y1) = ((x1 - left) as usize, (y1 - top) as usize);
+            differences[y0 * stride + x0] += 1;
+            differences[y0 * stride + x1] -= 1;
+            differences[y1 * stride + x0] -= 1;
+            differences[y1 * stride + x1] += 1;
+        }
+        let grid_width = self.grid.width() as usize;
+        let cells = self.grid.cells();
+        let mut walkable = vec![false; width * height];
+        for y in 0..height {
+            let row = &cells[(top as usize + y) * grid_width + left as usize..][..width];
+            for x in 0..width {
+                let index = y * stride + x;
+                let above = if y == 0 {
+                    0
+                } else {
+                    differences[index - stride]
+                };
+                let before = if x == 0 { 0 } else { differences[index - 1] };
+                let above_before = if x == 0 || y == 0 {
+                    0
+                } else {
+                    differences[index - stride - 1]
+                };
+                differences[index] += above + before - above_before;
+                walkable[y * width + x] = row[x].walkable && differences[index] <= 0;
+            }
+        }
+        LocalGrid {
+            left,
+            top,
+            width: width as u32,
+            height: height as u32,
+            walkable,
+        }
+    }
+
+    /// Cells reachable from `start` within `maximum` 8-neighbor steps, matching
+    /// [`SearchScratch::flood`] on the full current grid. Such a flood cannot leave the
+    /// Chebyshev window around `start`, so only that window is rasterized.
+    fn reach(&self, start: WalkPosition, maximum: u16) -> LocalGrid {
+        let radius = u32::from(maximum);
+        let left = start.x.saturating_sub(radius);
+        let top = start.y.saturating_sub(radius);
+        let right = start.x.saturating_add(radius).min(self.grid.width() - 1) + 1;
+        let bottom = start.y.saturating_add(radius).min(self.grid.height() - 1) + 1;
+        let open = self.window(left, top, right, bottom);
+        let width = open.width as usize;
+        let height = open.height as usize;
+        let mut reached = vec![false; open.walkable.len()];
+        let mut distances = vec![0_u16; open.walkable.len()];
+        let mut queue = std::collections::VecDeque::new();
+        let start_index = (start.y - top) as usize * width + (start.x - left) as usize;
+        if open.walkable[start_index] {
+            reached[start_index] = true;
+            queue.push_back(start_index);
+        }
+        while let Some(index) = queue.pop_front() {
+            let distance = distances[index];
+            if distance == maximum {
+                continue;
+            }
+            let x = index % width;
+            let y = index / width;
+            for (delta_x, delta_y) in NEIGHBOR_DIRECTIONS {
+                let (Some(next_x), Some(next_y)) = (
+                    x.checked_add_signed(delta_x).filter(|&value| value < width),
+                    y.checked_add_signed(delta_y)
+                        .filter(|&value| value < height),
+                ) else {
+                    continue;
+                };
+                let next = next_y * width + next_x;
+                let diagonal = delta_x != 0 && delta_y != 0;
+                if reached[next]
+                    || !open.walkable[next]
+                    || (diagonal
+                        && (!open.walkable[y * width + next_x]
+                            || !open.walkable[next_y * width + x]))
+                {
+                    continue;
+                }
+                reached[next] = true;
+                distances[next] = distance + 1;
+                queue.push_back(next);
+            }
+        }
+        LocalGrid {
+            walkable: reached,
+            ..open
+        }
+    }
+}
+
+const NEIGHBOR_DIRECTIONS: [(isize, isize); 8] = [
+    (0, -1),
+    (-1, 0),
+    (1, 0),
+    (0, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (1, 1),
+];
+
+/// A rectangular window of walk-cell flags; cells outside it read as false.
+struct LocalGrid {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    walkable: Vec<bool>,
+}
+
+impl LocalGrid {
+    fn walkable(&self, point: WalkPosition) -> bool {
+        let (Some(x), Some(y)) = (
+            point.x.checked_sub(self.left),
+            point.y.checked_sub(self.top),
+        ) else {
+            return false;
+        };
+        x < self.width
+            && y < self.height
+            && self.walkable[y as usize * self.width as usize + x as usize]
+    }
 }
 
 struct DisjointSet {
@@ -2770,60 +3154,193 @@ mod tests {
         }
     }
 
+    fn pairwise_clusters(terrain: &TerrainGrid, mining: &[MiningResource]) -> Vec<Vec<usize>> {
+        let mut sets = DisjointSet::new(mining.len());
+        for source in 0..mining.len() {
+            let mut distances = vec![None; terrain.cells().len()];
+            let mut queue = std::collections::VecDeque::new();
+            for &point in &mining[source].access {
+                let index = terrain.index(point).unwrap();
+                if distances[index].is_none() {
+                    distances[index] = Some(0);
+                    queue.push_back(point);
+                }
+            }
+            while let Some(point) = queue.pop_front() {
+                let distance = distances[terrain.index(point).unwrap()].unwrap();
+                if distance == CLUSTER_RADIUS_CELLS {
+                    continue;
+                }
+                for (next, _) in terrain.neighbors(point) {
+                    let next_index = terrain.index(next).unwrap();
+                    if distances[next_index].is_none() {
+                        distances[next_index] = Some(distance + 1);
+                        queue.push_back(next);
+                    }
+                }
+            }
+            for (target, candidate) in mining.iter().enumerate().skip(source + 1) {
+                if candidate
+                    .access
+                    .iter()
+                    .any(|point| distances[terrain.index(*point).unwrap()].is_some())
+                {
+                    sets.union(source, target);
+                }
+            }
+        }
+        clusters_from_sets(&mut sets, mining.len())
+    }
+
     #[test]
-    fn targeted_search_reaches_what_the_full_search_reaches() {
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    fn labeled_cluster_search_matches_pairwise_floods() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut next = move |bound: u32| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % u64::from(bound.max(1))) as u32
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            u32::try_from(seed % u64::from(bound)).unwrap()
         };
-        for _ in 0..200 {
-            let density = 2 + next(5);
-            let cells: Vec<_> = (0..64 * 64)
-                .map(|_| TerrainCell {
-                    walkable: next(density) != 0,
-                    terrain_buildable: true,
-                    elevation: 0,
-                    ramp: false,
-                })
-                .collect();
-            let terrain = TerrainGrid::from_cells(64, 64, cells).unwrap();
-            let point = |next: &mut dyn FnMut(u32) -> u32| WalkPosition {
-                x: next(64),
-                y: next(64),
-            };
-            let starts: Vec<_> = (0..1 + next(3)).map(|_| point(&mut next)).collect();
-            let targets: Vec<Vec<_>> = (0..1 + next(6))
-                .map(|_| (0..1 + next(4)).map(|_| point(&mut next)).collect())
-                .collect();
-            let maximum = 1 + next(40) as u16;
-            let mut full = SearchScratch::new(terrain.cells().len());
-            full.flood(&terrain, starts.iter().copied(), maximum);
-            let mut index = TargetIndex::new(terrain.cells().len());
-            index.set(
-                &terrain,
-                targets
-                    .iter()
-                    .enumerate()
-                    .map(|(id, cells)| (id, cells.iter().copied())),
+        let mut joined = 0;
+        for trial in 0..120 {
+            let tiles = 12 + next(16);
+            let open = 55 + next(46);
+            let blocks = next(12);
+            let mut walls = Vec::new();
+            for _ in 0..blocks {
+                walls.push((next(tiles * 4), next(tiles * 4), 1 + next(12), 1 + next(12)));
+            }
+            let mut noise = Vec::new();
+            for _ in 0..tiles * tiles * 16 {
+                noise.push(next(100) < open);
+            }
+            let width = tiles * 4;
+            let terrain = grid(tiles, tiles, |x, y| {
+                noise[(y * width + x) as usize]
+                    && !walls
+                        .iter()
+                        .any(|&(l, t, w, h)| (l..l + w).contains(&x) && (t..t + h).contains(&y))
+            });
+            let mut mining = Vec::new();
+            for _ in 0..2 + next(14) {
+                let left = i32::try_from(next(tiles * 32 - 8)).unwrap();
+                let top = i32::try_from(next(tiles * 32 - 8)).unwrap();
+                let right = (left + 1 + i32::try_from(next(64)).unwrap()).min((tiles * 32) as i32);
+                let bottom = (top + 1 + i32::try_from(next(48)).unwrap()).min((tiles * 32) as i32);
+                let bounds = PixelRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                if let Some(access) = perimeter_access_cells(&terrain, bounds) {
+                    mining.push(MiningResource {
+                        catalog_index: mining.len(),
+                        access,
+                    });
+                }
+            }
+            let expected = pairwise_clusters(&terrain, &mining);
+            let mut sets = cluster_sets(&terrain, &mining);
+            assert_eq!(
+                clusters_from_sets(&mut sets, mining.len()),
+                expected,
+                "trial {trial}"
             );
-            let mut reached = Vec::new();
-            let mut targeted = SearchScratch::new(terrain.cells().len());
-            targeted.flood_to_targets(
-                &terrain,
-                starts.iter().copied(),
-                maximum,
-                &index,
-                targets.len(),
-                &mut reached,
-            );
-            for (cells, reached) in targets.iter().zip(&reached) {
-                let expected = cells
-                    .iter()
-                    .any(|&cell| full.reached(terrain.index(cell).unwrap()));
-                assert_eq!(*reached, expected);
+            joined += mining.len() - expected.len();
+        }
+        assert!(joined > 50, "trials should exercise joins, got {joined}");
+    }
+
+    #[test]
+    fn local_rasterization_matches_full_grid_obstacles() {
+        let terrain = grid(16, 12, |x, y| (x * 7 + y * 3) % 11 != 0);
+        let rects = [
+            PixelRect {
+                left: 3,
+                top: 5,
+                right: 21,
+                bottom: 9,
+            },
+            PixelRect {
+                left: i32::MIN,
+                top: 100,
+                right: 40,
+                bottom: i32::MAX,
+            },
+            PixelRect {
+                left: 300,
+                top: 200,
+                right: 300,
+                bottom: 260,
+            },
+            PixelRect {
+                left: 90,
+                top: 90,
+                right: 80,
+                bottom: 120,
+            },
+            PixelRect {
+                left: 500,
+                top: -20,
+                right: 513,
+                bottom: 7,
+            },
+            PixelRect {
+                left: 2_000,
+                top: 0,
+                right: 3_000,
+                bottom: 50,
+            },
+            PixelRect {
+                left: 250,
+                top: 250,
+                right: 330,
+                bottom: 270,
+            },
+        ];
+        let full = terrain.with_obstacles(&rects);
+        assert_eq!(stamp_obstacles(terrain.clone(), &rects), full);
+        let huge = [PixelRect {
+            left: 0,
+            top: 0,
+            right: 512,
+            bottom: 384,
+        }; 2];
+        assert_eq!(
+            stamp_obstacles(terrain.clone(), &huge),
+            terrain.with_obstacles(&huge)
+        );
+
+        let current = CurrentOccupancy::new(&terrain, rects);
+        let window = current.window(5, 7, 40, 33);
+        for y in 0..full.height() {
+            for x in 0..full.width() {
+                let point = WalkPosition { x, y };
+                let inside = (5..40).contains(&x) && (7..33).contains(&y);
+                assert_eq!(
+                    window.walkable(point),
+                    inside && full.cell(point).unwrap().walkable,
+                    "{point:?}"
+                );
+            }
+        }
+        let mut scratch = SearchScratch::new(full.cells().len());
+        for (start, radius) in [
+            (WalkPosition { x: 30, y: 20 }, 12),
+            (WalkPosition { x: 1, y: 2 }, 48),
+        ] {
+            scratch.flood(&full, [start], radius);
+            let reach = current.reach(start, radius);
+            for y in 0..full.height() {
+                for x in 0..full.width() {
+                    let point = WalkPosition { x, y };
+                    assert_eq!(
+                        reach.walkable(point),
+                        scratch.reached(full.index(point).unwrap()),
+                        "{start:?} {point:?}"
+                    );
+                }
             }
         }
     }

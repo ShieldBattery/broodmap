@@ -25,6 +25,7 @@ pub mod bases;
 pub mod clearance;
 pub mod entrances;
 pub mod obstacles;
+mod proximity;
 pub mod ramps;
 pub mod regions;
 pub mod topology;
