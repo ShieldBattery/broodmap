@@ -31,6 +31,7 @@ fn exercise_lazy_accessors(chk: &Chk) {
     let _ = chk.scenario_props();
     let _ = chk.force_settings();
     let _ = chk.raw_triggers();
+    let _ = chk.uses_eud();
     let _ = chk.raw_briefing();
     let _ = chk.terrain();
     let _ = chk.sprites();

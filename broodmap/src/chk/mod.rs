@@ -32,6 +32,7 @@ use crate::chk::terrain::{TerrainError, TerrainTileIds, read_terrain};
 use crate::chk::tileset::{Tileset, TilesetError, read_tileset};
 use crate::chk::triggers::{
     RawTrigger, TriggersError, read_triggers, scan_used_string_ids as scan_used_trigger_string_ids,
+    scan_uses_eud as scan_trigger_uses_eud,
 };
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
 use crate::limits::{
@@ -288,6 +289,21 @@ impl Chk {
 
     pub fn raw_triggers(&self) -> Result<&Vec<RawTrigger>, &TriggersError> {
         self.raw_triggers_private().as_ref()
+    }
+
+    /// Returns whether the map's triggers (`TRIG`) use EUDs, matching SC:R's classification of EUD
+    /// maps: a Deaths condition or SetDeaths action whose comparison/number operation byte is below
+    /// 12, and whose full 32-bit player id is neither a player (0-11) nor a player group (13-26) or
+    /// whose unit id is past the unit types and unit groups (above 232). BW uses such ids directly
+    /// as offsets into its death table, so these conditions/actions read or write memory outside
+    /// of it.
+    ///
+    /// This scans the raw trigger records, so it counts disabled conditions/actions and ones that
+    /// [`Chk::raw_triggers`] omits because their comparison or number operation isn't one BW
+    /// executes. Mission briefing triggers (`MBRF`) don't count.
+    pub fn uses_eud(&self) -> bool {
+        read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG)
+            .is_some_and(|data| scan_trigger_uses_eud(&data))
     }
 
     // NOTE(tec27): This is private because we don't generally want to return references to the
@@ -1306,6 +1322,49 @@ mod tests {
         data.extend(chunk(*b"STR ", &0u16.to_le_bytes()));
         data.extend_from_slice(extra);
         data
+    }
+
+    #[test]
+    fn uses_eud() {
+        for chk_bytes in [LT_CHK, SECRET_BOUND_CHK] {
+            let chk = assert_ok!(Chk::from_bytes(chk_bytes.into(), None));
+            assert!(!chk.uses_eud());
+        }
+
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&[]), None));
+        assert!(!chk.uses_eud());
+
+        // A SetDeaths action for player 27, split across two appended TRIG chunks.
+        let mut trigger = vec![0u8; 2400];
+        let action = &mut trigger[320..352];
+        action[16..20].copy_from_slice(&27u32.to_le_bytes());
+        action[26] = 45;
+        action[27] = 7;
+        let (first, second) = trigger.split_at(1000);
+
+        let briefing = chunk(*b"MBRF", &trigger);
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&briefing), None));
+        assert!(!chk.uses_eud());
+
+        let triggers = [chunk(*b"TRIG", first), chunk(*b"TRIG", second)].concat();
+        let chk = assert_ok!(Chk::from_bytes(minimal_chk_with_extra(&triggers), None));
+        assert!(chk.uses_eud());
+
+        // SC:R classifies a SetDeaths action with modifier 0 as an EUD even though it isn't a
+        // number operation BW executes (and so isn't one of the parsed actions).
+        trigger[320 + 27] = 0;
+        let chk = assert_ok!(Chk::from_bytes(
+            minimal_chk_with_extra(&chunk(*b"TRIG", &trigger)),
+            None
+        ));
+        let triggers = assert_ok!(chk.raw_triggers());
+        assert!(
+            !triggers[0]
+                .actions
+                .iter()
+                .any(|a| matches!(a.action, RawTriggerAction::SetDeaths(_)))
+        );
+        assert!(chk.uses_eud());
     }
 
     #[test]

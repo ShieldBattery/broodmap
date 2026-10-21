@@ -232,6 +232,20 @@ impl TryFrom<u16> for ScoreKind {
     }
 }
 
+/// Returns whether a Deaths condition / SetDeaths action player id is outside the ids BW resolves
+/// to players (0-11) or expands as player groups (13-26). BW uses such an id directly as an offset
+/// into its death table, which is how EUD triggers address arbitrary memory.
+fn is_extended_deaths_player(player: u32) -> bool {
+    player == PlayerGroup::None as u32 || player > PlayerGroup::NonAlliedVictoryPlayers as u32
+}
+
+/// Returns whether a Deaths condition / SetDeaths action unit id is past BW's unit types and unit
+/// groups (229-232: any unit, men, buildings, factories), and so addresses memory outside the
+/// death table.
+fn is_extended_deaths_unit(unit_id: u16) -> bool {
+    unit_id > 232
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeathsTriggerCondition {
     Normal {
@@ -424,8 +438,8 @@ impl TriggerCondition {
                 amount,
             },
             15 => {
-                let player_extended = player_group == 12 || player_group > 26;
-                let unit_extended = unit_id > 232;
+                let player_extended = is_extended_deaths_player(player_group);
+                let unit_extended = is_extended_deaths_unit(unit_id);
                 let mask = if eud_mask {
                     Some(location_or_bitmask)
                 } else {
@@ -1137,8 +1151,8 @@ impl RawTriggerAction {
                 location: location_or_bitmask,
             },
             45 => {
-                let player_extended = player_group_a == 12 || player_group_a > 26;
-                let unit_extended = unit_id_or_type > 232;
+                let player_extended = is_extended_deaths_player(player_group_a);
+                let unit_extended = is_extended_deaths_unit(unit_id_or_type);
                 let mask = if eud_mask {
                     Some(location_or_bitmask)
                 } else {
@@ -1392,6 +1406,12 @@ fn trigger_action_string_id(action: RawTriggerAction) -> Option<StringId> {
     }
 }
 
+const TRIGGER_SIZE: usize = 2400;
+const CONDITION_SIZE: usize = 20;
+const CONDITIONS_SIZE: usize = 16 * CONDITION_SIZE;
+const ACTION_SIZE: usize = 32;
+const ACTIONS_SIZE: usize = 64 * ACTION_SIZE;
+
 fn scan_action_string_id(action: &[u8]) -> Option<StringId> {
     debug_assert_eq!(action.len(), 32);
     let action_type = action[26];
@@ -1414,11 +1434,6 @@ fn scan_action_string_id(action: &[u8]) -> Option<StringId> {
 /// The action-specific validity checks mirror [`trigger_action_data`], so malformed actions are
 /// excluded in the same way as [`read_triggers`].
 pub(crate) fn scan_used_string_ids(data: &[u8]) -> impl Iterator<Item = StringId> + '_ {
-    const TRIGGER_SIZE: usize = 2400;
-    const CONDITIONS_SIZE: usize = 16 * 20;
-    const ACTION_SIZE: usize = 32;
-    const ACTIONS_SIZE: usize = 64 * ACTION_SIZE;
-
     data.as_chunks::<TRIGGER_SIZE>()
         .0
         .iter()
@@ -1429,6 +1444,47 @@ pub(crate) fn scan_used_string_ids(data: &[u8]) -> impl Iterator<Item = StringId
                 .iter()
                 .filter_map(|action| scan_action_string_id(action))
         })
+}
+
+const DEATHS_CONDITION: u8 = 15;
+const SET_DEATHS_ACTION: u8 = 45;
+
+/// Returns whether a raw Deaths condition / SetDeaths action is one SC:R classifies as an EUD: its
+/// comparison/number operation byte is below 12 and its player or unit id is extended. This is a
+/// wider range than the comparisons (0, 1, 10) and number operations (7, 8, 9) BW executes, which
+/// is why it has to be checked on the raw bytes rather than on parsed conditions/actions.
+fn is_eud_deaths_entry(player: u32, unit_id: u16, comparison_or_operation: u8) -> bool {
+    comparison_or_operation < 12
+        && (is_extended_deaths_player(player) || is_extended_deaths_unit(unit_id))
+}
+
+/// Returns whether any complete trigger record contains a Deaths condition or SetDeaths action
+/// that SC:R classifies as an EUD (see [`is_eud_deaths_entry`]). Disabled conditions/actions count,
+/// as do ones [`read_triggers`] discards because their comparison or number operation isn't one BW
+/// executes.
+pub(crate) fn scan_uses_eud(data: &[u8]) -> bool {
+    data.as_chunks::<TRIGGER_SIZE>().0.iter().any(|trigger| {
+        let conditions = trigger[..CONDITIONS_SIZE].as_chunks::<CONDITION_SIZE>().0;
+        let actions = trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
+            .as_chunks::<ACTION_SIZE>()
+            .0;
+
+        conditions.iter().any(|condition| {
+            condition[15] == DEATHS_CONDITION
+                && is_eud_deaths_entry(
+                    u32::from_le_bytes(condition[4..8].try_into().unwrap()),
+                    u16::from_le_bytes(condition[12..14].try_into().unwrap()),
+                    condition[14],
+                )
+        }) || actions.iter().any(|action| {
+            action[26] == SET_DEATHS_ACTION
+                && is_eud_deaths_entry(
+                    u32::from_le_bytes(action[16..20].try_into().unwrap()),
+                    u16::from_le_bytes(action[24..26].try_into().unwrap()),
+                    action[27],
+                )
+        })
+    })
 }
 
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
@@ -1469,5 +1525,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn deaths_condition(player: u32, unit_id: u16) -> [u8; 20] {
+        let mut condition = [0u8; 20];
+        condition[4..8].copy_from_slice(&player.to_le_bytes());
+        condition[8..12].copy_from_slice(&5u32.to_le_bytes());
+        condition[12..14].copy_from_slice(&unit_id.to_le_bytes());
+        condition[14] = NumericComparison::AtLeast as u8;
+        condition[15] = 15;
+        condition
+    }
+
+    fn set_deaths_action(player: u32, unit_id: u16) -> [u8; 32] {
+        let mut action = [0u8; 32];
+        action[16..20].copy_from_slice(&player.to_le_bytes());
+        action[20..24].copy_from_slice(&5u32.to_le_bytes());
+        action[24..26].copy_from_slice(&unit_id.to_le_bytes());
+        action[26] = 45;
+        action[27] = NumberOperation::SetTo as u8;
+        action
+    }
+
+    fn trigger_with_condition(slot: usize, condition: &[u8; 20]) -> Vec<u8> {
+        let mut trigger = vec![0u8; TRIGGER_SIZE];
+        trigger[slot * CONDITION_SIZE..(slot + 1) * CONDITION_SIZE].copy_from_slice(condition);
+        trigger
+    }
+
+    fn trigger_with_action(slot: usize, action: &[u8; 32]) -> Vec<u8> {
+        let mut trigger = vec![0u8; TRIGGER_SIZE];
+        let start = CONDITIONS_SIZE + slot * ACTION_SIZE;
+        trigger[start..start + 32].copy_from_slice(action);
+        trigger
+    }
+
+    #[test]
+    fn uses_eud_false_without_eud_triggers() {
+        assert!(!scan_uses_eud(&[]));
+        assert!(!scan_uses_eud(&[0u8; TRIGGER_SIZE * 2]));
+
+        let mut data = trigger_with_condition(0, &deaths_condition(0, 0));
+        data.extend(trigger_with_action(
+            0,
+            &set_deaths_action(PlayerGroup::CurrentPlayer as u32, 232),
+        ));
+        assert!(!scan_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_detects_extended_deaths_condition() {
+        let data = trigger_with_condition(3, &deaths_condition(0xFFFF_FF1B, 0));
+        assert!(scan_uses_eud(&data));
+        let data = trigger_with_condition(15, &deaths_condition(0, 0x1234));
+        assert!(scan_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_detects_extended_set_deaths_action() {
+        let data = trigger_with_action(10, &set_deaths_action(12, 0));
+        assert!(scan_uses_eud(&data));
+        let data = trigger_with_action(63, &set_deaths_action(0, 233));
+        assert!(scan_uses_eud(&data));
+    }
+
+    #[test]
+    fn uses_eud_threshold_boundaries() {
+        let cases: [(u32, u16, bool); 10] = [
+            (11, 0, false),
+            (12, 0, true),
+            (13, 0, false),
+            (26, 0, false),
+            (27, 0, true),
+            (0x100, 0, true),
+            (0, 228, false),
+            (0, 232, false),
+            (0, 233, true),
+            (0, u16::MAX, true),
+        ];
+        for (player, unit_id, expected) in cases {
+            let condition = trigger_with_condition(0, &deaths_condition(player, unit_id));
+            assert_eq!(scan_uses_eud(&condition), expected, "{player} {unit_id}");
+            let action = trigger_with_action(0, &set_deaths_action(player, unit_id));
+            assert_eq!(scan_uses_eud(&action), expected, "{player} {unit_id}");
+        }
+    }
+
+    #[test]
+    fn uses_eud_accepts_any_comparison_or_modifier_below_12() {
+        let cases: [(u32, u8, bool); 7] = [
+            (0x100, NumericComparison::AtLeast as u8, true),
+            (27, 2, true),
+            (27, 0, true),
+            (27, 11, true),
+            (27, 12, false),
+            (27, u8::MAX, false),
+            (0, 2, false),
+        ];
+        for (player, value, expected) in cases {
+            let mut condition = deaths_condition(player, 0);
+            condition[14] = value;
+            let condition = trigger_with_condition(0, &condition);
+            assert_eq!(scan_uses_eud(&condition), expected, "{player} {value}");
+
+            let mut action = set_deaths_action(player, 0);
+            action[27] = value;
+            let action = trigger_with_action(0, &action);
+            assert_eq!(scan_uses_eud(&action), expected, "{player} {value}");
+        }
+    }
+
+    #[test]
+    fn uses_eud_ignores_other_condition_and_action_types() {
+        // Command (2) and Kill Unit (22) keep player/unit ids at the same offsets.
+        let mut condition = deaths_condition(27, 233);
+        condition[15] = 2;
+        assert!(!scan_uses_eud(&trigger_with_condition(0, &condition)));
+        let mut action = set_deaths_action(27, 233);
+        action[26] = 22;
+        assert!(!scan_uses_eud(&trigger_with_action(0, &action)));
+    }
+
+    #[test]
+    fn uses_eud_counts_disabled_entries_and_entries_after_empty_slots() {
+        let mut condition = deaths_condition(27, 0);
+        condition[17] = ConditionFlags::DISABLED.bits();
+        assert!(scan_uses_eud(&trigger_with_condition(8, &condition)));
+        let mut action = set_deaths_action(27, 0);
+        action[28] = ActionFlags::DISABLED.bits();
+        assert!(scan_uses_eud(&trigger_with_action(40, &action)));
+    }
+
+    #[test]
+    fn uses_eud_scans_every_trigger_and_ignores_trailing_partial_trigger() {
+        let eud = trigger_with_action(0, &set_deaths_action(27, 0));
+
+        let mut data = vec![0u8; TRIGGER_SIZE * 2];
+        data.extend(&eud);
+        assert!(scan_uses_eud(&data));
+
+        let mut data = vec![0u8; TRIGGER_SIZE];
+        data.extend(&eud[..TRIGGER_SIZE - 1]);
+        assert!(!scan_uses_eud(&data));
     }
 }
