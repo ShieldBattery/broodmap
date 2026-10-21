@@ -19,6 +19,15 @@ pub struct ResourceLimits {
     pub max_mpq_table_entries: usize,
     /// Maximum declared and extracted size of one file in an MPQ archive.
     pub max_mpq_file_bytes: usize,
+    /// Maximum expansion ratio of an MPQ sector (default: 500).
+    ///
+    /// Each decompression stage, including intermediate stages and compatibility zero-padding,
+    /// may produce at most `max(4096, compressed_sector_bytes * ratio)` bytes. The input size is
+    /// the original sector's actual bytes, including its compression mask, not an intermediate
+    /// stage's size or the archive's advertised length. The 4 KiB allowance preserves ordinary
+    /// small sectors. Absolute file/output limits still apply. Use `usize::MAX` to disable this
+    /// ratio limit; zero permits only the 4 KiB allowance.
+    pub max_mpq_compression_ratio: usize,
     /// Maximum number of sectors used to represent one MPQ file.
     pub max_mpq_file_sectors: usize,
     /// Maximum size of raw CHK data passed to [`crate::Chk::from_bytes`].
@@ -32,6 +41,15 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    pub(crate) fn mpq_sector_expansion_limit(&self, compressed_bytes: usize) -> usize {
+        if self.max_mpq_compression_ratio == usize::MAX {
+            return usize::MAX;
+        }
+        compressed_bytes
+            .saturating_mul(self.max_mpq_compression_ratio)
+            .max(4096)
+    }
+
     /// Limits for trusted local inputs, preserving the parser's previous effective behavior.
     ///
     /// This profile must not be used for network-provided or otherwise untrusted data.
@@ -40,6 +58,7 @@ impl ResourceLimits {
             max_map_bytes: usize::MAX,
             max_mpq_table_entries: usize::MAX,
             max_mpq_file_bytes: usize::MAX,
+            max_mpq_compression_ratio: usize::MAX,
             max_mpq_file_sectors: usize::MAX,
             max_chk_bytes: usize::MAX,
             max_chk_chunks: usize::MAX,
@@ -55,6 +74,7 @@ impl Default for ResourceLimits {
             max_map_bytes: 256 * MIB,
             max_mpq_table_entries: 512 * 1024,
             max_mpq_file_bytes: 64 * MIB,
+            max_mpq_compression_ratio: 500,
             max_mpq_file_sectors: 128 * 1024,
             max_chk_bytes: 64 * MIB,
             max_chk_chunks: 64 * 1024,
@@ -74,6 +94,7 @@ pub enum Resource {
     MpqFileBytes,
     MpqFileSectors,
     MpqSectorOutput,
+    MpqSectorExpansion,
     ChkBytes,
     ChkChunks,
     ChkChunksPerTag,
@@ -89,6 +110,7 @@ impl Display for Resource {
             Self::MpqFileBytes => "MPQ file bytes",
             Self::MpqFileSectors => "MPQ file sectors",
             Self::MpqSectorOutput => "MPQ sector output",
+            Self::MpqSectorExpansion => "MPQ sector expansion bytes",
             Self::ChkBytes => "CHK bytes",
             Self::ChkChunks => "CHK chunks",
             Self::ChkChunksPerTag => "CHK chunks per tag",

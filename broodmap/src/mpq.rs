@@ -480,6 +480,7 @@ fn decompress_sector_into(
     data: &[u8],
     max_output: usize,
     max_append: usize,
+    max_expansion: usize,
     output: &mut Vec<u8>,
 ) -> Result<usize, MpqError> {
     if data.len() <= 1 {
@@ -508,12 +509,12 @@ fn decompress_sector_into(
         decompress_with(
             compression,
             input.as_ref(),
-            &mut SectorOutput::new(max_output, max_output, &mut next),
+            &mut SectorOutput::new(max_output, max_output, max_expansion, &mut next),
         )?;
         input = Cow::from(next);
     }
 
-    let mut sink = SectorOutput::new(max_output, max_append, output);
+    let mut sink = SectorOutput::new(max_output, max_append, max_expansion, output);
     decompress_with(last, input.as_ref(), &mut sink)?;
     Ok(sink.decompressed_len)
 }
@@ -536,16 +537,23 @@ fn decompress_with(
 struct SectorOutput<'a> {
     max_output: usize,
     max_append: usize,
+    max_expansion: usize,
     decompressed_len: usize,
     appended_len: usize,
     output: &'a mut Vec<u8>,
 }
 
 impl<'a> SectorOutput<'a> {
-    fn new(max_output: usize, max_append: usize, output: &'a mut Vec<u8>) -> Self {
+    fn new(
+        max_output: usize,
+        max_append: usize,
+        max_expansion: usize,
+        output: &'a mut Vec<u8>,
+    ) -> Self {
         Self {
             max_output,
             max_append,
+            max_expansion,
             decompressed_len: 0,
             appended_len: 0,
             output,
@@ -566,6 +574,11 @@ impl<'a> SectorOutput<'a> {
             self.decompressed_len,
             self.max_output,
         )?;
+        ensure_within(
+            Resource::MpqSectorExpansion,
+            self.decompressed_len,
+            self.max_expansion,
+        )?;
 
         let append_len = data
             .len()
@@ -583,9 +596,10 @@ fn explode_into(
     data: &[u8],
     max_output: usize,
     max_append: usize,
+    max_expansion: usize,
     output: &mut Vec<u8>,
 ) -> Result<usize, MpqError> {
-    let mut sink = SectorOutput::new(max_output, max_append, output);
+    let mut sink = SectorOutput::new(max_output, max_append, max_expansion, output);
     explode_to(data, &mut sink)?;
     Ok(sink.decompressed_len)
 }
@@ -658,14 +672,26 @@ fn bunzip_to(data: &[u8], sink: &mut SectorOutput<'_>) -> Result<(), MpqError> {
 #[cfg(test)]
 fn explode_data(data: &[u8], max_output: usize) -> Result<Vec<u8>, MpqError> {
     let mut result = Vec::new();
-    explode_into(data, max_output, max_output, &mut result)?;
+    explode_into(
+        data,
+        max_output,
+        max_output,
+        ResourceLimits::default().mpq_sector_expansion_limit(data.len()),
+        &mut result,
+    )?;
     Ok(result)
 }
 
 #[cfg(test)]
 fn decompress_sector(data: &[u8], max_output: usize) -> Result<Vec<u8>, MpqError> {
     let mut result = Vec::new();
-    decompress_sector_into(data, max_output, max_output, &mut result)?;
+    decompress_sector_into(
+        data,
+        max_output,
+        max_output,
+        ResourceLimits::default().mpq_sector_expansion_limit(data.len()),
+        &mut result,
+    )?;
     Ok(result)
 }
 
@@ -905,9 +931,8 @@ impl<'a> Mpq<'a> {
 
         let mut bytes_left = block.size as usize;
         let mut result = Vec::new();
-        result
-            .try_reserve_exact(bytes_left)
-            .map_err(|_| allocation_error(Resource::MpqFileBytes, bytes_left))?;
+        // Grow only after checking actual output. Reserving the attacker-declared file size
+        // here would allocate up to the file ceiling before the first ratio check.
 
         // NOTE(tec27): BW is okay with file data being truncated by the end of the file, so we
         // reproduce that handling
@@ -946,6 +971,9 @@ impl<'a> Mpq<'a> {
 
             let end = start.saturating_add(cur_sector_size).min(self.data.len());
             let mut sector = Cow::from(&self.data[start..end]);
+            // Use actual input bytes, not offsets that may extend beyond EOF. Reuse this budget
+            // for every codec stage and any zero-padding; intermediate ratios must not compound.
+            let max_expansion = self.limits.mpq_sector_expansion_limit(sector.len());
             // MPQ compressors normally expand every sector to the archive's full sector size,
             // including the final sector; the final output is truncated to the file's declared
             // length below. Keep that compatibility while still applying the file-wide ceiling.
@@ -956,13 +984,28 @@ impl<'a> Mpq<'a> {
                 sector = Cow::from(d.decrypt_bytes(sector.as_ref()));
             }
             let sector_output_len = if sector_compressed {
-                decompress_sector_into(sector.as_ref(), expected_output, bytes_left, &mut result)?
+                decompress_sector_into(
+                    sector.as_ref(),
+                    expected_output,
+                    bytes_left,
+                    max_expansion,
+                    &mut result,
+                )?
             } else if sector_imploded {
-                explode_into(sector.as_ref(), expected_output, bytes_left, &mut result)?
+                explode_into(
+                    sector.as_ref(),
+                    expected_output,
+                    bytes_left,
+                    max_expansion,
+                    &mut result,
+                )?
             } else {
                 // Some protectors add extra data past the file's stated length. Truncate it while
                 // appending to the final buffer.
                 let slice_len = sector.len().min(bytes_left);
+                result
+                    .try_reserve(slice_len)
+                    .map_err(|_| allocation_error(Resource::MpqFileBytes, slice_len))?;
                 result.extend_from_slice(&sector[..slice_len]);
                 sector.len()
             };
@@ -973,6 +1016,7 @@ impl<'a> Mpq<'a> {
             // give sectorSize bytes anyway, so we need to pad the buffer in those cases.
             let is_last_sector = i == sector_table.len() - 2;
             if !is_last_sector && sector_output_len < sector_size {
+                ensure_within(Resource::MpqSectorExpansion, sector_size, max_expansion)?;
                 let padding = sector_size - sector_output_len;
                 let new_len =
                     result
@@ -1761,6 +1805,7 @@ mod tests {
             &sector(COMPRESSION_ZLIB, &zlib(&data)),
             4096,
             100,
+            usize::MAX,
             &mut output,
         ));
         assert_eq!(decompressed_len, 4096);
@@ -1847,5 +1892,294 @@ mod tests {
         };
 
         assert_eq!(assert_ok!(mpq.read_file(CHK_PATH, None)), contents);
+    }
+    // One-sector compressed archives or arbitrary raw archives, exercising the public extraction
+    // path while keeping metadata construction independent of the archive parser.
+    fn ratio_archive_read(
+        payload: &[u8],
+        flags: MpqBlockFlags,
+        sector_size_shift: u16,
+        declared_size: u32,
+        limits: ResourceLimits,
+    ) -> Result<Vec<u8>, MpqError> {
+        let mut data = Vec::new();
+        if flags.intersects(MpqBlockFlags::COMPRESSED | MpqBlockFlags::IMPLODED) {
+            assert!(declared_size as usize <= 512usize << sector_size_shift);
+            data.extend_from_slice(&8u32.to_le_bytes());
+            data.extend_from_slice(&(8 + payload.len() as u32).to_le_bytes());
+        }
+        data.extend_from_slice(payload);
+        let mpq = Mpq {
+            data: &data,
+            header: MpqHeader {
+                offset: 0,
+                sector_size_shift,
+                hash_table_pos: 0,
+                block_table_pos: 0,
+                hash_table_size: 1,
+                block_table_size: 1,
+            },
+            hash_table: vec![MpqHashTableEntry {
+                hash_a: hash_str(CHK_PATH, MpqHashType::NameA),
+                hash_b: hash_str(CHK_PATH, MpqHashType::NameB),
+                locale: 0,
+                platform: 0,
+                block_index: 0,
+            }],
+            block_table: vec![MpqBlockTableEntry {
+                offset: 0,
+                compressed_size: data.len() as u32,
+                size: declared_size,
+                flags: flags | MpqBlockFlags::EXISTS,
+            }],
+            limits,
+        };
+        mpq.read_file(CHK_PATH, None)
+    }
+
+    fn assert_expansion_limit<T>(result: Result<T, MpqError>, expected: usize) {
+        // A regression may return megabytes of output; report only whether it succeeded.
+        let result = result.map(|_| ());
+        assert!(
+            matches!(result, Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                resource: Resource::MpqSectorExpansion, limit, observed,
+            })) if limit == expected && observed > limit),
+            "{result:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::zlib(COMPRESSION_ZLIB)]
+    #[case::bzip2(COMPRESSION_BZIP2)]
+    #[case::masked_implode(COMPRESSION_IMPLODE)]
+    #[case::legacy_implode(0)]
+    fn read_file_enforces_ratio_for_every_codec(#[case] mask: u8) {
+        let contents = sample_data(8192);
+        let encoded = match mask {
+            COMPRESSION_ZLIB => zlib(&contents),
+            COMPRESSION_BZIP2 => bzip2(&contents),
+            _ => implode_literals(&contents),
+        };
+        let (payload, flags) = if mask == 0 {
+            (encoded, MpqBlockFlags::IMPLODED)
+        } else {
+            (sector(mask, &encoded), MpqBlockFlags::COMPRESSED)
+        };
+        // Zero allows only the 4 KiB floor, including literal-only implode streams.
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 0,
+            ..ResourceLimits::default()
+        };
+        assert_expansion_limit(ratio_archive_read(&payload, flags, 5, 16384, limits), 4096);
+        assert_eq!(
+            assert_ok!(ratio_archive_read(
+                &payload,
+                flags,
+                5,
+                16384,
+                ResourceLimits::trusted()
+            )),
+            contents
+        );
+    }
+
+    #[test]
+    fn default_ratio_rejects_small_bzip2_bomb_below_absolute_limit() {
+        let contents = vec![0; 4 * 1024 * 1024];
+        let payload = sector(COMPRESSION_BZIP2, &bzip2(&contents));
+        assert!(payload.len() < 128, "expected a tiny compressed fixture");
+        let flags = MpqBlockFlags::COMPRESSED;
+        let size = contents.len() as u32;
+        let limits = ResourceLimits::default();
+        assert_expansion_limit(
+            ratio_archive_read(&payload, flags, 13, size, limits),
+            payload.len() * limits.max_mpq_compression_ratio,
+        );
+        let relaxed = ResourceLimits {
+            max_mpq_compression_ratio: 100_000,
+            ..limits
+        };
+        assert_eq!(
+            assert_ok!(ratio_archive_read(&payload, flags, 13, size, relaxed)),
+            contents
+        );
+    }
+
+    #[test]
+    fn ratio_budget_uses_original_sector_across_stages() {
+        let contents = sample_data(16384);
+        let mut inner = zlib(&contents);
+        // Trailing bytes are accepted after zlib's stream end. They let the first decoder
+        // expand to exactly the allowance while the final decoder expands beyond it.
+        inner.resize(4096, 0);
+        let payload = sector(COMPRESSION_BZIP2 | COMPRESSION_ZLIB, &bzip2(&inner));
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 4,
+            ..ResourceLimits::default()
+        };
+        assert!(payload.len() * 4 < 4096);
+        assert_eq!(
+            assert_ok!(ratio_archive_read(
+                &payload,
+                MpqBlockFlags::COMPRESSED,
+                5,
+                16384,
+                ResourceLimits::trusted(),
+            )),
+            contents
+        );
+        // Resetting the denominator to the intermediate 4096 bytes would allow all 16384.
+        assert_expansion_limit(
+            ratio_archive_read(&payload, MpqBlockFlags::COMPRESSED, 5, 16384, limits),
+            4096,
+        );
+    }
+
+    #[test]
+    fn ratio_rejects_intermediate_expansion_before_invalid_next_codec() {
+        let payload = sector(COMPRESSION_BZIP2 | COMPRESSION_ZLIB, &bzip2(&[0; 8192]));
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 4,
+            ..ResourceLimits::default()
+        };
+        // The expanded bytes are not zlib. An error from zlib would mean the first stage
+        // was materialized without enforcing its expansion budget.
+        assert_expansion_limit(
+            ratio_archive_read(&payload, MpqBlockFlags::COMPRESSED, 5, 16384, limits),
+            4096,
+        );
+    }
+
+    #[rstest]
+    #[case::zlib(COMPRESSION_ZLIB, zlib(&sample_data(8192)))]
+    #[case::bzip2(COMPRESSION_BZIP2, bzip2(&sample_data(8192)))]
+    #[case::implode(COMPRESSION_IMPLODE, implode_literals(&sample_data(8192)))]
+    fn truncating_retained_output_does_not_bypass_ratio(
+        #[case] mask: u8,
+        #[case] encoded: Vec<u8>,
+    ) {
+        let mut output = Vec::new();
+        assert_expansion_limit(
+            decompress_sector_into(&sector(mask, &encoded), 16384, 1, 4096, &mut output),
+            4096,
+        );
+        assert!(output.len() <= 1);
+    }
+
+    #[test]
+    fn ratio_small_sector_allowance_includes_boundary_only() {
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 0,
+            ..ResourceLimits::default()
+        };
+        for len in [4096, 4097] {
+            let contents = vec![0; len];
+            let payload = sector(COMPRESSION_ZLIB, &zlib(&contents));
+            let result = ratio_archive_read(&payload, MpqBlockFlags::COMPRESSED, 4, 8192, limits);
+            if len == 4096 {
+                assert_eq!(assert_ok!(result), contents);
+            } else {
+                assert_expansion_limit(result, 4096);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::truncated_first_sector(vec![7], 8193, 8192)]
+    #[case::empty_second_sector(vec![7; 8192], 16385, 16384)]
+    fn compatibility_padding_uses_actual_bytes_and_respects_ratio(
+        #[case] payload: Vec<u8>,
+        #[case] declared_size: u32,
+        #[case] trusted_size: usize,
+    ) {
+        // Raw sector offsets advertise 8192 bytes even when EOF leaves only one or zero.
+        assert_expansion_limit(
+            ratio_archive_read(
+                &payload,
+                MpqBlockFlags::empty(),
+                4,
+                declared_size,
+                ResourceLimits::default(),
+            ),
+            4096,
+        );
+        let result = assert_ok!(ratio_archive_read(
+            &payload,
+            MpqBlockFlags::empty(),
+            4,
+            declared_size,
+            ResourceLimits::trusted(),
+        ));
+        assert_eq!(result.len(), trusted_size);
+        assert_eq!(&result[..payload.len()], payload);
+        assert!(result[payload.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn ratio_limit_above_allowance_accepts_exact_boundary() {
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 2,
+            ..ResourceLimits::default()
+        };
+        for len in [10000, 10001] {
+            let contents = vec![0; len];
+            let mut payload = sector(COMPRESSION_ZLIB, &zlib(&contents));
+            // Count all actual original sector bytes, including bytes after the stream.
+            payload.resize(5000, 0);
+            let result = ratio_archive_read(&payload, MpqBlockFlags::COMPRESSED, 5, 16384, limits);
+            if len == 10000 {
+                assert_eq!(assert_ok!(result), contents);
+            } else {
+                assert_expansion_limit(result, 10000);
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_counts_decoded_bytes_and_padding_together() {
+        let payload = vec![7; 4096];
+        let limits = ResourceLimits {
+            max_mpq_compression_ratio: 1,
+            ..ResourceLimits::default()
+        };
+        // The copied bytes and the padding each fit separately, but together occupy 8192 bytes.
+        assert_expansion_limit(
+            ratio_archive_read(&payload, MpqBlockFlags::empty(), 4, 8193, limits),
+            4096,
+        );
+    }
+
+    #[test]
+    fn large_ratios_saturate_without_disabling_absolute_limits() {
+        let contents = sample_data(8192);
+        let payload = sector(COMPRESSION_ZLIB, &zlib(&contents));
+        for ratio in [usize::MAX - 1, usize::MAX] {
+            let limits = ResourceLimits {
+                max_mpq_compression_ratio: ratio,
+                ..ResourceLimits::default()
+            };
+            assert_eq!(
+                assert_ok!(ratio_archive_read(
+                    &payload,
+                    MpqBlockFlags::COMPRESSED,
+                    5,
+                    16384,
+                    limits,
+                )),
+                contents
+            );
+            let limited = ResourceLimits {
+                max_mpq_file_bytes: 1024,
+                ..limits
+            };
+            assert!(matches!(
+                ratio_archive_read(&payload, MpqBlockFlags::COMPRESSED, 5, 16384, limited,),
+                Err(MpqError::ResourceLimit(ResourceLimitError::Exceeded {
+                    resource: Resource::MpqFileBytes,
+                    limit: 1024,
+                    ..
+                }))
+            ));
+        }
     }
 }
