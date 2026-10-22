@@ -42,13 +42,6 @@ const START_ASSOCIATION_PIXELS: i64 = 6 * PIXELS_PER_TILE;
 const SEARCH_RADIUS_TILES: i64 = 12;
 const RESOURCE_GAP_PIXELS: i64 = 3 * PIXELS_PER_TILE;
 
-#[cfg(test)]
-thread_local! {
-    /// Uncertain selections this thread re-scored without pruning, so tests can tell that path
-    /// was exercised.
-    static UNCERTAIN_RESCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 /// Logical map pixels, with the origin at the top-left corner.
 pub struct PixelPosition {
@@ -181,10 +174,11 @@ pub fn discover_bases(
     starts: &[PixelPosition],
     options: &BaseSearchOptions,
 ) -> Result<BaseDiscovery, BaseError> {
-    discover(terrain, resources, obstacles, starts, options, true)
+    discover(terrain, resources, obstacles, starts, options, true).map(|(discovery, _)| discovery)
 }
 
-/// `prune` only changes how much scoring work is done, never the result.
+/// `prune` only changes how much scoring work is done, never the result. Also returns how many
+/// fields selection had to re-score without pruning because a taken optimum left them uncertain.
 fn discover(
     terrain: &TerrainGrid,
     resources: &[ResourceNode],
@@ -192,7 +186,7 @@ fn discover(
     starts: &[PixelPosition],
     options: &BaseSearchOptions,
     prune: bool,
-) -> Result<BaseDiscovery, BaseError> {
+) -> Result<(BaseDiscovery, usize), BaseError> {
     if !terrain.width().is_multiple_of(WALK_CELLS_PER_TILE)
         || !terrain.height().is_multiple_of(WALK_CELLS_PER_TILE)
     {
@@ -256,11 +250,12 @@ fn discover(
         });
     }
     if catalog.is_empty() {
-        return Ok(BaseDiscovery {
+        let discovery = BaseDiscovery {
             bases: Vec::new(),
             unplaced_clusters: 0,
             ignored_resources,
-        });
+        };
+        return Ok((discovery, 0));
     }
 
     let permanent_bounds: Vec<_> = catalog
@@ -295,11 +290,12 @@ fn discover(
         }
     }
     if mining.is_empty() {
-        return Ok(BaseDiscovery {
+        let discovery = BaseDiscovery {
             bases: Vec::new(),
             unplaced_clusters: 0,
             ignored_resources,
-        });
+        };
+        return Ok((discovery, 0));
     }
 
     let mut scoring = ScoringScratch::new(terrain.cells().len());
@@ -367,6 +363,7 @@ fn discover(
         .sort_by_key(|&index| (!start_owners.values().any(|owner| owner.2 == index), index));
     let mut used_tiles = HashSet::new();
     let mut selected_cluster_indices = Vec::new();
+    let mut uncertain_rescores = 0;
     for cluster_index in cluster_order {
         let chosen = match scored_clusters[cluster_index].choose(
             cluster_index,
@@ -376,8 +373,7 @@ fn discover(
             Ok(chosen) => chosen,
             Err(Uncertain) => {
                 // A taken optimum exposed candidates that scoring skipped; score every one.
-                #[cfg(test)]
-                UNCERTAIN_RESCORES.with(|count| count.set(count.get() + 1));
+                uncertain_rescores += 1;
                 let cluster = std::mem::take(&mut scored_clusters[cluster_index].cluster);
                 scored_clusters[cluster_index] =
                     context.score_cluster(cluster, &mut scoring, false);
@@ -460,5 +456,5 @@ fn discover(
     result
         .bases
         .sort_by_key(|base| (base.depot_tile.y, base.depot_tile.x));
-    Ok(result)
+    Ok((result, uncertain_rescores))
 }

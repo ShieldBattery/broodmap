@@ -1,18 +1,25 @@
 use super::*;
-use crate::bases::{UNCERTAIN_RESCORES, discover};
+use crate::bases::discover;
 
-/// Discovery with pruned scoring must equal discovery that scores every candidate.
+/// Discovery with pruned scoring must equal discovery that scores every candidate. Returns the
+/// pruned discovery and how many of its fields were re-scored after an uncertain selection.
 fn discover_both(
     terrain: &TerrainGrid,
     resources: &[ResourceNode],
     obstacles: &[StaticObstacle],
     starts: &[PixelPosition],
     options: &BaseSearchOptions,
-) -> BaseDiscovery {
-    let pruned = discover(terrain, resources, obstacles, starts, options, true);
-    let exhaustive = discover(terrain, resources, obstacles, starts, options, false);
+) -> (BaseDiscovery, usize) {
+    let (pruned, rescores) =
+        discover(terrain, resources, obstacles, starts, options, true).unwrap();
+    let (exhaustive, exhaustive_rescores) =
+        discover(terrain, resources, obstacles, starts, options, false).unwrap();
     assert_eq!(pruned, exhaustive);
-    pruned.unwrap()
+    assert_eq!(
+        exhaustive_rescores, 0,
+        "fully scored fields are always certain"
+    );
+    (pruned, rescores)
 }
 
 #[test]
@@ -36,13 +43,14 @@ fn a_taken_optimum_rescores_pruned_candidates() {
         .into_iter()
         .flat_map(|top| [384, 416].map(|left| resource(left, top, ResourceKind::Mineral, None)))
         .collect();
-    let result = discover_both(
+    let (result, rescores) = discover_both(
         &terrain,
         &resources,
         &[],
         &[],
         &BaseSearchOptions::default(),
     );
+    assert_eq!(rescores, 1);
     let tiles: Vec<_> = result.bases.iter().map(|base| base.depot_tile).collect();
     assert_eq!(
         tiles,
@@ -211,7 +219,7 @@ fn contested_pockets_match_exhaustive_scoring() {
     let tiles = 32;
     let size = tiles * 4;
     let center = (tiles * 16) as i32;
-    UNCERTAIN_RESCORES.with(|count| count.set(0));
+    let mut rescores = 0;
     for _ in 0..200 {
         let pockets: Vec<_> = (0..2 + next(2))
             .map(|_| {
@@ -316,8 +324,7 @@ fn contested_pockets_match_exhaustive_scoring() {
             allow_start_obstacle_clearing: next(2) == 0,
             ..BaseSearchOptions::default()
         };
-        discover_both(&terrain, &resources, &obstacles, &starts, &options);
+        rescores += discover_both(&terrain, &resources, &obstacles, &starts, &options).1;
     }
-    let rescores = UNCERTAIN_RESCORES.with(|count| count.get());
     assert!(rescores >= 5, "uncertain selections re-scored: {rescores}");
 }
