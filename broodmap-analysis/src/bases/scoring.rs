@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use super::sweep::SweepGroup;
 use super::{
     BaseSearchOptions, PROXIMITY_MAX_COST, PixelPosition, ResourceKind, ResourceNode,
     candidates::{
@@ -87,6 +88,63 @@ impl GroupScores {
             self.values[slot] = bound;
         }
     }
+
+    /// Applies one flood's outcome to every member it wanted. `members` maps group members to
+    /// indices into `candidates`; without `pruned`, members the flood gave up on stay live.
+    fn record_flood(
+        &mut self,
+        members: &[usize],
+        candidates: &[CandidateLocation],
+        flood: &Flood<'_>,
+        pruned: Option<&mut Vec<PrunedCandidate>>,
+    ) {
+        let mut pruned = pruned;
+        for &member in flood.wanted {
+            let candidate = &candidates[members[member]];
+            if let Some(distance) = flood.scratch.target_distance(member) {
+                self.settle(member, flood.resource, distance, flood.key_weight);
+                continue;
+            }
+            match flood.end {
+                FloodEnd::GaveUp(cost) => {
+                    // Every unsettled cell is at least `cost` away, past this member's limit.
+                    // Probes stay live; a bounded member is pruned with its raised bound.
+                    self.raise(member, flood.resource, cost, flood.key_weight);
+                    let Some(pruned) = pruned.as_deref_mut() else {
+                        continue;
+                    };
+                    self.status[member] = MemberStatus::Pruned;
+                    pruned.push(PrunedCandidate {
+                        tile: candidate.tile,
+                        bound: (
+                            self.bounds[member],
+                            candidate.center_deviation,
+                            candidate.tile.y,
+                            candidate.tile.x,
+                        ),
+                    });
+                }
+                FloodEnd::Settled | FloodEnd::Exhausted | FloodEnd::OverBudget => {
+                    if candidate.exact_start {
+                        let slot = self.slot(member, flood.resource);
+                        self.known[slot] = Known::Unreachable;
+                    } else {
+                        self.status[member] = MemberStatus::Dead;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A finished flood from one cluster resource toward the group members it wanted; `scratch`
+/// holds the distances it settled.
+struct Flood<'a> {
+    resource: usize,
+    key_weight: u128,
+    wanted: &'a [usize],
+    end: FloodEnd,
+    scratch: &'a ScoringScratch,
 }
 
 impl ScoringContext<'_> {
@@ -139,6 +197,11 @@ impl ScoringContext<'_> {
                 &weights,
             );
         }
+        let resources: Vec<_> = cluster
+            .iter()
+            .zip(&weights)
+            .map(|(&mining_index, &weight)| (self.node(mining_index), weight))
+            .collect();
         // A fully connected candidate's key distance is the sum of these times its distances.
         let key_weights: Vec<_> = cluster
             .iter()
@@ -262,16 +325,13 @@ impl ScoringContext<'_> {
                     .map(|resource| resource.node.bounds),
             );
             // Exhaustive scoring sweeps every group: its cost does not depend on pruning.
+            let sweep = SweepGroup {
+                resources: &resources,
+                blockers: &blockers,
+                members: &members,
+            };
             if !prune {
-                self.sweep_group(
-                    scoring,
-                    &cluster,
-                    &weights,
-                    &blockers,
-                    &members,
-                    &mut candidates,
-                    &mut retained,
-                );
+                self.sweep_group(scoring, &sweep, &mut candidates, &mut retained);
                 continue;
             }
             let remaining: Vec<_> = blockers
@@ -372,17 +432,14 @@ impl ScoringContext<'_> {
                         break 'probes;
                     }
                     budget -= scoring.pops;
-                    self.record_flood(
-                        &mut scores,
-                        &members,
-                        &candidates,
+                    let flood = Flood {
                         resource,
-                        key_weights[resource],
-                        &wanted,
-                        scoring,
+                        key_weight: key_weights[resource],
+                        wanted: &wanted,
                         end,
-                        None,
-                    );
+                        scratch: scoring,
+                    };
+                    scores.record_flood(&members, &candidates, &flood, None);
                     if scores.status[probe] != MemberStatus::Live
                         || scores.known[slot] != Known::Distance
                     {
@@ -467,17 +524,14 @@ impl ScoringContext<'_> {
                     break;
                 }
                 budget -= scoring.pops;
-                self.record_flood(
-                    &mut scores,
-                    &members,
-                    &candidates,
+                let flood = Flood {
                     resource,
                     key_weight,
-                    &wanted,
-                    scoring,
+                    wanted: &wanted,
                     end,
-                    Some(&mut pruned),
-                );
+                    scratch: scoring,
+                };
+                scores.record_flood(&members, &candidates, &flood, Some(&mut pruned));
                 for &member in &wanted {
                     let candidate = &candidates[members[member]];
                     if scores.status[member] == MemberStatus::Live
@@ -496,15 +550,7 @@ impl ScoringContext<'_> {
                 // Score the whole group exactly instead. Its pruned entries are superseded, and
                 // its exact keys are valid incumbents.
                 pruned.truncate(pruned_before);
-                let best = self.sweep_group(
-                    scoring,
-                    &cluster,
-                    &weights,
-                    &blockers,
-                    &members,
-                    &mut candidates,
-                    &mut retained,
-                );
+                let best = self.sweep_group(scoring, &sweep, &mut candidates, &mut retained);
                 if let Some(best) = best {
                     incumbent = Some(incumbent.map_or(best, |old| old.min(best)));
                 }
@@ -559,58 +605,6 @@ impl ScoringContext<'_> {
             pruned,
             mineral_weight_total,
             gas_weight_total,
-        }
-    }
-
-    /// Applies one flood's outcome to every member it wanted.
-    #[allow(clippy::too_many_arguments)]
-    fn record_flood(
-        &self,
-        scores: &mut GroupScores,
-        members: &[usize],
-        candidates: &[CandidateLocation],
-        resource: usize,
-        key_weight: u128,
-        wanted: &[usize],
-        scoring: &ScoringScratch,
-        end: FloodEnd,
-        pruned: Option<&mut Vec<PrunedCandidate>>,
-    ) {
-        let mut pruned = pruned;
-        for &member in wanted {
-            let candidate = &candidates[members[member]];
-            if let Some(distance) = scoring.target_distance(member) {
-                scores.settle(member, resource, distance, key_weight);
-                continue;
-            }
-            match end {
-                FloodEnd::GaveUp(cost) => {
-                    // Every unsettled cell is at least `cost` away, past this member's limit.
-                    // Probes stay live; a bounded member is pruned with its raised bound.
-                    scores.raise(member, resource, cost, key_weight);
-                    let Some(pruned) = pruned.as_deref_mut() else {
-                        continue;
-                    };
-                    scores.status[member] = MemberStatus::Pruned;
-                    pruned.push(PrunedCandidate {
-                        tile: candidate.tile,
-                        bound: (
-                            scores.bounds[member],
-                            candidate.center_deviation,
-                            candidate.tile.y,
-                            candidate.tile.x,
-                        ),
-                    });
-                }
-                FloodEnd::Settled | FloodEnd::Exhausted | FloodEnd::OverBudget => {
-                    if candidate.exact_start {
-                        let slot = scores.slot(member, resource);
-                        scores.known[slot] = Known::Unreachable;
-                    } else {
-                        scores.status[member] = MemberStatus::Dead;
-                    }
-                }
-            }
         }
     }
 }

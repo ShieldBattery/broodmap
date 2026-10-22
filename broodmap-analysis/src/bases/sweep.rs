@@ -10,23 +10,28 @@ use super::{
 };
 use crate::{PixelRect, TerrainGrid, WalkPosition};
 
+/// One removal-set group's sweep inputs: the field's resources with their weights, the objects
+/// that stay in place, and the group's member candidate indices.
+pub(super) struct SweepGroup<'a> {
+    pub(super) resources: &'a [(ResourceNode, u64)],
+    pub(super) blockers: &'a [PixelRect],
+    pub(super) members: &'a [usize],
+}
+
 impl ScoringContext<'_> {
     /// Scores every member of one removal-set group exactly, as the reference algorithm does, with
     /// lane-parallel sweeps, and marks the members it retains. Returns the best selection key
     /// among fully connected ordinary members.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn sweep_group(
         &self,
         scoring: &mut ScoringScratch,
-        cluster: &[usize],
-        weights: &[u64],
-        blockers: &[PixelRect],
-        members: &[usize],
+        group: &SweepGroup<'_>,
         candidates: &mut [CandidateLocation],
         retained: &mut [bool],
     ) -> Option<CandidateKey> {
         let depot = self.options.depot;
-        let targets = members
+        let targets = group
+            .members
             .iter()
             .map(|&index| {
                 let (x0, y0, x1, y1) = footprint_cells(candidates[index].tile, depot);
@@ -39,46 +44,36 @@ impl ScoringContext<'_> {
             })
             .reduce(CellBox::union)
             .expect("nonempty group");
-        let resources: Vec<_> = cluster
-            .iter()
-            .zip(weights)
-            .map(|(&index, &weight)| (self.node(index), weight))
-            .collect();
         let perimeter = footprint_perimeter(TilePosition { x: 0, y: 0 }, depot);
-        if resources.len() <= 8 {
-            sweep_chunks(
+        if group.resources.len() <= 8 {
+            group.sweep_chunks(
                 &mut scoring.narrow,
                 self.resource_grid,
-                blockers,
-                &resources,
                 targets,
                 &perimeter,
-                members,
                 candidates,
             );
         } else {
-            sweep_chunks(
+            group.sweep_chunks(
                 &mut scoring.wide,
                 self.resource_grid,
-                blockers,
-                &resources,
                 targets,
                 &perimeter,
-                members,
                 candidates,
             );
         }
         let (mineral_total, gas_total) =
-            resources
+            group
+                .resources
                 .iter()
                 .fold((0, 0), |(m, g), (node, w)| match node.kind {
                     ResourceKind::Mineral => (m + w, g),
                     ResourceKind::Gas => (m, g + w),
                 });
         let mut best: Option<CandidateKey> = None;
-        for &index in members {
+        for &index in group.members {
             let candidate = &candidates[index];
-            let full = candidate.connected == cluster.len();
+            let full = candidate.connected == group.resources.len();
             retained[index] = (candidate.exact_start && candidate.connected > 0) || full;
             if full && !candidate.exact_start {
                 let (deviation, y, x) = tie_of(candidate);
@@ -95,47 +90,47 @@ impl ScoringContext<'_> {
     }
 }
 
-/// Accumulates each resource's exact capped distance to each candidate's perimeter, `L`
-/// resources per sweep.
-#[allow(clippy::too_many_arguments)]
-fn sweep_chunks<const L: usize>(
-    field: &mut ProximityField<L>,
-    grid: &TerrainGrid,
-    blockers: &[PixelRect],
-    resources: &[(ResourceNode, u64)],
-    targets: CellBox,
-    perimeter: &[WalkPosition],
-    members: &[usize],
-    candidates: &mut [CandidateLocation],
-) {
-    for chunk in resources.chunks(L) {
-        let bounds: Vec<_> = chunk.iter().map(|(node, _)| node.bounds).collect();
-        field.compute(grid, blockers, &bounds, targets);
-        for &index in members {
-            let candidate = &mut candidates[index];
-            let mut best = [i16::MAX; L];
-            let (left, top) = (candidate.tile.x * 4, candidate.tile.y * 4);
-            for point in perimeter {
-                if let Some(lanes) = field.at(left + point.x, top + point.y) {
-                    for (best, &lane) in best.iter_mut().zip(lanes) {
-                        *best = (*best).min(lane);
+impl SweepGroup<'_> {
+    /// Accumulates each resource's exact capped distance to each member's perimeter, `L`
+    /// resources per sweep. `perimeter` is relative to a footprint's top-left cell, and `targets`
+    /// bounds every member footprint.
+    fn sweep_chunks<const L: usize>(
+        &self,
+        field: &mut ProximityField<L>,
+        grid: &TerrainGrid,
+        targets: CellBox,
+        perimeter: &[WalkPosition],
+        candidates: &mut [CandidateLocation],
+    ) {
+        for chunk in self.resources.chunks(L) {
+            let bounds: Vec<_> = chunk.iter().map(|(node, _)| node.bounds).collect();
+            field.compute(grid, self.blockers, &bounds, targets);
+            for &index in self.members {
+                let candidate = &mut candidates[index];
+                let mut best = [i16::MAX; L];
+                let (left, top) = (candidate.tile.x * 4, candidate.tile.y * 4);
+                for point in perimeter {
+                    if let Some(lanes) = field.at(left + point.x, top + point.y) {
+                        for (best, &lane) in best.iter_mut().zip(lanes) {
+                            *best = (*best).min(lane);
+                        }
                     }
                 }
-            }
-            for (&lane, &(node, weight)) in best.iter().zip(chunk) {
-                let Some(half) = half_cost(lane) else {
-                    continue;
-                };
-                let distance = u64::from(half) * 2;
-                candidate.connected += 1;
-                match node.kind {
-                    ResourceKind::Mineral => {
-                        candidate.mineral_distance += distance * weight;
-                        candidate.reachable_mineral_weight += weight;
-                    }
-                    ResourceKind::Gas => {
-                        candidate.gas_distance += distance * weight;
-                        candidate.reachable_gas_weight += weight;
+                for (&lane, &(node, weight)) in best.iter().zip(chunk) {
+                    let Some(half) = half_cost(lane) else {
+                        continue;
+                    };
+                    let distance = u64::from(half) * 2;
+                    candidate.connected += 1;
+                    match node.kind {
+                        ResourceKind::Mineral => {
+                            candidate.mineral_distance += distance * weight;
+                            candidate.reachable_mineral_weight += weight;
+                        }
+                        ResourceKind::Gas => {
+                            candidate.gas_distance += distance * weight;
+                            candidate.reachable_gas_weight += weight;
+                        }
                     }
                 }
             }
