@@ -55,6 +55,34 @@ node examples/node.mjs ../broodmap/assets/lt.scm examples/assets out.png
 
 WASM renders are byte-identical to the native CLI's (verified against `broodmap-cli render`).
 
+### Reading a SC:R install
+
+Where the game install is readable synchronously (Node, Electron), `CascStorage` reads assets
+straight from its CASC storage, so no prefetch or extracted asset directory is needed:
+
+```js
+const storage = new CascStorage(files) // opens .build.info, indices and catalogs (~70 ms)
+const map = new MapRenderer(mapBytes)
+const missing = map.loadAssets(storage, opts) // art assets the install lacks; those degrade
+const png = map.renderPng(opts)
+```
+
+`files` is the sync file access broodcasc reads through, with paths relative to the install
+directory (the one containing `.build.info`): `open(path)` returns a handle, `size(handle)`,
+`read(handle, buffer, position)` returns the bytes read, `close(handle)`, and `listDir(path)`
+returns names (`[]` when the directory doesn't exist). `examples/casc-files.mjs` implements it
+over `node:fs`:
+
+```bash
+pnpm run build:node
+node examples/node-casc.mjs "C:/Program Files (x86)/StarCraft" ../broodmap/assets/lt.scm
+```
+
+Decoded assets are cached per `CascStorage` and shared by every map loaded from it (every render
+needs the ~38 MB `SD/mainSD.anim`). `new CascStorage(files, '{"cacheBytes": N}')` bounds the
+cache (default 128 MiB, about the whole `original`-style set). `storage.version` is the
+install's game version, for keying rendered-image caches. `free()` the storage to close its files.
+
 `pkg/`, `pkg-node/` and `examples/assets/` are build/game-data artifacts and are gitignored;
 the assets are Blizzard's and must never be committed.
 

@@ -16,6 +16,10 @@
 //! const image = map.renderRgba(opts); // or renderPng(opts) / minimapPng(opts) / planJson(opts)
 //! ```
 //!
+//! Where a SC:R install is readable synchronously (Node, Electron), a [`CascStorage`] replaces
+//! the prefetch: `map.loadAssets(storage, opts)` reads both rounds straight from the install's
+//! CASC storage, sharing decoded assets across maps.
+//!
 //! Analysis is independent of artwork: `requiredMapAnalysisAssets()` names CV5, VF4, and
 //! units.dat for `analyzeMap(cv5, vf4, units)`, returning an owned [`TerrainAnalysis`] snapshot.
 //! Use `cellFlags()` for overlays and `routeJson()` for point-grid routes; `setObstaclesEnabled()`
@@ -39,12 +43,17 @@
 //! "showShadows": true, "terrainOnly": false, "scale": 4 }` (`scale` is minimap-only).
 
 mod analysis;
+mod casc;
 mod summary;
 
 pub use analysis::{AreaSnapshot, BaseTopologyJob, RegionSnapshot, TerrainAnalysis};
+pub use casc::CascStorage;
 pub use summary::summarize_map_json;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use casc::ReadFailure;
 
 use wasm_bindgen::prelude::*;
 
@@ -250,6 +259,20 @@ impl MapRenderer {
         Ok(())
     }
 
+    /// Loads every asset a render under `options` needs straight from `storage`, in place of
+    /// the `requiredAssets`/`requiredGraphics`/`addAsset` prefetch. Returns the CASC paths of
+    /// art assets the install doesn't have: those drawables degrade and the render still
+    /// succeeds. Throws if a base asset (tileset or `.dat` table) is missing or any read fails.
+    #[wasm_bindgen(js_name = loadAssets)]
+    pub fn load_assets(
+        &mut self,
+        storage: &CascStorage,
+        options: &str,
+    ) -> Result<Vec<String>, String> {
+        let opts = JsOptions::parse(options)?.render_options()?;
+        self.load_assets_with(&opts, |req| storage.read(req))
+    }
+
     /// Renders the map preview to RGBA pixels.
     #[wasm_bindgen(js_name = renderRgba)]
     pub fn render_rgba(&self, options: &str) -> Result<RenderedImage, String> {
@@ -343,6 +366,45 @@ impl MapRenderer {
             })
             .collect()
     }
+
+    /// Both prefetch rounds against a synchronous reader. See [`MapRenderer::load_assets`].
+    fn load_assets_with(
+        &mut self,
+        opts: &RenderOptions,
+        mut read: impl FnMut(&AssetRequest) -> Result<Arc<[u8]>, ReadFailure>,
+    ) -> Result<Vec<String>, String> {
+        for request in required_preview_assets_for_chk(&self.chk, opts) {
+            match read(&request) {
+                Ok(bytes) => {
+                    self.source.insert(request, bytes);
+                }
+                Err(ReadFailure::Missing) => {
+                    return Err(format!("base asset \"{}\" is missing", request.casc_path()));
+                }
+                Err(ReadFailure::Error(e)) => {
+                    return Err(format!("failed to read \"{}\": {e}", request.casc_path()));
+                }
+            }
+        }
+        let graphics = {
+            let data = GameData::load(&self.source)
+                .map_err(|e| format!("failed to load game data tables: {e}"))?;
+            required_preview_graphics_for_chk(&self.chk, &data, opts)
+        };
+        let mut missing = Vec::new();
+        for request in graphics {
+            match read(&request) {
+                Ok(bytes) => {
+                    self.source.insert(request, bytes);
+                }
+                Err(ReadFailure::Missing) => missing.push(request.casc_path()),
+                Err(ReadFailure::Error(e)) => {
+                    return Err(format!("failed to read \"{}\": {e}", request.casc_path()));
+                }
+            }
+        }
+        Ok(missing)
+    }
 }
 
 #[cfg(test)]
@@ -402,5 +464,68 @@ mod tests {
         let paths = map.required_assets("").unwrap();
         assert!(paths.contains(&"TileSet/jungle.cv5".to_string()));
         assert!(map.add_asset("TileSet/jungle.cv5", vec![0]).is_ok());
+    }
+
+    #[test]
+    fn load_assets_fails_on_a_missing_or_unreadable_base_asset() {
+        let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
+        let opts = RenderOptions::default();
+
+        let mut map = MapRenderer::new(map_bytes).unwrap();
+        let err = map
+            .load_assets_with(&opts, |_| Err(ReadFailure::Missing))
+            .unwrap_err();
+        assert!(err.contains("is missing"), "{err}");
+
+        let mut map = MapRenderer::new(map_bytes).unwrap();
+        let err = map
+            .load_assets_with(&opts, |_| Err(ReadFailure::Error("disk on fire".into())))
+            .unwrap_err();
+        assert!(err.contains("disk on fire"), "{err}");
+    }
+
+    /// `loadAssets` must render exactly what the two-round prefetch renders from the same
+    /// install. Needs a real SC:R install, like broodmap-render's real-asset tests.
+    #[test]
+    fn load_assets_matches_the_prefetch_flow() {
+        use broodmap_render::{CascSource, SourceError, TilesetDataSource};
+
+        let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+            eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+            return;
+        };
+        let source = CascSource::open(dir).expect("BROODMAP_TEST_SCR_DIR should be a SC:R install");
+        let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
+        let options = r#"{"style":"original","size":512,"startLocations":"hidden"}"#;
+        let opts = JsOptions::parse(options).unwrap().render_options().unwrap();
+
+        let mut loaded = MapRenderer::new(map_bytes).unwrap();
+        let missing = loaded
+            .load_assets_with(&opts, |req| {
+                source.read(req).map_err(|e| match e {
+                    SourceError::NotFound => ReadFailure::Missing,
+                    e => ReadFailure::Error(e.to_string()),
+                })
+            })
+            .unwrap();
+        assert!(missing.is_empty(), "{missing:?}");
+
+        let mut prefetched = MapRenderer::new(map_bytes).unwrap();
+        let add_all = |map: &mut MapRenderer, paths: Vec<String>| {
+            for path in paths {
+                let request = map.known[&path].clone();
+                map.add_asset(&path, source.read(&request).unwrap().to_vec())
+                    .unwrap();
+            }
+        };
+        let paths = prefetched.required_assets(options).unwrap();
+        add_all(&mut prefetched, paths);
+        let paths = prefetched.required_graphics(options).unwrap();
+        add_all(&mut prefetched, paths);
+
+        assert_eq!(
+            loaded.render_png(options).unwrap(),
+            prefetched.render_png(options).unwrap()
+        );
     }
 }
