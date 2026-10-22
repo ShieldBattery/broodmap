@@ -5,6 +5,33 @@ WebAssembly bindings for rendering StarCraft: Brood War map previews in the brow
 are CASC catalog paths, which double as URL suffixes), accepts the fetched bytes, and renders
 previews, zero-asset minimaps, and render-plan JSON synchronously from memory.
 
+## Map summary
+
+`summarizeMapJson(mapBytes, options?)` reads a map's scenario facts without rendering anything or
+needing game assets, for listing and filtering map files cheaply. `options` is an optional JSON
+object overriding broodmap's default resource limits (`maxMapBytes`, `maxMpqFileBytes`,
+`maxChkBytes`, `maxMergedChunkBytes`), for callers that accept larger maps. It returns JSON:
+
+| Field | Meaning |
+| ----- | ------- |
+| `name`, `description` | Decoded scenario strings, color codes included. `null` when unset. |
+| `width`, `height`, `tileset` | Dimensions in tiles and the ERA tileset id. |
+| `stringEncoding` | How strings were decoded: `utf8`, `utf8-cp949`, `utf8-cp1252`, `cp949` or `cp1252`. |
+| `players` | The 8 player slots: `controller` (`OWNR` value), `race` (`SIDE` value) and `force` (force index; 4 or more means none). |
+| `forces` | The 4 forces' `name`s. |
+| `usesEud` | Whether triggers read or write memory outside the death table. |
+| `triggerActionKinds`, `triggerCount` | The distinct trigger action kinds used (variant names such as `CreateUnit`, sorted), and how many triggers there are. `null` when the triggers can't be read. |
+| `placedUnits`, `playerUnits`, `startLocations` | Placed units (and those owned by one of the 8 player slots), not counting start locations, and the number of start locations. |
+
+It throws if the file isn't a readable map within those limits, or lacks the name, player or
+force sections.
+
+## Package
+
+Published as `@shieldbattery/broodmap`, with a web build (`pkg/`, ES module) and a Node build
+(`pkg-node/`, CommonJS). `pnpm run build` produces both; `pnpm run test:package` checks the built
+package through its entry points.
+
 ## Browser example
 
 ```bash

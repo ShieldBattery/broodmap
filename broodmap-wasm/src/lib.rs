@@ -39,8 +39,10 @@
 //! "showShadows": true, "terrainOnly": false, "scale": 4 }` (`scale` is minimap-only).
 
 mod analysis;
+mod summary;
 
 pub use analysis::{AreaSnapshot, BaseTopologyJob, RegionSnapshot, TerrainAnalysis};
+pub use summary::summarize_map_json;
 
 use std::collections::HashMap;
 
