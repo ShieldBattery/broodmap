@@ -42,6 +42,13 @@ const START_ASSOCIATION_PIXELS: i64 = 6 * PIXELS_PER_TILE;
 const SEARCH_RADIUS_TILES: i64 = 12;
 const RESOURCE_GAP_PIXELS: i64 = 3 * PIXELS_PER_TILE;
 
+#[cfg(test)]
+thread_local! {
+    /// Uncertain selections this thread re-scored without pruning, so tests can tell that path
+    /// was exercised.
+    static UNCERTAIN_RESCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 /// Logical map pixels, with the origin at the top-left corner.
 pub struct PixelPosition {
@@ -369,6 +376,8 @@ fn discover(
             Ok(chosen) => chosen,
             Err(Uncertain) => {
                 // A taken optimum exposed candidates that scoring skipped; score every one.
+                #[cfg(test)]
+                UNCERTAIN_RESCORES.with(|count| count.set(count.get() + 1));
                 let cluster = std::mem::take(&mut scored_clusters[cluster_index].cluster);
                 scored_clusters[cluster_index] =
                     context.score_cluster(cluster, &mut scoring, false);
