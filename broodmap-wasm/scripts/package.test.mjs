@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { test } from 'node:test'
 import * as esm from '@shieldbattery/broodmap'
+import { nodeCascFiles } from '../examples/casc-files.mjs'
 
 const require = createRequire(import.meta.url)
 const packageDir = path.resolve(import.meta.dirname, '..')
@@ -68,4 +69,36 @@ test('takes resource limits as options', () => {
 
 test('rejects files that are not maps', () => {
   assert.throws(() => esm.summarizeMapJson(new Uint8Array([1, 2, 3])))
+})
+
+test('CascStorage rejects incomplete file callbacks and directories that are not installs', () => {
+  const { open, ...noOpen } = nodeCascFiles(import.meta.dirname)
+  assert.throws(() => new esm.CascStorage(noOpen), /no `open` function/)
+  assert.throws(() => new esm.CascStorage(nodeCascFiles(import.meta.dirname)), /failed to open CASC/)
+})
+
+test('renders from a SC:R install through CascStorage', async t => {
+  const installDir = process.env.BROODMAP_TEST_SCR_DIR
+  if (!installDir) {
+    t.skip('BROODMAP_TEST_SCR_DIR not set')
+    return
+  }
+  const storage = new esm.CascStorage(nodeCascFiles(installDir))
+  assert.match(storage.version, /^\d+\.\d+/)
+
+  const opts = JSON.stringify({ style: 'original', size: 256 })
+  const render = () => {
+    const map = new esm.MapRenderer(lt)
+    assert.deepEqual(map.loadAssets(storage, opts), [])
+    const png = map.renderPng(opts)
+    map.free()
+    return png
+  }
+  const first = render()
+  assert.deepEqual([...first.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47])
+  const cached = storage.cachedBytes
+  assert.ok(cached > 0)
+  assert.deepEqual(render(), first)
+  assert.equal(storage.cachedBytes, cached, 'a second render of the same map reads only from the cache')
+  storage.free()
 })
