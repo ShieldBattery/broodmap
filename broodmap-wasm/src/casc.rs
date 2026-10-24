@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use broodcasc::io::{ReadAt, StorageProvider};
-use broodcasc::{CascError, Storage};
+use broodcasc::{CascError, ReadLimits, Storage, StorageOptions};
 use broodmap_render::AssetRequest;
 use js_sys::{Array, Function, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
@@ -25,6 +25,11 @@ compile_error!("broodmap-wasm's CASC file access assumes a single-threaded wasm 
 /// The default for `cacheBytes`: roughly the whole asset set for the `original` style (the one
 /// `mainSD.anim`, all 8 SD tilesets and the GRPs), so repeated renders never decode twice.
 const DEFAULT_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// How much broodcasc may reserve up front for a decoded asset; beyond it the output grows by
+/// doubling. Its 8 MiB default made the ~38 MB `mainSD.anim` pass through 16, 32 and 64 MiB
+/// buffers, and WASM memory never shrinks back from that peak.
+const INITIAL_DECODE_RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The largest file position a JS number represents exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_JS_POSITION: u64 = (1 << 53) - 1;
@@ -61,10 +66,12 @@ impl From<CascError> for ReadFailure {
 /// - `listDir(path)`: the names of the entries in a directory, or `[]` if it doesn't exist.
 ///
 /// In Node these map one to one onto `fs.openSync`, `fs.fstatSync(fd).size`, `fs.readSync`,
-/// `fs.closeSync` and `fs.readdirSync`. Every callback is called with `files` as `this`.
+/// `fs.closeSync` and `fs.readdirSync`. Every callback is called with `files` as `this`. `read`'s
+/// `buffer` is a view of WASM memory that's filled in place, so the callbacks must not call back
+/// into this module.
 ///
-/// `options` is an optional JSON object: `{ "cacheBytes": 134217728 }` bounds the shared cache
-/// of decoded assets (least recently used are evicted first; 0 disables caching).
+/// `options` is optional `CascStorageOptions` JSON: `{ "cacheBytes": 134217728 }` bounds the
+/// shared cache of decoded assets (least recently used are evicted first; 0 disables caching).
 ///
 /// Data archives stay open until the storage is freed (`free()`).
 #[wasm_bindgen]
@@ -72,6 +79,23 @@ pub struct CascStorage {
     storage: Storage<JsProvider>,
     cache: RefCell<AssetCache>,
 }
+
+#[wasm_bindgen(typescript_custom_section)]
+const CASC_STORAGE_TYPES: &str = r#"
+/** Sync access to a SC:R install's files, for `CascStorage`. Paths are relative to the install. */
+export interface CascFiles {
+    open(path: string): unknown;
+    size(handle: unknown): number;
+    read(handle: unknown, buffer: Uint8Array, position: number): number;
+    close(handle: unknown): void;
+    listDir(path: string): string[];
+}
+
+/** Options for `CascStorage`, passed as JSON. */
+export interface CascStorageOptions {
+    cacheBytes?: number;
+}
+"#;
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -85,7 +109,10 @@ impl CascStorage {
     /// catalog (a few MB). Throws if `files` lacks a callback or the directory isn't a readable
     /// SC:R install.
     #[wasm_bindgen(constructor)]
-    pub fn new(files: JsValue, options: Option<String>) -> Result<CascStorage, String> {
+    pub fn new(
+        #[wasm_bindgen(unchecked_param_type = "CascFiles")] files: JsValue,
+        options: Option<String>,
+    ) -> Result<CascStorage, String> {
         let options = match options.as_deref().map(str::trim) {
             None | Some("") => CascOptions::default(),
             Some(json) => {
@@ -95,8 +122,15 @@ impl CascStorage {
         let provider = JsProvider {
             files: Arc::new(JsFiles::from_object(&files)?),
         };
-        let storage = Storage::open_with_provider(provider)
-            .map_err(|e| format!("failed to open CASC storage: {e}"))?;
+        let read_limits = ReadLimits {
+            initial_reserve_bytes: INITIAL_DECODE_RESERVE_BYTES,
+            ..ReadLimits::default()
+        };
+        let storage = Storage::open_with_provider_and_options(
+            provider,
+            StorageOptions::new().with_read_limits(read_limits),
+        )
+        .map_err(|e| format!("failed to open CASC storage: {e}"))?;
         Ok(CascStorage {
             storage,
             cache: RefCell::new(AssetCache::new(
@@ -301,34 +335,36 @@ impl ReadAt for JsFile {
         if buf.is_empty() {
             return Ok(());
         }
-        let total = u32::try_from(buf.len())
-            .map_err(|_| malformed("positioned read", "read is too large"))?;
-        let chunk = Uint8Array::new_with_length(total);
-        let mut filled = 0u32;
-        while filled < total {
+        let mut filled = 0;
+        while filled < buf.len() {
             let position = offset
-                .checked_add(u64::from(filled))
+                .checked_add(filled as u64)
                 .filter(|&p| p <= MAX_JS_POSITION)
                 .ok_or_else(|| malformed("positioned read", "position is past 2^53 bytes"))?;
+            let rest = &mut buf[filled..];
+            // SAFETY: the view aliases `rest`, so `read` fills it straight from the file with no
+            // JS-side buffer or copy. A view into WASM memory is only valid until that memory
+            // grows, and nothing can grow it before `read` returns: the callback runs plain JS
+            // (calling back into this module from it isn't supported).
+            let view = unsafe { Uint8Array::view_mut_raw(rest.as_mut_ptr(), rest.len()) };
             let read = self
                 .files
                 .read
                 .call3(
                     &self.files.target,
                     &self.handle,
-                    &chunk.subarray(filled, total),
+                    &view,
                     &JsValue::from_f64(position as f64),
                 )
                 .map_err(js_error)?;
             let n = js_count(&read)
-                .filter(|&n| n <= u64::from(total - filled))
+                .filter(|&n| n <= rest.len() as u64)
                 .ok_or_else(|| malformed("positioned read", format!("`read` returned {read:?}")))?;
             if n == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
             }
-            filled += n as u32;
+            filled += n as usize;
         }
-        chunk.copy_to(buf);
         Ok(())
     }
 

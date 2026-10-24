@@ -82,8 +82,9 @@ const png = map.renderPng(opts)
 `files` is the sync file access broodcasc reads through, with paths relative to the install
 directory (the one containing `.build.info`): `open(path)` returns a handle, `size(handle)`,
 `read(handle, buffer, position)` returns the bytes read, `close(handle)`, and `listDir(path)`
-returns names (`[]` when the directory doesn't exist). `examples/casc-files.mjs` implements it
-over `node:fs`:
+returns names (`[]` when the directory doesn't exist). `read` fills a view of WASM memory in
+place, so the callbacks mustn't call back into the module. `examples/casc-files.mjs` implements
+it over `node:fs`:
 
 ```bash
 pnpm run build
