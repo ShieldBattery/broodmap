@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn real_map_can_analyze_without_render_assets() {
-        let map = MapRenderer::new(include_bytes!("../../broodmap/assets/lt.scm")).unwrap();
+        let map = MapRenderer::new(include_bytes!("../../broodmap/assets/lt.scm"), None).unwrap();
         assert_eq!(
             map.required_analysis_assets(),
             ["TileSet/jungle.cv5", "TileSet/jungle.vf4"]
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn map_obstacles_block_routes_and_toggle_without_losing_terrain() {
-        let map = MapRenderer::new(include_bytes!("../../broodmap/assets/lt.scm")).unwrap();
+        let map = MapRenderer::new(include_bytes!("../../broodmap/assets/lt.scm"), None).unwrap();
         assert_eq!(
             map.required_map_analysis_assets(),
             ["TileSet/jungle.cv5", "TileSet/jungle.vf4", "arr/units.dat"]
