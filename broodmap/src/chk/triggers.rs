@@ -1487,6 +1487,138 @@ pub(crate) fn scan_uses_eud(data: &[u8]) -> bool {
     })
 }
 
+/// The name of each trigger action type BW defines, indexed by type id: the [`RawTriggerAction`]
+/// variant that id parses to.
+const ACTION_TYPE_NAMES: [&str; 60] = [
+    "NoAction",
+    "Victory",
+    "Defeat",
+    "PreserveTrigger",
+    "Wait",
+    "PauseGame",
+    "UnpauseGame",
+    "Transmission",
+    "PlaySound",
+    "DisplayTextMessage",
+    "CenterView",
+    "CreateUnitWithProperties",
+    "SetMissionObjectives",
+    "ModifySwitch",
+    "ModifyCountdownTimer",
+    "RunAiScript",
+    "RunAiScriptAtLocation",
+    "LeaderboardControl",
+    "LeaderboardControlAtLocation",
+    "LeaderboardResources",
+    "LeaderboardKills",
+    "LeaderboardScore",
+    "KillUnit",
+    "KillUnitAtLocation",
+    "RemoveUnit",
+    "RemoveUnitAtLocation",
+    "ModifyResources",
+    "ModifyScore",
+    "MinimapPing",
+    "TalkingPortrait",
+    "MuteUnitSpeech",
+    "UnmuteUnitSpeech",
+    "LeaderboardComputers",
+    "LeaderboardGoalControl",
+    "LeaderboardGoalControlAtLocation",
+    "LeaderboardGoalResources",
+    "LeaderboardGoalKills",
+    "LeaderboardGoalScore",
+    "CenterLocationOn",
+    "MoveUnit",
+    "LeaderboardGreed",
+    "SetNextScenario",
+    "SetDoodadState",
+    "SetInvincibility",
+    "CreateUnit",
+    "SetDeaths",
+    "Order",
+    "Comment",
+    "GiveUnitsToPlayer",
+    "SetUnitHp",
+    "SetUnitEnergy",
+    "SetUnitShields",
+    "SetUnitResources",
+    "SetUnitHangarCount",
+    "PauseTimer",
+    "UnpauseTimer",
+    "Draw",
+    "SetAlliance",
+    "DisableDebugMode",
+    "EnableDebugMode",
+];
+
+/// Returns the name of a trigger action type: the name of the [`RawTriggerAction`] variant its type
+/// id parses to (e.g. `CreateUnit` for 44), or `None` for ids BW doesn't define.
+pub fn action_type_name(type_id: u8) -> Option<&'static str> {
+    ACTION_TYPE_NAMES.get(usize::from(type_id)).copied()
+}
+
+/// A set of trigger action types, by type id.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct TriggerActionTypes(u64);
+
+impl TriggerActionTypes {
+    pub fn contains(self, type_id: u8) -> bool {
+        type_id < 64 && self.0 & (1 << type_id) != 0
+    }
+
+    pub fn insert(&mut self, type_id: u8) {
+        debug_assert!(usize::from(type_id) < ACTION_TYPE_NAMES.len());
+        self.0 |= 1 << type_id;
+    }
+
+    pub fn remove(&mut self, type_id: u8) {
+        if type_id < 64 {
+            self.0 &= !(1 << type_id);
+        }
+    }
+
+    /// The type ids in the set, ascending.
+    pub fn iter(self) -> impl Iterator<Item = u8> {
+        (0..64).filter(move |&type_id| self.contains(type_id))
+    }
+
+    /// The names of the types in the set (see [`action_type_name`]), in type id order.
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        self.iter().filter_map(action_type_name)
+    }
+}
+
+/// How many triggers a `TRIG` chunk holds and which action types they use.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct TriggerActionStats {
+    pub trigger_count: usize,
+    pub action_types: TriggerActionTypes,
+}
+
+/// Counts the complete trigger records and collects the types of their actions without constructing
+/// trigger objects. Actions are validated by [`trigger_action_data`], so this covers exactly the
+/// actions [`read_triggers`] keeps, empty (`NoAction`) slots and disabled actions included.
+pub(crate) fn scan_action_stats(data: &[u8]) -> TriggerActionStats {
+    let triggers = data.as_chunks::<TRIGGER_SIZE>().0;
+    let mut action_types = TriggerActionTypes::default();
+    for trigger in triggers {
+        for action in trigger[CONDITIONS_SIZE..CONDITIONS_SIZE + ACTIONS_SIZE]
+            .as_chunks::<ACTION_SIZE>()
+            .0
+        {
+            if let Ok((_, Some(_))) = trigger_action_data(action) {
+                action_types.insert(action[26]);
+            }
+        }
+    }
+
+    TriggerActionStats {
+        trigger_count: triggers.len(),
+        action_types,
+    }
+}
+
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum TriggersError {
     #[error("Error parsing triggers")]
@@ -1525,6 +1657,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn action_type_names_match_parsed_variants() {
+        let mut named = TriggerActionTypes::default();
+        for action_type in u8::MIN..=u8::MAX {
+            for operation in (0..=12).chain([u8::MAX]) {
+                for unit_or_type in [0, 1, 2, 3, 7, 8, u16::MAX] {
+                    let mut action = [0u8; 32];
+                    action[24..26].copy_from_slice(&unit_or_type.to_le_bytes());
+                    action[26] = action_type;
+                    action[27] = operation;
+
+                    let Some(parsed) = trigger_action_data(&action).unwrap().1 else {
+                        continue;
+                    };
+                    let debug = format!("{:?}", parsed.action);
+                    let variant = debug
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .next()
+                        .unwrap();
+                    assert_eq!(action_type_name(action_type), Some(variant));
+                    named.insert(action_type);
+                }
+            }
+        }
+        assert_eq!(named.iter().count(), ACTION_TYPE_NAMES.len());
+        assert_eq!(action_type_name(60), None);
+    }
+
+    #[test]
+    fn action_stats_count_complete_triggers() {
+        assert_eq!(scan_action_stats(&[]), TriggerActionStats::default());
+
+        let mut action = [0u8; 32];
+        action[26] = 44;
+        let mut data = trigger_with_action(63, &action);
+        action[26] = 60;
+        data.extend(trigger_with_action(0, &action));
+        data.extend([0u8; TRIGGER_SIZE - 1]);
+
+        let stats = scan_action_stats(&data);
+        assert_eq!(stats.trigger_count, 2);
+        assert_eq!(
+            stats.action_types.names().collect::<Vec<_>>(),
+            ["NoAction", "CreateUnit"]
+        );
     }
 
     fn deaths_condition(player: u32, unit_id: u16) -> [u8; 20] {

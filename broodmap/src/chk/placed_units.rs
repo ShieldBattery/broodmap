@@ -1,7 +1,8 @@
 use bitflags::bitflags;
 use thiserror::Error;
 
-const START_LOCATION_ID: u16 = 214;
+/// The unit id of the marker placed for each start location.
+pub const START_LOCATION_ID: u16 = 214;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UnitInstanceId(pub u32);
