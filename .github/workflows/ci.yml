@@ -33,3 +33,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  wasm:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', '24']
+    defaults:
+      run:
+        working-directory: broodmap-wasm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: broodmap-wasm/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: broodmap-wasm/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm run build
+      - run: pnpm run test:package
+      - run: pnpm run test:types
+      - run: pnpm run build:demo
