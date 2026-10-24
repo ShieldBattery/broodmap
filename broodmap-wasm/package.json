@@ -19,7 +19,7 @@
     "LICENSE-MIT"
   ],
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.13.1"
   },
   "scripts": {
     "build": "wasm-pack build --target web --no-pack && node scripts/finalize-package.mjs",

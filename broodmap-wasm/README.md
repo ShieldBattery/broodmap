@@ -38,7 +38,8 @@ from a worker that can be terminated afterwards to give it back.
 Published as `@shieldbattery/broodmap`, an ES module package built once with `wasm-pack --target
 web`. Browsers and bundlers get `pkg/broodmap_wasm.js` and must `await init()` before using it.
 Node gets `node.js`, which loads the same build synchronously from disk, so it's ready on import
-(and `require()`, through Node's `require(esm)`); calling `init()` there is a harmless no-op.
+(and `require()`, through Node's `require(esm)`); calling `init()` there is a harmless no-op. It
+needs Node 22.13.1 or later.
 
 `pnpm run build` builds `pkg/`; `pnpm run test:package` and `pnpm run test:types` check the built
 package through its entry points.
