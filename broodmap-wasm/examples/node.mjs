@@ -1,12 +1,9 @@
 // Node usage example: the same prefetch -> render flow as the browser, with assets read from a
-// `fetch-assets` directory on disk. Build the node package first: `pnpm run build:node`.
+// `fetch-assets` directory on disk. Build the package first: `pnpm run build`.
 //
 //   node examples/node.mjs <map.scm> <assets-dir> [out.png]
 import { readFileSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-
-const require = createRequire(import.meta.url)
-const { MapRenderer } = require('../pkg-node/broodmap_wasm.js')
+import { MapRenderer } from '@shieldbattery/broodmap'
 
 const [mapPath, assetsDir, outPath = 'preview.png'] = process.argv.slice(2)
 if (!mapPath || !assetsDir) {

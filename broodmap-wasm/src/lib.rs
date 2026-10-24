@@ -39,15 +39,17 @@
 //! "showShadows": true, "terrainOnly": false, "scale": 4 }` (`scale` is minimap-only).
 
 mod analysis;
+mod summary;
 
 pub use analysis::{AreaSnapshot, BaseTopologyJob, RegionSnapshot, TerrainAnalysis};
+pub use summary::summarize_map_json;
 
 use std::collections::HashMap;
 
 use wasm_bindgen::prelude::*;
 
 use broodmap::chk::Chk;
-use broodmap::extract_chk_from_map;
+use broodmap::{ResourceLimits, extract_chk_from_map_with_limits};
 use broodmap_render::{
     ArtStyle, AssetRequest, GameData, MemorySource, MinimapOptions, RenderOptions, StartLocations,
     UnitFilter, plan_chk_preview, render_chk_minimap, render_chk_preview, render_terrain,
@@ -131,6 +133,51 @@ impl JsOptions {
     }
 }
 
+/// The JSON `MapLimitOptions` object: overrides of broodmap's default [`ResourceLimits`] for
+/// parsing a map. Every field is optional.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct LimitOptions {
+    max_map_bytes: Option<usize>,
+    max_mpq_file_bytes: Option<usize>,
+    max_chk_bytes: Option<usize>,
+    max_merged_chunk_bytes: Option<usize>,
+}
+
+impl LimitOptions {
+    fn parse(json: Option<&str>) -> Result<LimitOptions, String> {
+        match json.map(str::trim) {
+            None | Some("") => Ok(LimitOptions::default()),
+            Some(json) => serde_json::from_str(json).map_err(|e| format!("invalid options: {e}")),
+        }
+    }
+
+    fn limits(&self) -> ResourceLimits {
+        let mut limits = ResourceLimits::default();
+        if let Some(bytes) = self.max_map_bytes {
+            limits.max_map_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_mpq_file_bytes {
+            limits.max_mpq_file_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_chk_bytes {
+            limits.max_chk_bytes = bytes;
+        }
+        if let Some(bytes) = self.max_merged_chunk_bytes {
+            limits.max_merged_chunk_bytes = bytes;
+        }
+        limits
+    }
+}
+
+/// Parses a `.scm`/`.scx` map file within the limits `options` (`MapLimitOptions` JSON) sets.
+fn parse_map(map_bytes: &[u8], options: Option<&str>) -> Result<Chk, String> {
+    let limits = LimitOptions::parse(options)?.limits();
+    let (chk, _mpq) = extract_chk_from_map_with_limits(map_bytes, None, None, &limits)
+        .map_err(|e| format!("failed to parse map: {e}"))?;
+    Ok(chk)
+}
+
 fn parse_style(style: Option<&str>) -> Result<Option<ArtStyle>, String> {
     match style {
         None => Ok(None),
@@ -190,16 +237,21 @@ pub struct MapRenderer {
 
 #[wasm_bindgen]
 impl MapRenderer {
-    /// Parses a `.scm`/`.scx` map file (MPQ + CHK).
+    /// Parses a `.scm`/`.scx` map file (MPQ + CHK). `options` is optional `MapLimitOptions` JSON
+    /// overriding broodmap's default resource limits.
     #[wasm_bindgen(constructor)]
-    pub fn new(map_bytes: &[u8]) -> Result<MapRenderer, String> {
-        let (chk, _mpq) = extract_chk_from_map(map_bytes, None, None)
-            .map_err(|e| format!("failed to parse map: {e}"))?;
+    pub fn new(map_bytes: &[u8], options: Option<String>) -> Result<MapRenderer, String> {
         Ok(MapRenderer {
-            chk,
+            chk: parse_map(map_bytes, options.as_deref())?,
             source: MemorySource::new(),
             known: HashMap::new(),
         })
+    }
+
+    /// The map's scenario facts as a JSON `MapSummary`, like `summarizeMapJson`.
+    #[wasm_bindgen(js_name = summaryJson)]
+    pub fn summary_json(&self) -> Result<String, String> {
+        summary::summary_json(&self.chk)
     }
 
     /// Map width in tiles (0 if the map has no readable terrain).
@@ -383,7 +435,7 @@ mod tests {
         // The zero-asset minimap needs nothing fetched at all, so it exercises parse +
         // rendering end to end without any asset fixtures.
         let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
-        let map = MapRenderer::new(map_bytes).unwrap();
+        let map = MapRenderer::new(map_bytes, None).unwrap();
         assert_eq!((map.width_tiles(), map.height_tiles()), (128, 128));
 
         let minimap = map.minimap_rgba(r#"{"scale":2}"#).unwrap();
@@ -394,7 +446,7 @@ mod tests {
     #[test]
     fn add_asset_rejects_paths_the_map_never_asked_for() {
         let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
-        let mut map = MapRenderer::new(map_bytes).unwrap();
+        let mut map = MapRenderer::new(map_bytes, None).unwrap();
         assert!(map.add_asset("TileSet/jungle.cv5", vec![0]).is_err());
 
         let paths = map.required_assets("").unwrap();

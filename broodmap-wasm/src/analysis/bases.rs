@@ -285,7 +285,8 @@ mod tests {
 
     #[test]
     fn discovery_json_cache_and_routes_are_snapshot_owned() {
-        let map = MapRenderer::new(include_bytes!("../../../broodmap/assets/lt.scm")).unwrap();
+        let map =
+            MapRenderer::new(include_bytes!("../../../broodmap/assets/lt.scm"), None).unwrap();
         let cv5 = vec![0; 52 * 2048];
         let vf4: Vec<u8> = (0..16).flat_map(|_| 1u16.to_le_bytes()).collect();
         let mut terrain_only = map.analyze_terrain(&cv5, &vf4).unwrap();

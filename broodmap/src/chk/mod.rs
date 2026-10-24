@@ -31,8 +31,9 @@ use crate::chk::strings::{
 use crate::chk::terrain::{TerrainError, TerrainTileIds, read_terrain};
 use crate::chk::tileset::{Tileset, TilesetError, read_tileset};
 use crate::chk::triggers::{
-    RawTrigger, TriggersError, read_triggers, scan_used_string_ids as scan_used_trigger_string_ids,
-    scan_uses_eud as scan_trigger_uses_eud,
+    RawTrigger, TriggerActionStats, TriggersError, read_triggers,
+    scan_action_stats as scan_trigger_action_stats,
+    scan_used_string_ids as scan_used_trigger_string_ids, scan_uses_eud as scan_trigger_uses_eud,
 };
 use crate::chk::unit_settings::{RawUnitSettings, UnitSettingsError};
 use crate::limits::{
@@ -304,6 +305,16 @@ impl Chk {
     pub fn uses_eud(&self) -> bool {
         read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG)
             .is_some_and(|data| scan_trigger_uses_eud(&data))
+    }
+
+    /// Returns how many triggers (`TRIG`) the map has and which action types they use, the same
+    /// actions [`Chk::raw_triggers`] parses (empty `NoAction` slots and disabled actions included).
+    /// This scans the raw trigger records instead of parsing them, so it's much cheaper when the
+    /// actions themselves aren't needed.
+    pub fn trigger_action_stats(&self) -> TriggerActionStats {
+        read_chunk_data(&self.data, &self.chunks, ChunkType::TRIG)
+            .map(|data| scan_trigger_action_stats(&data))
+            .unwrap_or_default()
     }
 
     // NOTE(tec27): This is private because we don't generally want to return references to the
@@ -631,6 +642,30 @@ mod tests {
                 .used_string_ids()
                 .collect::<Vec<_>>();
             assert_eq!(scanned_briefing_ids, parsed_briefing_ids);
+        }
+    }
+
+    #[test]
+    fn trigger_action_stats_match_parsed_triggers() {
+        for chk_bytes in [LT_CHK, SECRET_BOUND_CHK] {
+            let chk = assert_ok!(Chk::from_bytes(chk_bytes.into(), None));
+            let stats = chk.trigger_action_stats();
+
+            let triggers = assert_ok!(chk.raw_triggers());
+            let mut parsed_types = triggers::TriggerActionTypes::default();
+            for action in triggers.iter().flat_map(|t| &t.actions) {
+                let debug = format!("{:?}", action.action);
+                let name = debug
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap();
+                let type_id = (0..=u8::MAX)
+                    .find(|&id| triggers::action_type_name(id) == Some(name))
+                    .unwrap();
+                parsed_types.insert(type_id);
+            }
+            assert_eq!(stats.trigger_count, triggers.len());
+            assert_eq!(stats.action_types, parsed_types);
         }
     }
 

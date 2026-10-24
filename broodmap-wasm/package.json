@@ -1,21 +1,54 @@
 {
-  "name": "broodmap-wasm",
+  "name": "@shieldbattery/broodmap",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "WebAssembly bindings for rendering StarCraft: Brood War map previews",
+  "description": "WebAssembly bindings for broodmap: StarCraft: Brood War map summaries, previews and terrain analysis",
+  "main": "./node.js",
+  "types": "./pkg/broodmap_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./pkg/broodmap_wasm.d.ts",
+      "node": "./node.js",
+      "default": "./pkg/broodmap_wasm.js"
+    }
+  },
+  "files": [
+    "pkg/broodmap_wasm*",
+    "node.js",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "engines": {
+    "node": ">=22.13.1"
+  },
   "scripts": {
-    "build": "pnpm run build:web && pnpm run build:node",
-    "build:web": "wasm-pack build --target web",
-    "build:node": "wasm-pack build --target nodejs --out-dir pkg-node",
+    "build": "wasm-pack build --target web --no-pack && node scripts/finalize-package.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('pkg', { recursive: true, force: true })\"",
     "assets:analysis": "cargo run --release -p broodmap-cli -- fetch-assets --analysis-only --out examples/assets",
     "assets": "cargo run --release -p broodmap-cli -- fetch-assets --out examples/assets",
-    "dev": "pnpm run build:web && vite",
-    "build:demo": "pnpm run build:web && vite build",
-    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs"
+    "dev": "pnpm run build && vite",
+    "build:demo": "pnpm run build && vite build",
+    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs",
+    "test:package": "node --test scripts/package.test.mjs",
+    "test:types": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext scripts/types-consumer.ts && tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler scripts/types-consumer.ts",
+    "prepublishOnly": "pnpm run clean && pnpm run build && pnpm test && pnpm run test:package && pnpm run test:types"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShieldBattery/broodmap.git",
+    "directory": "broodmap-wasm"
+  },
+  "keywords": [
+    "starcraft",
+    "map",
+    "parser",
+    "wasm",
+    "webassembly"
+  ],
   "license": "MIT OR Apache-2.0",
+  "packageManager": "pnpm@12.15.0+sha512.b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61",
   "devDependencies": {
-    "vite": "^7.1.5"
+    "typescript": "7.0.2",
+    "vite": "^8.3.5"
   }
 }
