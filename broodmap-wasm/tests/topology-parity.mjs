@@ -1,15 +1,14 @@
 // Optional real-asset regression: node tests/topology-parity.mjs <asset-directory> <map>...
-// Build pkg-node first. Assets/maps are local inputs and are not bundled with the repository.
+// Build the package first (`pnpm run build`). Assets/maps are local inputs and are not bundled with the repository.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve, join, basename } from 'node:path'
-import { createRequire } from 'node:module'
+import { MapRenderer } from '@shieldbattery/broodmap'
 import { analyzeBaseAreas } from '../examples/base-areas.js'
 import { analyzeBaseAreas as reference } from './topology-reference/base-areas.js'
 
 const [assets, ...maps] = process.argv.slice(2)
 if (!assets || !maps.length) throw new Error('Usage: node tests/topology-parity.mjs <asset-directory> <map>...')
-const { MapRenderer } = createRequire(import.meta.url)('../pkg-node/broodmap_wasm.js')
 for (const path of maps) {
   const map = new MapRenderer(readFileSync(resolve(path)))
   let analysis

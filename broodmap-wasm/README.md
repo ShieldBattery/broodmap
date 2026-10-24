@@ -8,9 +8,11 @@ previews, zero-asset minimaps, and render-plan JSON synchronously from memory.
 ## Map summary
 
 `summarizeMapJson(mapBytes, options?)` reads a map's scenario facts without rendering anything or
-needing game assets, for listing and filtering map files cheaply. `options` is an optional JSON
-object overriding broodmap's default resource limits (`maxMapBytes`, `maxMpqFileBytes`,
-`maxChkBytes`, `maxMergedChunkBytes`), for callers that accept larger maps. It returns JSON:
+needing game assets, for listing and filtering map files cheaply. `options` is optional
+`MapLimitOptions` JSON overriding broodmap's default resource limits (`maxMapBytes`,
+`maxMpqFileBytes`, `maxChkBytes`, `maxMergedChunkBytes`), for callers that accept larger maps;
+`new MapRenderer(mapBytes, options?)` takes the same options. It returns `MapSummary` JSON (both
+types are in the package's TypeScript declarations):
 
 | Field | Meaning |
 | ----- | ------- |
@@ -20,16 +22,25 @@ object overriding broodmap's default resource limits (`maxMapBytes`, `maxMpqFile
 | `players` | The 8 player slots: `controller` (`OWNR` value), `race` (`SIDE` value) and `force` (force index; 4 or more means none). |
 | `forces` | The 4 forces' `name`s. |
 | `usesEud` | Whether triggers read or write memory outside the death table. |
-| `triggerActionKinds`, `triggerCount` | The distinct trigger action kinds used (variant names such as `CreateUnit`, sorted), and how many triggers there are. `null` when the triggers can't be read. |
+| `triggerActionKinds`, `triggerCount` | The distinct trigger action kinds used (names such as `CreateUnit`, sorted; empty `NoAction` slots don't count), and how many triggers there are. |
 | `placedUnits`, `playerUnits`, `startLocations` | Placed units (and those owned by one of the 8 player slots), not counting start locations, and the number of start locations. |
 
 It throws if the file isn't a readable map within those limits, or lacks the name, player or
-force sections.
+force sections. A `MapRenderer` gives the same JSON from `summaryJson()`, so a map that's also
+rendered is only parsed once.
+
+WebAssembly memory grows to fit the largest map parsed and never shrinks, so summarizing a folder
+of maps (especially with raised limits) keeps that much memory for the life of the module. Scan
+from a worker that can be terminated afterwards to give it back.
 
 ## Package
 
-Published as `@shieldbattery/broodmap`, with a web build (`pkg/`, ES module) and a Node build
-(`pkg-node/`, CommonJS). `pnpm run build` produces both; `pnpm run test:package` checks the built
+Published as `@shieldbattery/broodmap`, an ES module package built once with `wasm-pack --target
+web`. Browsers and bundlers get `pkg/broodmap_wasm.js` and must `await init()` before using it.
+Node gets `node.js`, which loads the same build synchronously from disk, so it's ready on import
+(and `require()`, through Node's `require(esm)`); calling `init()` there is a harmless no-op.
+
+`pnpm run build` builds `pkg/`; `pnpm run test:package` and `pnpm run test:types` check the built
 package through its entry points.
 
 ## Browser example
@@ -49,13 +60,13 @@ request — any static file host works as an asset origin.
 ## Node
 
 ```bash
-pnpm run build:node
+pnpm run build
 node examples/node.mjs ../broodmap/assets/lt.scm examples/assets out.png
 ```
 
 WASM renders are byte-identical to the native CLI's (verified against `broodmap-cli render`).
 
-`pkg/`, `pkg-node/` and `examples/assets/` are build/game-data artifacts and are gitignored;
+`pkg/` and `examples/assets/` are build/game-data artifacts and are gitignored;
 the assets are Blizzard's and must never be committed.
 
 ## Terrain inspector (experimental)

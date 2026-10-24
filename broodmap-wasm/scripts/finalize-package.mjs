@@ -1,23 +1,21 @@
-import { copyFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
-const output = process.argv[2]
-if (output !== 'pkg' && output !== 'pkg-node') {
-  throw new Error('Expected a wasm-pack output directory: pkg or pkg-node')
-}
-
 const packageDir = path.resolve(import.meta.dirname, '..')
-const outputDir = path.join(packageDir, output)
+const outputDir = path.join(packageDir, 'pkg')
 
-// The parent package defines the exports. wasm-pack's generated ignore file would also make npm
-// leave these artifacts out of the published tarball; the parent .gitignore still covers them.
+// wasm-pack's generated ignore file would make npm leave the build out of the published tarball;
+// the package's own .gitignore still covers it.
 rmSync(path.join(outputDir, '.gitignore'), { force: true })
-// The parent package is an ES module package, so each output directory declares its own module
-// format: the web build is ESM, the Node build CommonJS.
-writeFileSync(
-  path.join(outputDir, 'package.json'),
-  JSON.stringify({ type: output === 'pkg' ? 'module' : 'commonjs' }, null, 2) + '\n',
-)
+
+// wasm-bindgen emits Symbol.dispose methods. Include their types even when consumers target an
+// earlier ECMAScript version, without requiring them to change their tsconfig's lib setting.
+const declarationsPath = path.join(outputDir, 'broodmap_wasm.d.ts')
+const declarations = readFileSync(declarationsPath, 'utf8')
+const disposableTypes = '/// <reference lib="esnext.disposable" />\n'
+if (!declarations.startsWith(disposableTypes)) {
+  writeFileSync(declarationsPath, disposableTypes + declarations)
+}
 
 // The licenses live at the repository root; the published package carries copies.
 for (const license of ['LICENSE-APACHE', 'LICENSE-MIT']) {
