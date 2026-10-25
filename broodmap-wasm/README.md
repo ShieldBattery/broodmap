@@ -73,7 +73,7 @@ Where the game install is readable synchronously (Node, Electron), `CascStorage`
 straight from its CASC storage, so no prefetch or extracted asset directory is needed:
 
 ```js
-const storage = new CascStorage(files) // opens .build.info, indices and catalogs (~70 ms)
+const storage = new CascStorage(files) // opens .build.info, indices and catalogs (~55 ms)
 const map = new MapRenderer(mapBytes)
 const missing = map.loadAssets(storage, opts) // art assets the install lacks; those degrade
 const png = map.renderPng(opts)

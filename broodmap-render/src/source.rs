@@ -336,11 +336,29 @@ impl<P: broodcasc::io::StorageProvider> CascSource<P> {
 
 #[cfg(feature = "casc")]
 impl<P: broodcasc::io::StorageProvider> TilesetDataSource for CascSource<P> {
+    /// Decodes straight into the returned `Arc`, so a large asset isn't held twice while a `Vec`
+    /// is copied into it.
     fn read(&self, req: &AssetRequest) -> Result<std::sync::Arc<[u8]>, SourceError> {
+        let path = req.casc_path();
+        // The size comes from the encoding table; bound it before allocating.
+        let limit = broodcasc::ReadLimits::default().max_decoded_bytes;
+        let size = usize::try_from(self.storage.file_size(&path).map_err(map_casc_error)?)
+            .ok()
+            .filter(|&size| size <= limit)
+            .ok_or_else(|| {
+                map_casc_error(broodcasc::CascError::LimitExceeded {
+                    what: "decoded file",
+                    limit,
+                })
+            })?;
+        let mut bytes: std::sync::Arc<[u8]> = std::iter::repeat_n(0, size).collect();
         self.storage
-            .read_file(&req.casc_path())
-            .map(Into::into)
-            .map_err(map_casc_error)
+            .read_file_into(
+                &path,
+                std::sync::Arc::get_mut(&mut bytes).expect("a new Arc is unique"),
+            )
+            .map_err(map_casc_error)?;
+        Ok(bytes)
     }
 }
 

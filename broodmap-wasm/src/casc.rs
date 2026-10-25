@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use broodcasc::io::{ReadAt, StorageProvider};
-use broodcasc::{CascError, ReadLimits, Storage, StorageOptions};
+use broodcasc::{CascError, ReadLimits, Storage};
 use broodmap_render::AssetRequest;
 use js_sys::{Array, Function, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
@@ -25,11 +25,6 @@ compile_error!("broodmap-wasm's CASC file access assumes a single-threaded wasm 
 /// The default for `cacheBytes`: roughly the whole asset set for the `original` style (the one
 /// `mainSD.anim`, all 8 SD tilesets and the GRPs), so repeated renders never decode twice.
 const DEFAULT_CACHE_BYTES: usize = 128 * 1024 * 1024;
-
-/// How much broodcasc may reserve up front for a decoded asset; beyond it the output grows by
-/// doubling. Its 8 MiB default made the ~38 MB `mainSD.anim` pass through 16, 32 and 64 MiB
-/// buffers, and WASM memory never shrinks back from that peak.
-const INITIAL_DECODE_RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The largest file position a JS number represents exactly (`Number.MAX_SAFE_INTEGER`).
 const MAX_JS_POSITION: u64 = (1 << 53) - 1;
@@ -122,15 +117,8 @@ impl CascStorage {
         let provider = JsProvider {
             files: Arc::new(JsFiles::from_object(&files)?),
         };
-        let read_limits = ReadLimits {
-            initial_reserve_bytes: INITIAL_DECODE_RESERVE_BYTES,
-            ..ReadLimits::default()
-        };
-        let storage = Storage::open_with_provider_and_options(
-            provider,
-            StorageOptions::new().with_read_limits(read_limits),
-        )
-        .map_err(|e| format!("failed to open CASC storage: {e}"))?;
+        let storage = Storage::open_with_provider(provider)
+            .map_err(|e| format!("failed to open CASC storage: {e}"))?;
         Ok(CascStorage {
             storage,
             cache: RefCell::new(AssetCache::new(
@@ -164,10 +152,28 @@ impl CascStorage {
         if let Some(bytes) = self.cache.borrow_mut().get(&path) {
             return Ok(bytes);
         }
-        let bytes: Arc<[u8]> = self.storage.read_file(&path)?.into();
+        let bytes = read_shared(&self.storage, &path)?;
         self.cache.borrow_mut().insert(path, bytes.clone());
         Ok(bytes)
     }
+}
+
+/// Reads and decodes `path` straight into a new `Arc`: one allocation of exactly its decoded size,
+/// rather than a `Vec` that converting into an `Arc` would copy.
+fn read_shared(storage: &Storage<JsProvider>, path: &str) -> Result<Arc<[u8]>, CascError> {
+    // The storage is opened with the default limits, and the size comes from the encoding table, so
+    // check it before allocating rather than leaving that to `read_file_into`.
+    let limit = ReadLimits::default().max_decoded_bytes;
+    let size = usize::try_from(storage.file_size(path)?)
+        .ok()
+        .filter(|&size| size <= limit)
+        .ok_or(CascError::LimitExceeded {
+            what: "decoded file",
+            limit,
+        })?;
+    let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, size).collect();
+    storage.read_file_into(path, Arc::get_mut(&mut bytes).expect("a new Arc is unique"))?;
+    Ok(bytes)
 }
 
 /// Decoded assets keyed by CASC path, bounded by total size, evicting the least recently used.

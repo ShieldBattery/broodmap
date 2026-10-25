@@ -23,8 +23,10 @@ broodmap-render = { version = "0.1.0", path = "../broodmap-render", default-feat
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 # CascStorage: CASC parsing over JS file callbacks. No default features: `fs` doesn't build for
-# wasm32, and the files come from the host.
-broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0", default-features = false }
+# wasm32, and the files come from the host. `fast-inflate` decodes ~12% faster for ~33 KB of wasm.
+broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "ea3556da602dca09f3b88517296ccb3772524098", default-features = false, features = [
+    "fast-inflate",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
