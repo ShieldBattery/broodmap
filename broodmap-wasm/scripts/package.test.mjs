@@ -20,7 +20,7 @@ test('npm publishes one build, the Node entry and the licenses', () => {
     'LICENSE-APACHE',
     'LICENSE-MIT',
     'README.md',
-    'node.js',
+    'node-entry.js',
     'package.json',
     'pkg/broodmap_wasm.d.ts',
     'pkg/broodmap_wasm.js',

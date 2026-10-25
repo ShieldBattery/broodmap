@@ -3,18 +3,18 @@
   "version": "0.2.0",
   "type": "module",
   "description": "WebAssembly bindings for broodmap: StarCraft: Brood War map summaries, previews and terrain analysis",
-  "main": "./node.js",
+  "main": "./node-entry.js",
   "types": "./pkg/broodmap_wasm.d.ts",
   "exports": {
     ".": {
       "types": "./pkg/broodmap_wasm.d.ts",
-      "node": "./node.js",
+      "node": "./node-entry.js",
       "default": "./pkg/broodmap_wasm.js"
     }
   },
   "files": [
     "pkg/broodmap_wasm*",
-    "node.js",
+    "node-entry.js",
     "LICENSE-APACHE",
     "LICENSE-MIT"
   ],
