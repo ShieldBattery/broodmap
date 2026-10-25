@@ -9,3 +9,10 @@ members = [
     "broodmap-render",
     "broodmap-wasm",
 ]
+
+# Whole-program optimization: the wasm package comes out ~8% smaller (1.86 to 1.71 MB) with no
+# loss of speed. Don't trade speed for size with opt-level "s"/"z": broodcasc measured them 3-5%
+# smaller but 25-50% slower at decoding.
+[profile.release]
+lto = true
+codegen-units = 1
