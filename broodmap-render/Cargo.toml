@@ -25,7 +25,7 @@ broodmap = { version = "0.1.0", path = "../broodmap" }
 broodmap-formats = { version = "0.1.0", path = "../broodmap-formats" }
 thiserror = "2.0"
 miniz_oxide = "0.8"
-broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "4c953f89b7e119e19cf0bdca71981e1d5a939de0", optional = true }
+broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "ea3556da602dca09f3b88517296ccb3772524098", optional = true }
 png = { version = "0.18", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
