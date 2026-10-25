@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_ok",
  "bitflags",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-analysis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "broodmap",
  "broodmap-formats",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "broodcasc",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-formats"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_ok",
  "bitflags",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_ok",
  "broodcasc",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "broodcasc",
  "broodmap",

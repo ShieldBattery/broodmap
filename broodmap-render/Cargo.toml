@@ -1,6 +1,6 @@
 [package]
 name = "broodmap-render"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -21,8 +21,8 @@ png = ["dep:png"]
 serde = ["dep:serde"]
 
 [dependencies]
-broodmap = { version = "0.1.0", path = "../broodmap" }
-broodmap-formats = { version = "0.1.0", path = "../broodmap-formats" }
+broodmap = { version = "0.2.0", path = "../broodmap" }
+broodmap-formats = { version = "0.2.0", path = "../broodmap-formats" }
 thiserror = "2.0"
 miniz_oxide = "0.8"
 broodcasc = { git = "https://github.com/ShieldBattery/broodcasc", rev = "ea3556da602dca09f3b88517296ccb3772524098", optional = true }

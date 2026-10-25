@@ -10,6 +10,10 @@ members = [
     "broodmap-wasm",
 ]
 
+# Shared by every crate, and by broodmap-wasm's npm package (`pnpm run check:versions`).
+[workspace.package]
+version = "0.2.0"
+
 # Whole-program optimization: the wasm package comes out ~8% smaller (1.86 to 1.71 MB) with no
 # loss of speed. Don't trade speed for size with opt-level "s"/"z": broodcasc measured them 3-5%
 # smaller but 25-50% slower at decoding.

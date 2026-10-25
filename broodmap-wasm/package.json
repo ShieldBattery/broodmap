@@ -1,6 +1,6 @@
 {
   "name": "@shieldbattery/broodmap",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "WebAssembly bindings for broodmap: StarCraft: Brood War map summaries, previews and terrain analysis",
   "main": "./node.js",
@@ -18,6 +18,9 @@
     "LICENSE-APACHE",
     "LICENSE-MIT"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.13.1"
   },
@@ -28,10 +31,11 @@
     "assets": "cargo run --release -p broodmap-cli -- fetch-assets --out examples/assets",
     "dev": "pnpm run build && vite",
     "build:demo": "pnpm run build && vite build",
-    "test": "node --test examples/*.test.mjs tests/topology-reference/*.test.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
+    "test": "pnpm run check:versions && node --test examples/*.test.mjs tests/topology-reference/*.test.mjs",
     "test:package": "node --test scripts/package.test.mjs",
     "test:types": "tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext scripts/types-consumer.ts && tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution Bundler scripts/types-consumer.ts",
-    "prepublishOnly": "pnpm run clean && pnpm run build && pnpm test && pnpm run test:package && pnpm run test:types"
+    "prepublishOnly": "pnpm run check:versions && pnpm run clean && pnpm run build && pnpm test && pnpm run test:package && pnpm run test:types"
   },
   "repository": {
     "type": "git",

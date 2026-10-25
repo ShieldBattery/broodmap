@@ -28,7 +28,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "broodmap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "bzip2",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-analysis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "broodmap",
  "broodmap-formats",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-formats"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "thiserror",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "broodmap-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "broodmap",
  "broodmap-formats",
