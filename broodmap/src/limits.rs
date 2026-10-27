@@ -78,7 +78,7 @@ impl Default for ResourceLimits {
             max_mpq_file_sectors: 128 * 1024,
             max_chk_bytes: 64 * MIB,
             max_chk_chunks: 64 * 1024,
-            max_chk_chunks_per_tag: 16 * 1024,
+            max_chk_chunks_per_tag: 64 * 1024,
             max_merged_chunk_bytes: 64 * MIB,
         }
     }

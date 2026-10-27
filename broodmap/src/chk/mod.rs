@@ -1314,6 +1314,16 @@ mod tests {
     }
 
     #[test]
+    fn default_limits_accept_many_padding_chunks_for_one_tag() {
+        // A released map (Tribe Control 1.4) pads its CHK with 16,396 mostly empty chunks under an
+        // all-zero tag.
+        let data = chunk(*b"\0\0\0\0", &[]).repeat(16 * 1024 + 12);
+
+        let sections = gather_chunk_map(&data, &ResourceLimits::default()).unwrap();
+        assert_eq!(sections[b"\0\0\0\0"].len(), 16 * 1024 + 12);
+    }
+
+    #[test]
     fn resource_limit_rejects_oversized_appended_chunk_data() {
         let data = [chunk(*b"UNIT", b"abc"), chunk(*b"UNIT", b"def")].concat();
         let limits = ResourceLimits {
