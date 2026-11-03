@@ -6,7 +6,8 @@ files, and offers handling for the archive format (MPQ) as well as the internal 
 
 ## Untrusted maps
 
-The default `ResourceLimits` cap extracted files at 64 MiB and MPQ sector expansion at 500:1.
+The default `ResourceLimits` cap extracted files and CHK data at 256 MiB, room for the largest
+CHKs in real maps (over 120 MB), and MPQ sector expansion at 500:1.
 Every decompression stage uses the original sector's actual byte length, including intermediate
 stages. A 4 KiB allowance preserves small sectors, and compatibility zero-padding also counts
 against the expansion limit. This is a per-sector policy, not a whole-upload ratio guarantee.
