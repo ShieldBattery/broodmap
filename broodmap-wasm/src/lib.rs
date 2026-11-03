@@ -183,8 +183,26 @@ impl LimitOptions {
 fn parse_map(map_bytes: &[u8], options: Option<&str>) -> Result<Chk, String> {
     let limits = LimitOptions::parse(options)?.limits();
     let (chk, _mpq) = extract_chk_from_map_with_limits(map_bytes, None, None, &limits)
-        .map_err(|e| format!("failed to parse map: {e}"))?;
+        .map_err(|e| format!("failed to parse map: {}", error_chain(&e)))?;
     Ok(chk)
+}
+
+/// An error's message followed by each of its sources', joined with `": "`. JS only receives the
+/// string, so a top-level message like "Failed to read MPQ" would otherwise hide the cause (such as
+/// which resource limit the file exceeded).
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // `#[error(transparent)]` wrappers repeat their source's message.
+        if !message.ends_with(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    message
 }
 
 fn parse_style(style: Option<&str>) -> Result<Option<ArtStyle>, String> {
@@ -576,6 +594,22 @@ mod tests {
         assert_eq!(
             loaded.render_png(options).unwrap(),
             prefetched.render_png(options).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_errors_name_the_exceeded_limit() {
+        let error = MapRenderer::new(
+            include_bytes!("../../broodmap/assets/lt.scm"),
+            Some(r#"{"maxMpqFileBytes":16}"#.into()),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.starts_with(
+                "failed to parse map: Failed to read MPQ: MPQ file bytes limit exceeded"
+            ),
+            "{error}"
         );
     }
 }
