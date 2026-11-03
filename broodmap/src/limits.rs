@@ -69,17 +69,20 @@ impl ResourceLimits {
 }
 
 impl Default for ResourceLimits {
+    /// Sizes leave room for the largest CHKs in real maps (over 120 MB), which the game loads, so
+    /// default limits only reject files no real map produces. The ratio and count limits are what
+    /// bound decompression bombs.
     fn default() -> Self {
         Self {
             max_map_bytes: 256 * MIB,
             max_mpq_table_entries: 512 * 1024,
-            max_mpq_file_bytes: 64 * MIB,
+            max_mpq_file_bytes: 256 * MIB,
             max_mpq_compression_ratio: 500,
             max_mpq_file_sectors: 128 * 1024,
-            max_chk_bytes: 64 * MIB,
+            max_chk_bytes: 256 * MIB,
             max_chk_chunks: 64 * 1024,
             max_chk_chunks_per_tag: 16 * 1024,
-            max_merged_chunk_bytes: 64 * MIB,
+            max_merged_chunk_bytes: 256 * MIB,
         }
     }
 }
