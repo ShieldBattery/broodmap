@@ -3,7 +3,8 @@
 use broodmap::chk::terrain::{TerrainTileIds, TileId};
 use broodmap::chk::tileset::Tileset;
 use broodmap_render::{
-    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, RenderOptions, render_terrain,
+    ArtPack, ArtStyle, AssetRequest, AssetTier, MemorySource, RenderOptions, TileRect,
+    render_terrain,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -79,4 +80,16 @@ fuzz_target!(|data: &[u8]| {
         ..Default::default()
     };
     let _ = render_terrain(&terrain, Tileset::Jungle, &source, &default_options);
+
+    // Pass 3: a region of the map (possibly hanging off its edges, which must clip).
+    let region_options = RenderOptions {
+        region: Some(TileRect {
+            x: (w_byte >> 4) as u32,
+            y: (h_byte >> 4) as u32,
+            width: (w_byte % 5) as u32,
+            height: (h_byte % 5) as u32,
+        }),
+        ..sd_options
+    };
+    let _ = render_terrain(&terrain, Tileset::Jungle, &source, &region_options);
 });

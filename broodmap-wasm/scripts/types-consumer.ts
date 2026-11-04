@@ -8,6 +8,8 @@ import init, {
   type CascFiles,
   type CascStorageOptions,
   type MapLimitOptions,
+  type MapRegion,
+  type MapRenderOptions,
   type MapSummary,
 } from '@shieldbattery/broodmap'
 
@@ -30,8 +32,13 @@ export function renderFromInstall(files: CascFiles, mapBytes: Uint8Array): Uint8
   const storage = new CascStorage(files, JSON.stringify(options))
   const map = new MapRenderer(mapBytes)
   try {
-    const missing: string[] = map.loadAssets(storage, '{}')
-    return missing.length ? new Uint8Array() : map.renderPng('{}')
+    const base: MapRenderOptions = { style: 'original', size: map.widthTiles * 32 }
+    const missing: string[] = map.loadAssets(storage, JSON.stringify(base))
+    if (missing.length) {
+      return new Uint8Array()
+    }
+    const region: MapRegion = { x: 0, y: 0, width: 16, height: 16 }
+    return map.renderPng(JSON.stringify({ ...base, region } satisfies MapRenderOptions))
   } finally {
     map.free()
     storage.free()

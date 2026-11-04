@@ -39,7 +39,17 @@
 //! rows of `out_w` pixels, and `out_w = map_w * ppt` while `ratio = tile_px / ppt`, so the `ppt`
 //! cancels: the ring is bounded by `~64 * tile_px * map_w` bytes (about 2 MiB at the worst legal
 //! map size), regardless of the requested output resolution.
+//!
+//! # Windows
+//!
+//! [`resample_linear`] can produce any rectangular window of the output rather than all of it,
+//! for region renders (`RenderOptions::region`). Each destination sample's taps are computed
+//! from its *global* index against the whole image's dimensions, by exactly the same arithmetic
+//! as for a whole-image resample, and accumulated in the same order, so a window is
+//! bit-identical to the same rectangle cropped out of the whole resample. Only the native rows
+//! and columns the window's taps reach ([`source_span`]) are ever requested.
 
+use std::ops::Range;
 use std::sync::OnceLock;
 
 /// A source of full-width native-resolution RGBA8 rows.
@@ -48,8 +58,9 @@ use std::sync::OnceLock;
 /// what lets the implementation (see `crate::terrain::StripCompositor`) keep only the tile-row
 /// strip currently being read.
 pub(crate) trait NativeRows {
-    /// Returns native row `y` as exactly `native_w * 4` RGBA8 bytes. A short row is tolerated
-    /// (the missing texels simply aren't sampled) but never expected.
+    /// Returns native row `y` as RGBA8 bytes, starting at the native column the caller passed
+    /// [`resample_linear`] as `row_origin` and covering at least the window's [`source_span`]. A
+    /// short row is tolerated (the missing texels simply aren't sampled) but never expected.
     fn row(&mut self, y: u32) -> &[u8];
 }
 
@@ -163,16 +174,20 @@ struct Axis {
 }
 
 impl Axis {
-    /// Builds the tap table mapping `src_len` source samples onto `dst_len` destination samples.
+    /// Builds the tap table mapping `src_len` source samples onto `dst_len` destination samples,
+    /// for the destination samples in `dst` only (entry `i` of the table is destination sample
+    /// `dst.start + i`). Every sample's taps depend only on its own global index and the two
+    /// lengths, so a sub-range's taps are exactly the whole table's taps for those samples.
     ///
     /// Destination sample centers map to source coordinates by the usual half-pixel convention
     /// (`(i + 0.5) * scale - 0.5`), and the kernel is stretched by `scale` when downscaling so it
     /// acts as a low-pass filter at the *destination* rate. Taps that fall outside the source are
     /// dropped and the surviving weights renormalized, which keeps the filter a partition of
     /// unity everywhere including the edges (no dark or bright rim).
-    fn build(src_len: u32, dst_len: u32) -> Axis {
-        let mut starts = Vec::with_capacity(dst_len as usize);
-        let mut offsets = Vec::with_capacity(dst_len as usize + 1);
+    fn build(src_len: u32, dst_len: u32, dst: Range<u32>) -> Axis {
+        let dst = dst.start.min(dst_len)..dst.end.min(dst_len);
+        let mut starts = Vec::with_capacity(dst.len());
+        let mut offsets = Vec::with_capacity(dst.len() + 1);
         let mut weights = Vec::new();
         let mut max_taps = 0usize;
 
@@ -192,7 +207,7 @@ impl Axis {
         let support = scale.max(1.0);
         let radius = 2.0 * support;
 
-        for i in 0..dst_len {
+        for i in dst {
             let center = (i as f32 + 0.5) * scale - 0.5;
             let lo = ((center - radius).ceil() as i64).max(0);
             let hi = ((center + radius).floor() as i64).min(src_len as i64 - 1);
@@ -238,46 +253,90 @@ impl Axis {
         let to = self.offsets[i + 1] as usize;
         (self.starts[i], &self.weights[from..to])
     }
+
+    /// The source samples this table's taps read: from the first sample's first tap to the
+    /// furthest any sample reaches. Empty for an empty table.
+    fn source_span(&self) -> Range<u32> {
+        let Some(&first) = self.starts.first() else {
+            return 0..0;
+        };
+        let end = (0..self.starts.len())
+            .map(|i| self.starts[i] + (self.offsets[i + 1] - self.offsets[i]))
+            .max()
+            .unwrap_or(first);
+        first..end
+    }
 }
 
-/// Resamples a native-resolution RGBA8 image (pulled one row at a time from `rows`) down to
-/// `out_w` x `out_h`, filtering in linear light with a separable Catmull-Rom kernel.
+/// The source samples (native rows or columns) that destination samples `dst` of a
+/// `src_len` -> `dst_len` resample read: what a compositor feeding [`resample_linear`] a window
+/// must provide, kernel margin included.
+pub(crate) fn source_span(src_len: u32, dst_len: u32, dst: Range<u32>) -> Range<u32> {
+    if src_len == 0 || dst_len == 0 {
+        return 0..0;
+    }
+    Axis::build(src_len, dst_len, dst).source_span()
+}
+
+/// Resamples a native-resolution `native_w` x `native_h` RGBA8 image (pulled one row at a time
+/// from `rows`) down to `out_w` x `out_h`, filtering in linear light with a separable Catmull-Rom
+/// kernel, and returns the `out_x` x `out_y` window of the result (`0..out_w` x `0..out_h` for
+/// all of it; both ranges are clamped to the output).
+///
+/// `rows` hands out rows starting at native column `row_origin`, which must be at or before the
+/// start of the window's horizontal [`source_span`]. A window is bit-identical to the same
+/// rectangle of the whole-image resample (see the module docs).
 ///
 /// Alpha is filtered as-is (linear, unencoded). Terrain is fully opaque, so there is no
 /// premultiplication question to answer here; the sprite overlay keeps its own premultiplied
 /// per-frame path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resample_linear(
     rows: &mut dyn NativeRows,
     native_w: u32,
     native_h: u32,
     out_w: u32,
     out_h: u32,
+    out_x: Range<u32>,
+    out_y: Range<u32>,
+    row_origin: u32,
 ) -> Vec<u8> {
-    let stride = out_w as usize * 4;
-    let mut out = vec![0u8; stride * out_h as usize];
+    let out_x = out_x.start.min(out_w)..out_x.end.min(out_w);
+    let out_y = out_y.start.min(out_h)..out_y.end.min(out_h);
+    let win_w = out_x.len() as u32;
+    let win_h = out_y.len() as u32;
+    let stride = win_w as usize * 4;
+    let mut out = vec![0u8; stride * win_h as usize];
     if out.is_empty() || native_w == 0 || native_h == 0 {
         return out;
     }
 
     let tables = tables();
-    let h_axis = Axis::build(native_w, out_w);
-    let v_axis = Axis::build(native_h, out_h);
+    let h_axis = Axis::build(native_w, out_w, out_x);
+    let v_axis = Axis::build(native_h, out_h, out_y);
 
     // Ring of horizontally-resampled rows, in linear light. Depth is exactly the widest vertical
     // window, which is what bounds this to a window rather than the whole native image.
     let window = v_axis.max_taps.max(1);
     let mut ring = vec![0f32; window * stride];
     let mut accum = vec![0f32; stride];
-    let mut produced: u32 = 0;
+    let mut produced: u32 = v_axis.source_span().start;
 
-    for oy in 0..out_h {
+    for oy in 0..win_h {
         let (v_start, v_weights) = v_axis.taps(oy as usize);
         let end = v_start + v_weights.len() as u32;
 
         while produced < end {
             let src = rows.row(produced);
             let slot = (produced % window as u32) as usize * stride;
-            resample_row_horizontal(src, &h_axis, out_w, tables, &mut ring[slot..slot + stride]);
+            resample_row_horizontal(
+                src,
+                &h_axis,
+                win_w,
+                row_origin,
+                tables,
+                &mut ring[slot..slot + stride],
+            );
             produced += 1;
         }
 
@@ -306,16 +365,19 @@ pub(crate) fn resample_linear(
     out
 }
 
-/// Horizontally resamples one native RGBA8 row into `dst` as linear-light `f32` RGBA.
+/// Horizontally resamples one native RGBA8 row (starting at native column `row_origin`) into
+/// `dst` as linear-light `f32` RGBA.
 fn resample_row_horizontal(
     src: &[u8],
     axis: &Axis,
     out_w: u32,
+    row_origin: u32,
     tables: &ColorTables,
     dst: &mut [f32],
 ) {
     for ox in 0..out_w as usize {
         let (start, weights) = axis.taps(ox);
+        let start = start.saturating_sub(row_origin);
         let mut acc = [0.0f32; 4];
         for (k, &weight) in weights.iter().enumerate() {
             let offset = (start as usize + k) * 4;
@@ -348,6 +410,143 @@ mod tests {
             let stride = self.width as usize * 4;
             &self.data[y as usize * stride..(y as usize + 1) * stride]
         }
+    }
+
+    /// A [`NativeRows`] handing out only columns `cols` of an in-memory image, recording which
+    /// rows were requested — what a region compositor provides.
+    struct WindowRows<'a> {
+        data: &'a [u8],
+        width: u32,
+        cols: Range<u32>,
+        requested: Vec<u32>,
+    }
+
+    impl NativeRows for WindowRows<'_> {
+        fn row(&mut self, y: u32) -> &[u8] {
+            self.requested.push(y);
+            let start = (y * self.width + self.cols.start) as usize * 4;
+            let end = (y * self.width + self.cols.end) as usize * 4;
+            &self.data[start..end]
+        }
+    }
+
+    /// Resamples all of an image (the whole-image case of [`resample_linear`]).
+    fn resample_whole(
+        rows: &mut dyn NativeRows,
+        native_w: u32,
+        native_h: u32,
+        out_w: u32,
+        out_h: u32,
+    ) -> Vec<u8> {
+        resample_linear(
+            rows,
+            native_w,
+            native_h,
+            out_w,
+            out_h,
+            0..out_w,
+            0..out_h,
+            0,
+        )
+    }
+
+    /// A deterministic, high-frequency test image (so every tap weight matters).
+    fn noise_image(width: u32, height: u32) -> Vec<u8> {
+        let mut data = vec![0u8; width as usize * height as usize * 4];
+        let mut state = 0x9E37_79B9u32;
+        for byte in &mut data {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        data
+    }
+
+    fn crop(image: &[u8], width: u32, x: Range<u32>, y: Range<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in y {
+            let start = (row * width + x.start) as usize * 4;
+            let end = (row * width + x.end) as usize * 4;
+            out.extend_from_slice(&image[start..end]);
+        }
+        out
+    }
+
+    /// A window of the resample is bit-identical to the same rectangle of the whole resample,
+    /// fed only the native columns [`source_span`] names and requesting only the native rows it
+    /// names — at interior windows, windows touching each edge, and integer and non-integer
+    /// ratios alike.
+    #[test]
+    fn windows_are_bit_identical_crops_of_the_whole_resample() {
+        for (native, out) in [(128u32, 32u32), (96, 48), (160, 20), (100, 37), (64, 64)] {
+            let image = noise_image(native, native);
+            let whole = resample_whole(
+                &mut Rows {
+                    data: image.clone(),
+                    width: native,
+                },
+                native,
+                native,
+                out,
+                out,
+            );
+
+            let third = out / 3;
+            for (x, y) in [
+                (0..out, 0..out),
+                (0..third, 0..third),
+                (third..2 * third, third..out),
+                (out - 1..out, 0..1),
+                (third + 1..out, 2..third + 3),
+            ] {
+                let cols = source_span(native, out, x.clone());
+                let rows_span = source_span(native, out, y.clone());
+                let mut rows = WindowRows {
+                    data: &image,
+                    width: native,
+                    cols: cols.clone(),
+                    requested: Vec::new(),
+                };
+                let window = resample_linear(
+                    &mut rows,
+                    native,
+                    native,
+                    out,
+                    out,
+                    x.clone(),
+                    y.clone(),
+                    cols.start,
+                );
+                assert_eq!(
+                    window,
+                    crop(&whole, out, x.clone(), y.clone()),
+                    "{native}->{out} window {x:?} x {y:?}"
+                );
+                assert!(
+                    rows.requested.iter().all(|r| rows_span.contains(r)),
+                    "{native}->{out} window {x:?} x {y:?} read rows outside {rows_span:?}"
+                );
+            }
+        }
+    }
+
+    /// The source span is the window plus the kernel's reach (two destination samples' worth of
+    /// source on each side when downscaling), clipped to the image.
+    #[test]
+    fn source_span_covers_the_kernel_margin_and_clips_at_the_edges() {
+        // 4:1 downscale: the kernel reaches 2 * 4 = 8 source samples either side of a centre.
+        assert_eq!(source_span(128, 32, 0..32), 0..128);
+        let span = source_span(128, 32, 8..16);
+        assert!(span.start >= 32 - 8 - 2 && span.start < 32, "{span:?}");
+        assert!(span.end > 64 && span.end <= 64 + 8 + 2, "{span:?}");
+        assert_eq!(source_span(128, 32, 0..4).start, 0);
+        assert_eq!(source_span(128, 32, 28..32).end, 128);
+        // Identity: each output sample reads its own source sample and its neighbours.
+        let span = source_span(64, 64, 10..20);
+        assert!(span.start >= 8 && span.end <= 22, "{span:?}");
+        assert_eq!(source_span(0, 4, 0..4), 0..0);
+        assert_eq!(source_span(4, 4, 2..2), 0..0);
     }
 
     #[test]
@@ -389,7 +588,7 @@ mod tests {
     #[test]
     fn axis_weights_sum_to_one_everywhere() {
         for (src, dst) in [(64u32, 8u32), (128, 3), (100, 7), (8, 8), (5, 4), (1, 1)] {
-            let axis = Axis::build(src, dst);
+            let axis = Axis::build(src, dst, 0..dst);
             for i in 0..dst as usize {
                 let (_, weights) = axis.taps(i);
                 let sum: f32 = weights.iter().sum();
@@ -405,7 +604,7 @@ mod tests {
     #[test]
     fn axis_windows_never_exceed_the_ring_depth() {
         for (src, dst) in [(64u32, 8u32), (128, 5), (37, 9)] {
-            let axis = Axis::build(src, dst);
+            let axis = Axis::build(src, dst, 0..dst);
             for i in 0..dst as usize {
                 let (_, weights) = axis.taps(i);
                 assert!(weights.len() <= axis.max_taps);
@@ -444,7 +643,7 @@ mod tests {
             texel.copy_from_slice(&[137, 42, 200, 255]);
         }
 
-        let out = resample_linear(&mut rows, width as u32, height as u32, 8, 8);
+        let out = resample_whole(&mut rows, width as u32, height as u32, 8, 8);
         for texel in out.as_chunks::<4>().0 {
             assert_eq!(*texel, [137, 42, 200, 255], "a flat field must stay flat");
         }
@@ -467,7 +666,7 @@ mod tests {
             width: width as u32,
         };
 
-        let out = resample_linear(&mut rows, width as u32, 1, 8, 1);
+        let out = resample_whole(&mut rows, width as u32, 1, 8, 1);
         let luma: Vec<u8> = out.as_chunks::<4>().0.iter().map(|t| t[0]).collect();
 
         assert_eq!(luma[0], 0, "far from the seam the tiles keep their color");
@@ -497,8 +696,8 @@ mod tests {
             width: width as u32,
         };
         assert_eq!(
-            resample_linear(&mut a, width as u32, height as u32, 7, 7),
-            resample_linear(&mut b, width as u32, height as u32, 7, 7)
+            resample_whole(&mut a, width as u32, height as u32, 7, 7),
+            resample_whole(&mut b, width as u32, height as u32, 7, 7)
         );
     }
 
@@ -510,7 +709,7 @@ mod tests {
             data: vec![0, 0, 0, 255, 255, 255, 255, 255],
             width: 2,
         };
-        let out = resample_linear(&mut rows, 2, 1, 1, 1);
+        let out = resample_whole(&mut rows, 2, 1, 1, 1);
         assert!(
             (185..=190).contains(&out[0]),
             "expected the linear-light mid-gray (~188), got {}",
@@ -525,7 +724,7 @@ mod tests {
             data: vec![255, 255, 255, 0, 255, 255, 255, 255],
             width: 2,
         };
-        let out = resample_linear(&mut rows, 2, 1, 1, 1);
+        let out = resample_whole(&mut rows, 2, 1, 1, 1);
         assert!((126..=129).contains(&out[3]), "got alpha {}", out[3]);
     }
 
@@ -535,9 +734,9 @@ mod tests {
             data: vec![1, 2, 3, 4],
             width: 1,
         };
-        assert!(resample_linear(&mut rows, 1, 1, 0, 4).is_empty());
+        assert!(resample_whole(&mut rows, 1, 1, 0, 4).is_empty());
         assert!(
-            resample_linear(&mut rows, 0, 0, 4, 4)
+            resample_whole(&mut rows, 0, 0, 4, 4)
                 .iter()
                 .all(|&b| b == 0)
         );

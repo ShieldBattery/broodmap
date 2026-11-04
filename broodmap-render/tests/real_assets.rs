@@ -12,10 +12,10 @@
 use broodmap::extract_chk_from_map;
 use broodmap_formats::{MainSdAnim, parse_grp_header};
 use broodmap_render::{
-    ArtStyle, AssetRequest, CascSource, GameData, RenderOptions, StartLocations, TilesetDataSource,
-    build_minimap_table, compress_minimap_table, render_chk_preview, render_terrain,
-    required_preview_assets, required_preview_assets_for_chk, required_preview_graphics,
-    required_preview_graphics_for_chk, required_terrain_assets,
+    ArtStyle, AssetRequest, CascSource, GameData, MemorySource, RenderOptions, StartLocations,
+    TileRect, TilesetDataSource, UnitFilter, build_minimap_table, compress_minimap_table,
+    render_chk_preview, render_terrain, required_preview_assets, required_preview_assets_for_chk,
+    required_preview_graphics, required_preview_graphics_for_chk, required_terrain_assets,
 };
 
 fn scr_source() -> Option<CascSource> {
@@ -478,4 +478,105 @@ fn committed_jungle_minimap_table_matches_a_fresh_generation() {
         "committed jungle.bin has drifted from a fresh `gen-minimap-tables` run -- regenerate \
          and commit the 8 tables"
     );
+}
+
+/// Region renders (`RenderOptions::region`) are exact crops of the whole-map render, on real
+/// maps with real art: every 512px tile of the map at SD's native 32 px/tile and at a 2:1
+/// downscale (16 px/tile, where terrain filter windows reach across region edges), plus a
+/// Remastered (HD2, 4:1) pass, and an unaligned region cutting through units, doodads and
+/// start-location tokens at odd places. Maps include dense UMS unit placements (as-placed) and
+/// melee maps with resources and doodads at the map edges.
+///
+/// Regions render from a `MemorySource` prefetched with the *whole-map* two-round lists, the
+/// flow a tiling consumer uses (load once, render many regions), so this also checks that the
+/// whole-map lists cover every region.
+#[test]
+fn region_renders_are_exact_crops_of_real_whole_map_renders() {
+    let Some(source) = scr_source() else {
+        eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+        return;
+    };
+
+    let assets = concat!(env!("CARGO_MANIFEST_DIR"), "/../broodmap/assets/");
+    for name in [
+        "lt.scm",
+        "Impossible_Scen._Future.scx",
+        "OcOc_Bound_2(p).scx",
+        "Sniper_Seed_vA.scx",
+    ] {
+        let map_bytes = std::fs::read(format!("{assets}{name}")).unwrap();
+        let (chk, _mpq) = extract_chk_from_map(&map_bytes, None, None).unwrap();
+        let terrain = chk.terrain().unwrap();
+        let (map_w, map_h) = (terrain.width as u32, terrain.height as u32);
+
+        for (style, ppt, unit_filter) in [
+            (ArtStyle::Original, 32, UnitFilter::AsPlaced),
+            (ArtStyle::Original, 16, UnitFilter::Melee),
+            (ArtStyle::Remastered, 16, UnitFilter::AsPlaced),
+        ] {
+            let options = |region: Option<TileRect>| RenderOptions {
+                art_style: style,
+                max_dimension: Some(map_w.max(map_h) * ppt),
+                max_output_pixels: u32::MAX,
+                unit_filter,
+                region,
+                ..Default::default()
+            };
+            let mut memory = MemorySource::new();
+            for request in required_preview_assets_for_chk(&chk, &options(None)) {
+                memory.insert(request.clone(), source.read(&request).unwrap().to_vec());
+            }
+            let data = GameData::load(&memory).unwrap();
+            for request in required_preview_graphics_for_chk(&chk, &data, &options(None)) {
+                if let Ok(bytes) = source.read(&request) {
+                    memory.insert(request, bytes.to_vec());
+                }
+            }
+
+            let whole = render_chk_preview(&chk, &source, &options(None))
+                .unwrap()
+                .image;
+            assert_eq!((whole.width, whole.height), (map_w * ppt, map_h * ppt));
+
+            let tile = 512 / ppt;
+            let mut regions = vec![TileRect {
+                x: 7,
+                y: 5,
+                width: 9,
+                height: 13,
+            }];
+            for y in (0..map_h).step_by(tile as usize) {
+                for x in (0..map_w).step_by(tile as usize) {
+                    regions.push(TileRect {
+                        x,
+                        y,
+                        width: tile,
+                        height: tile,
+                    });
+                }
+            }
+
+            for region in regions {
+                let image = render_chk_preview(&chk, &memory, &options(Some(region)))
+                    .unwrap()
+                    .image;
+                let clipped = region.clip(map_w, map_h);
+                assert_eq!(
+                    (image.width, image.height),
+                    (clipped.width * ppt, clipped.height * ppt)
+                );
+                let row_bytes = image.width as usize * 4;
+                for row in 0..image.height {
+                    let src =
+                        ((clipped.y * ppt + row) * whole.width + clipped.x * ppt) as usize * 4;
+                    let dst = row as usize * row_bytes;
+                    assert!(
+                        image.data[dst..dst + row_bytes] == whole.data[src..src + row_bytes],
+                        "{name} {style:?} {ppt}px/tile: region {region:?} row {row} differs \
+                         from the whole-map render"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -414,6 +414,7 @@ fn write_plan_execute_seed(seeds_root: &Path) {
         width: 64,
         height: 64,
         px_per_tile: 32,
+        region: None,
         terrain: TerrainPlan {
             tileset: Tileset::Jungle,
             tier: AssetTier::Sd,

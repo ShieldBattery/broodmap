@@ -29,9 +29,15 @@
 //!   instead.
 //! - **Blocks**: solid player-token rectangles (start locations), drawn over everything, each
 //!   centred on `(x, y)` with the given logical-pixel size.
+//! - **Region**: when `region` is set, the output is that rectangle of tiles of the whole-map
+//!   image described above, not the whole image: place everything in whole-map output pixels,
+//!   then translate by `-(region.x * px_per_tile, region.y * px_per_tile)` and clip. Terrain
+//!   filtering still uses the whole map's grid, so the region's edge pixels sample the terrain
+//!   just outside it.
 
 use broodmap::chk::tileset::Tileset;
 
+use crate::options::TileRect;
 use crate::source::AssetRequest;
 use crate::tier::{ArtPack, AssetTier};
 
@@ -41,13 +47,23 @@ use crate::tier::{ArtPack, AssetTier};
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RenderPlan {
-    /// Output image width in pixels (`terrain.width * px_per_tile`).
+    /// Output image width in pixels (`terrain.width * px_per_tile`, or `region.width *
+    /// px_per_tile` for a region plan).
     pub width: u32,
-    /// Output image height in pixels (`terrain.height * px_per_tile`).
+    /// Output image height in pixels (`terrain.height * px_per_tile`, or `region.height *
+    /// px_per_tile` for a region plan).
     pub height: u32,
     /// Output pixels per map tile. The sprite-space zoom is `px_per_tile / 32` output pixels
     /// per logical pixel.
     pub px_per_tile: u32,
+    /// The rectangle of tiles drawn, already clipped to the map, when the plan is for a region
+    /// render (`crate::RenderOptions::region`); `None` draws the whole map. `sprites` then holds
+    /// only what can reach the region, and `manifest` only their art.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub region: Option<TileRect>,
     /// The terrain layer.
     pub terrain: TerrainPlan,
     /// The tier every sprite's art comes from.

@@ -92,6 +92,69 @@ pub struct RenderOptions {
     /// `docs/render-design.md`). Applies to `UNIT`-chunk units, THG2 unit-sprites, and THG2
     /// doodad sprites alike; start-location graphics never get one. Default `true`.
     pub show_shadows: bool,
+    /// Render only this rectangle of the map (in tiles) instead of the whole map. `None` (the
+    /// default) renders the whole map.
+    ///
+    /// A region render is exactly the matching crop of the whole-map render with the same
+    /// options, pixel for pixel: the resolution and asset tiers are still resolved from the
+    /// *whole* map's dimensions (so `max_dimension` and `max_output_pixels` mean what they mean
+    /// for a whole-map render, and every region of a map rendered with the same options shares
+    /// one pixel grid), and everything that straddles the region's edges — terrain filter
+    /// windows, units, sprites, shadows, start-location tokens — is drawn clipped, not skipped.
+    /// Regions rendered side by side therefore tile into the whole-map image with no seams.
+    ///
+    /// The output is `width * ppt` x `height * ppt` pixels, where `ppt` is the whole map's
+    /// resolved pixels per tile. Only the terrain under the region (plus the resampling
+    /// kernel's margin) is composited and only units/sprites that can reach the region are
+    /// drawn, so cost and peak memory scale with the region rather than the map.
+    ///
+    /// The rectangle is clipped to the map; a region entirely outside it renders as a 0x0
+    /// image.
+    pub region: Option<TileRect>,
+}
+
+/// A rectangle of a map, in tiles. See [`RenderOptions::region`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TileRect {
+    /// Left edge, in tiles from the map's left edge.
+    pub x: u32,
+    /// Top edge, in tiles from the map's top edge.
+    pub y: u32,
+    /// Width in tiles.
+    pub width: u32,
+    /// Height in tiles.
+    pub height: u32,
+}
+
+impl TileRect {
+    /// The whole of a `map_w` x `map_h` map.
+    pub fn full(map_w: u32, map_h: u32) -> TileRect {
+        TileRect {
+            x: 0,
+            y: 0,
+            width: map_w,
+            height: map_h,
+        }
+    }
+
+    /// This rectangle intersected with a `map_w` x `map_h` map. The result may be empty
+    /// (zero width or height).
+    pub fn clip(&self, map_w: u32, map_h: u32) -> TileRect {
+        let x = self.x.min(map_w);
+        let y = self.y.min(map_h);
+        TileRect {
+            x,
+            y,
+            width: self.width.min(map_w - x),
+            height: self.height.min(map_h - y),
+        }
+    }
+
+    /// Whether the rectangle covers no tiles.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
 }
 
 impl Default for RenderOptions {
@@ -108,6 +171,7 @@ impl Default for RenderOptions {
             show_doodad_sprites: true,
             show_neutral_buildings: true,
             show_shadows: true,
+            region: None,
         }
     }
 }
@@ -118,6 +182,15 @@ impl RenderOptions {
     pub fn effective_unit_style(&self) -> ArtStyle {
         self.unit_style.unwrap_or(self.art_style)
     }
+
+    /// The tiles a render of a `map_w` x `map_h` map draws: [`Self::region`] clipped to the map,
+    /// or the whole map when no region is set.
+    pub(crate) fn drawn_tiles(&self, map_w: u32, map_h: u32) -> TileRect {
+        match self.region {
+            Some(region) => region.clip(map_w, map_h),
+            None => TileRect::full(map_w, map_h),
+        }
+    }
 }
 
 /// The assets a [`crate::render_terrain`] call with these inputs will request from its
@@ -125,7 +198,9 @@ impl RenderOptions {
 /// the render is sync over a [`crate::MemorySource`]) know exactly what to load without
 /// duplicating the renderer's tier-selection logic.
 ///
-/// `map_w`/`map_h` are the map's dimensions in tiles (`TerrainTileIds::width`/`height`).
+/// `map_w`/`map_h` are the map's dimensions in tiles (`TerrainTileIds::width`/`height`). A
+/// [`RenderOptions::region`] render needs the same terrain assets as the whole map: the tier is
+/// resolved from the whole map either way.
 pub fn required_terrain_assets(
     tileset: Tileset,
     map_w: u32,

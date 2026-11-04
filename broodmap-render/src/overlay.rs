@@ -23,6 +23,15 @@
 //!
 //! The render's zoom is `z = ppt / 32` output pixels per logical pixel, so a frame's bitmap
 //! scales by `z / anim.scale()` and its placement offsets (4K units) by `z / 4`.
+//!
+//! # Regions
+//!
+//! A region render (`RenderOptions::region`) draws a [`Viewport`] of the whole-map output image.
+//! Every placement is computed in whole-image output pixels exactly as for a whole-map render and
+//! only then translated by the viewport's (integer) origin, and every tile is built independently
+//! of where it lands, so a sprite straddling the region's edge contributes exactly the pixels it
+//! would to the whole-map render, clipped. Sprites that can't reach the viewport are skipped,
+//! which changes nothing inside it: compositing is per pixel, in painter order.
 
 use std::collections::HashMap;
 
@@ -44,7 +53,9 @@ use crate::gamedata::{
     UNIT_IDS_MINERAL_FIELD, anim_request, is_critter, is_resource,
 };
 use crate::image::{RgbaImage, scale_rgba_premultiplied};
-use crate::options::{RenderOptions, StartLocations, UnitFilter, resolve_tier, resolve_unit_tier};
+use crate::options::{
+    RenderOptions, StartLocations, TileRect, UnitFilter, resolve_tier, resolve_unit_tier,
+};
 use crate::plan::{PlannedBlock, PlannedSprite, RenderPlan, SdCanvasSource, TerrainPlan};
 use crate::source::{AssetRequest, DatKind, TilesetDataSource};
 use crate::terrain::{MAX_TERRAIN_DIM, megatile_grid, rasterize_terrain};
@@ -187,13 +198,17 @@ pub fn plan_preview(
     let map_h = terrain.height.min(MAX_TERRAIN_DIM) as u32;
     let (terrain_tier, terrain_pack, ppt) = resolve_tier(options, map_w, map_h);
     let (unit_tier, unit_pack) = resolve_unit_tier(options, ppt);
+    let region = options.drawn_tiles(map_w, map_h);
+    let plan_region = options.region.map(|_| region);
 
-    // A zero-dimension map plans (and renders) as an empty image; nothing is read at all.
-    if map_w == 0 || map_h == 0 {
+    // A zero-dimension map (or a region entirely off the map) plans and renders as an empty
+    // image; nothing is read at all.
+    if region.is_empty() {
         return Ok(RenderPlan {
             width: 0,
             height: 0,
             px_per_tile: ppt,
+            region: plan_region,
             terrain: TerrainPlan {
                 tileset,
                 tier: terrain_tier,
@@ -222,7 +237,14 @@ pub fn plan_preview(
     let mut planned_sprites = Vec::new();
     let mut sd_canvases: Vec<SdCanvasSource> = Vec::new();
     if let Some(data) = data.as_ref() {
-        let drawables = collect_drawables(units, sprites, data, options, tileset);
+        let mut drawables = collect_drawables(units, sprites, data, options, tileset);
+        if options.region.is_some() {
+            // Only what can reach the region is planned (and so only its art is in the
+            // manifest); `execute_plan` would cull the rest at draw time by the same test.
+            let viewport = Viewport::of(region, ppt);
+            let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
+            drawables.retain(|d| could_possibly_be_visible(d.x, d.y, viewport, zoom));
+        }
         for drawable in &drawables {
             planned_sprites.push(PlannedSprite {
                 image_id: drawable.art_image_id,
@@ -293,9 +315,10 @@ pub fn plan_preview(
     }
 
     Ok(RenderPlan {
-        width: map_w * ppt,
-        height: map_h * ppt,
+        width: region.width * ppt,
+        height: region.height * ppt,
         px_per_tile: ppt,
+        region: plan_region,
         terrain: TerrainPlan {
             tileset,
             tier: terrain_tier,
@@ -356,9 +379,10 @@ pub fn plan_chk_preview(
 /// untrusted: the terrain grid dimensions are clamped to the CHK format's 256-tile maximum and
 /// `px_per_tile` to the largest real tier's 128, bounding the output buffer by construction.
 /// The declared `width`/`height` are informational — output dimensions are derived from the
-/// (clamped) tile grid, so a plan whose fields disagree draws the consistent interpretation
-/// rather than erroring. Missing/undecodable art degrades exactly like the direct render path:
-/// per drawable, never a failure; only the terrain texture itself is a hard error.
+/// (clamped) tile grid and `region` (itself clipped to the grid), so a plan whose fields disagree
+/// draws the consistent interpretation rather than erroring. Missing/undecodable art degrades
+/// exactly like the direct render path: per drawable, never a failure; only the terrain texture
+/// itself is a hard error.
 pub fn execute_plan(
     plan: &RenderPlan,
     source: &dyn TilesetDataSource,
@@ -366,7 +390,11 @@ pub fn execute_plan(
     let map_w = plan.terrain.width.min(MAX_TERRAIN_DIM as u32);
     let map_h = plan.terrain.height.min(MAX_TERRAIN_DIM as u32);
     let ppt = plan.px_per_tile.clamp(1, AssetTier::Hd.tile_px());
-    if map_w == 0 || map_h == 0 {
+    let region = match plan.region {
+        Some(region) => region.clip(map_w, map_h),
+        None => TileRect::full(map_w, map_h),
+    };
+    if region.is_empty() {
         return Ok(RgbaImage {
             width: 0,
             height: 0,
@@ -378,6 +406,7 @@ pub fn execute_plan(
         &plan.terrain.megatiles,
         map_w,
         map_h,
+        region,
         plan.terrain.tileset,
         plan.terrain.tier,
         plan.terrain.pack,
@@ -386,11 +415,13 @@ pub fn execute_plan(
     )?;
 
     let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
+    let viewport = Viewport::of(region, ppt);
     // An empty sprite list skips the overlay entirely (in particular, the SD `mainSD.anim`
     // bundle is never fetched), matching the direct render path's behavior for unit-less maps.
     if !plan.sprites.is_empty() {
         draw_overlay(
             &mut image,
+            viewport,
             &plan.sprites,
             &plan.sd_canvases,
             source,
@@ -400,7 +431,7 @@ pub fn execute_plan(
         );
     }
 
-    draw_planned_blocks(&mut image, &plan.blocks, zoom);
+    draw_planned_blocks(&mut image, viewport, &plan.blocks, zoom);
 
     Ok(image)
 }
@@ -503,7 +534,9 @@ pub fn required_preview_graphics_for_chk(
 /// the per-image GRP header fetch `crate::overlay::draw_overlay`'s SD branch does at render time.
 ///
 /// `map_w`/`map_h` (in tiles) are needed to derive the same effective resolution — and therefore
-/// the same asset tier — the render itself will pick.
+/// the same asset tier — the render itself will pick. With [`RenderOptions::region`] set, only
+/// the art for units and sprites that can reach the region is listed, by the same test the
+/// renderer uses to skip the rest; the list for the whole map (no region) covers every region.
 pub fn required_preview_graphics(
     units: &[PlacedUnit],
     sprites: &[Sprite],
@@ -512,12 +545,23 @@ pub fn required_preview_graphics(
     map_h: u32,
     options: &RenderOptions,
 ) -> Vec<AssetRequest> {
+    let map_w = map_w.min(MAX_TERRAIN_DIM as u32);
+    let map_h = map_h.min(MAX_TERRAIN_DIM as u32);
     let (_, _, ppt) = resolve_tier(options, map_w, map_h);
     let (tier, pack) = resolve_unit_tier(options, ppt);
 
     // The tileset only selects the geyser's *frame*, never which image is loaded, so any value
     // yields the same asset list.
-    let drawables = collect_drawables(units, sprites, data, options, Tileset::Badlands);
+    let mut drawables = collect_drawables(units, sprites, data, options, Tileset::Badlands);
+    if options.region.is_some() {
+        let region = options.drawn_tiles(map_w, map_h);
+        if region.is_empty() {
+            return Vec::new();
+        }
+        let viewport = Viewport::of(region, ppt);
+        let zoom = ppt as f32 / LOGICAL_PX_PER_TILE;
+        drawables.retain(|d| could_possibly_be_visible(d.x, d.y, viewport, zoom));
+    }
 
     let mut seen = Vec::new();
     for drawable in &drawables {
@@ -1057,19 +1101,45 @@ const MAX_OVERLAY_TILE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// that can only ever land off-screen.
 const MAX_PLAUSIBLE_SPRITE_HALF_EXTENT_LOGICAL_PX: f32 = 512.0;
 
-/// Conservative, position-only visibility test applied before a drawable's `.anim` is fetched:
-/// `false` only when the drawable's placed position is so far outside the image that no frame,
-/// however large a real one could plausibly be, could reach back onto it.
-fn could_possibly_be_visible(x: i32, y: i32, image_w: u32, image_h: u32, zoom: f32) -> bool {
-    let margin = (MAX_PLAUSIBLE_SPRITE_HALF_EXTENT_LOGICAL_PX * zoom).max(1.0);
-    let (x, y) = (x as f32 * zoom, y as f32 * zoom);
-    x + margin >= 0.0
-        && x - margin <= image_w as f32
-        && y + margin >= 0.0
-        && y - margin <= image_h as f32
+/// The part of the whole-map output image a render draws, in whole-image output pixels: all of
+/// it, or a region of it (see the module docs). The rendered image's pixel `(0, 0)` is the
+/// viewport's `(x, y)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Viewport {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
-/// Whether an output-space rect `[x, x + w) x [y, y + h)` intersects the image bounds at all.
+impl Viewport {
+    /// The viewport of `region` (tiles, clipped to a map of at most 256x256) at `ppt` output
+    /// pixels per tile (at most 128), so every coordinate fits an `i32` comfortably.
+    fn of(region: TileRect, ppt: u32) -> Viewport {
+        Viewport {
+            x: (region.x * ppt) as i32,
+            y: (region.y * ppt) as i32,
+            width: region.width * ppt,
+            height: region.height * ppt,
+        }
+    }
+}
+
+/// Conservative, position-only visibility test applied before a drawable's `.anim` is fetched:
+/// `false` only when the drawable's placed position is so far outside the viewport that no frame,
+/// however large a real one could plausibly be, could reach back onto it.
+fn could_possibly_be_visible(x: i32, y: i32, viewport: Viewport, zoom: f32) -> bool {
+    let margin = (MAX_PLAUSIBLE_SPRITE_HALF_EXTENT_LOGICAL_PX * zoom).max(1.0);
+    let (x, y) = (x as f32 * zoom, y as f32 * zoom);
+    let (left, top) = (viewport.x as f32, viewport.y as f32);
+    x + margin >= left
+        && x - margin <= left + viewport.width as f32
+        && y + margin >= top
+        && y - margin <= top + viewport.height as f32
+}
+
+/// Whether an output-space rect `[x, x + w) x [y, y + h)` (relative to the rendered image)
+/// intersects the image bounds at all.
 fn rect_intersects_image(x: i32, y: i32, w: u32, h: u32, image_w: u32, image_h: u32) -> bool {
     if w == 0 || h == 0 {
         return false;
@@ -1080,15 +1150,19 @@ fn rect_intersects_image(x: i32, y: i32, w: u32, h: u32, image_w: u32, image_h: 
 }
 
 /// Fetches art for every distinct image among `sprites`, builds the output tiles, and blits
-/// them onto `image` in `sprites`' (already painter-sorted) order.
+/// them onto `image` (which holds `viewport` of the whole-map output) in `sprites'` (already
+/// painter-sorted) order.
 ///
 /// Art is loaded one image at a time and its atlases dropped before moving on, so peak memory is
 /// one decoded atlas plus the (small, output-resolution) tiles — never every atlas at once. A
-/// sprite unambiguously off the output image never triggers its `.anim`'s fetch at all (see
-/// [`could_possibly_be_visible`]), and one whose exact placement rect clips entirely off the
-/// image is dropped before its tile is built (see [`rect_intersects_image`]).
+/// sprite unambiguously off the viewport never triggers its `.anim`'s fetch at all (see
+/// [`could_possibly_be_visible`]), one whose exact placement rect clips entirely off it is
+/// dropped before its tile is built (see [`rect_intersects_image`]), and an image none of whose
+/// sprites land on it is never decoded.
+#[allow(clippy::too_many_arguments)]
 fn draw_overlay(
     image: &mut RgbaImage,
+    viewport: Viewport,
     sprites: &[PlannedSprite],
     sd_canvases: &[SdCanvasSource],
     source: &dyn TilesetDataSource,
@@ -1103,7 +1177,7 @@ fn draw_overlay(
     // even enters this map, so its image is never fetched if nothing else needs it.
     let mut by_image: HashMap<u16, Vec<usize>> = HashMap::new();
     for (i, sprite) in sprites.iter().enumerate() {
-        if !could_possibly_be_visible(sprite.x, sprite.y, image_w, image_h, zoom) {
+        if !could_possibly_be_visible(sprite.x, sprite.y, viewport, zoom) {
             continue;
         }
         by_image.entry(sprite.image_id).or_default().push(i);
@@ -1148,11 +1222,11 @@ fn draw_overlay(
             };
             anim
         };
-        let Some(diffuse) = anim.layer("diffuse").and_then(decode_layer) else {
-            continue;
-        };
-        let teamcolor = anim.layer("teamcolor").and_then(decode_layer);
-        let has_teamcolor = teamcolor.is_some();
+        // The atlases are decoded on first use, once some sprite of this image is known to land
+        // on the image: decoding is the expensive step, and a region render routinely has
+        // sprites whose image is fetched but whose frames all fall outside it. `None` until
+        // tried; `Some(None)` if the diffuse layer can't be decoded (the image draws nothing).
+        let mut layers: Option<Option<(DecodedLayer, Option<DecodedLayer>)>> = None;
 
         let (canvas_w, canvas_h) = anim.canvas_size();
         let (canvas_w, canvas_h) = if tier == AssetTier::Sd {
@@ -1179,13 +1253,18 @@ fn draw_overlay(
 
             let canvas_w = effective_canvas(canvas_w, frame.offset_x, frame.width);
             let canvas_h = effective_canvas(canvas_h, frame.offset_y, frame.height);
+            // Placed in whole-image output pixels, then translated into the viewport — the
+            // translation is by whole pixels, so this lands exactly where a whole-map render puts
+            // it.
             let x = frame_origin(
                 drawable.x,
                 frame_offset_x(&frame, canvas_w, drawable.flip),
                 canvas_w,
                 zoom,
-            );
-            let y = frame_origin(drawable.y, frame.offset_y as i32, canvas_h, zoom);
+            )
+            .saturating_sub(viewport.x);
+            let y = frame_origin(drawable.y, frame.offset_y as i32, canvas_h, zoom)
+                .saturating_sub(viewport.y);
 
             // The tile's eventual size, estimated exactly the way `build_tile` computes it (no
             // allocation involved) — worth checking before cropping/team-coloring/scaling a
@@ -1194,6 +1273,16 @@ fn draw_overlay(
             if !rect_intersects_image(x, y, est_w, est_h, image_w, image_h) {
                 continue;
             }
+
+            let decoded = layers.get_or_insert_with(|| {
+                let diffuse = anim.layer("diffuse").and_then(decode_layer)?;
+                let teamcolor = anim.layer("teamcolor").and_then(decode_layer);
+                Some((diffuse, teamcolor))
+            });
+            let Some((diffuse, teamcolor)) = decoded.as_ref() else {
+                break;
+            };
+            let has_teamcolor = teamcolor.is_some();
 
             // `tint` is `None` only for shadows in a plan this crate built, but a deserialized
             // plan can say anything — the sentinel makes an untinted non-shadow draw exactly
@@ -1219,7 +1308,7 @@ fn draw_overlay(
                 std::collections::hash_map::Entry::Occupied(_) => TileRef::Cached(key),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let Some(tile) = build_tile(
-                        &diffuse,
+                        diffuse,
                         teamcolor.as_ref(),
                         rect,
                         color,
@@ -1743,15 +1832,27 @@ pub(crate) fn start_location_box(data: Option<&GameData>) -> (u32, u32) {
 
 /// Draws a plan's start-location color blocks: a polished "player token" (rounded,
 /// gradient-filled, bezel-stroked — see [`crate::token`]) in each block's color, centred on its
-/// logical-pixel position, over everything else.
-fn draw_planned_blocks(image: &mut RgbaImage, blocks: &[PlannedBlock], zoom: f32) {
+/// logical-pixel position, over everything else. `image` holds `viewport` of the whole-map
+/// output: each token's corners are rounded in whole-image pixels and then translated, and the
+/// token's shading depends only on positions relative to those corners, so a token cut by the
+/// viewport's edge draws exactly its share of the whole-map token.
+fn draw_planned_blocks(
+    image: &mut RgbaImage,
+    viewport: Viewport,
+    blocks: &[PlannedBlock],
+    zoom: f32,
+) {
     for block in blocks {
         let box_w = block.width.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
         let box_h = block.height.min(MAX_START_LOCATION_BOX_LOGICAL_PX);
-        let left = ((block.x as f32 - box_w as f32 / 2.0) * zoom).round() as i32;
-        let top = ((block.y as f32 - box_h as f32 / 2.0) * zoom).round() as i32;
-        let right = ((block.x as f32 + box_w as f32 / 2.0) * zoom).round() as i32;
-        let bottom = ((block.y as f32 + box_h as f32 / 2.0) * zoom).round() as i32;
+        let left = (((block.x as f32 - box_w as f32 / 2.0) * zoom).round() as i32)
+            .saturating_sub(viewport.x);
+        let top = (((block.y as f32 - box_h as f32 / 2.0) * zoom).round() as i32)
+            .saturating_sub(viewport.y);
+        let right = (((block.x as f32 + box_w as f32 / 2.0) * zoom).round() as i32)
+            .saturating_sub(viewport.x);
+        let bottom = (((block.y as f32 + box_h as f32 / 2.0) * zoom).round() as i32)
+            .saturating_sub(viewport.y);
         // Saturating: a hostile plan can put `block.x`/`y` at i32 extremes, where the rounded
         // casts above saturate and a plain `+ 1` would overflow.
         crate::token::draw_player_token(
@@ -2860,6 +2961,7 @@ mod tests {
             width: u32::MAX,
             height: u32::MAX,
             px_per_tile: u32::MAX,
+            region: None,
             terrain: TerrainPlan {
                 tileset: Tileset::Jungle,
                 tier: AssetTier::Sd,
@@ -3454,6 +3556,7 @@ mod tests {
 
         draw_overlay(
             &mut image,
+            Viewport::of(TileRect::full(4, 4), 32),
             &sprites,
             &[],
             &counting,
@@ -3853,5 +3956,550 @@ mod tests {
 
         let data = game_data();
         assert!(required_preview_graphics_for_chk(&chk, &data, &opts).is_empty());
+    }
+    // -----------------------------------------------------------------------------------------
+    // Region renders
+    // -----------------------------------------------------------------------------------------
+
+    /// A tiny xorshift generator, so the region fixtures are varied but reproducible.
+    struct Noise(u32);
+
+    impl Noise {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// A `width`x`height` BC1 DDS of random blocks: every texel varies, and blocks whose
+    /// `color0 <= color1` decode in BC1's punch-through mode, so the art has transparent holes
+    /// too (the sprite paths' alpha handling matters at region edges).
+    fn noise_bc1_dds(width: u32, height: u32, noise: &mut Noise) -> Vec<u8> {
+        let mut data = solid_bc1_dds(width, height, 0);
+        data.truncate(128);
+        for _ in 0..(width.div_ceil(4) * height.div_ceil(4)) {
+            data.extend_from_slice(&noise.next().to_le_bytes());
+            data.extend_from_slice(&noise.next().to_le_bytes());
+        }
+        data
+    }
+
+    const REGION_MAP_W: usize = 13;
+    const REGION_MAP_H: usize = 11;
+    /// The synthetic terrain's native megatile size.
+    const REGION_TILE_PX: u32 = 16;
+
+    /// The region tests' world: a 13x11-tile map of random 16px megatiles, units of two images
+    /// (one with a shadow, the other without) and doodads scattered across it and hanging off
+    /// every edge, and start locations (drawn as color-block tokens) straddling tile and map
+    /// boundaries.
+    struct RegionWorld {
+        source: MemorySource,
+        terrain: TerrainTileIds,
+        units: Vec<PlacedUnit>,
+        sprites: Vec<Sprite>,
+    }
+
+    fn region_world() -> RegionWorld {
+        let mut noise = Noise(0x2545_F491);
+
+        // Unit 5 -> flingy 1 -> sprite 2 -> image 3, with shadow image 4; every other unit and
+        // sprite id resolves to image 0, which has no shadow.
+        let mut parts = synthetic_parts(5, 1, 2, 3, None);
+        plant_shadow_record(&mut parts.4, 4, 3);
+        parts.3[IMAGES_RENDER_STYLE_COLUMN + 4] = RENDER_STYLE_SHADOW;
+        let mut source = preview_source(AssetTier::Hd2, 0, parts);
+
+        const MEGATILES: u16 = 6;
+        let mut cv5 = Vec::new();
+        let mut frames = Vec::new();
+        for megatile in 0..MEGATILES {
+            cv5.extend_from_slice(&[0u8; 20]);
+            cv5.extend_from_slice(&megatile.to_le_bytes());
+            cv5.extend_from_slice(&[0u8; 30]);
+            frames.push(noise_bc1_dds(REGION_TILE_PX, REGION_TILE_PX, &mut noise));
+        }
+        let mut dds_vr4 = Vec::new();
+        dds_vr4.extend_from_slice(&0u32.to_le_bytes());
+        dds_vr4.extend_from_slice(&MEGATILES.to_le_bytes());
+        dds_vr4.extend_from_slice(&0x1004u16.to_le_bytes());
+        for frame in &frames {
+            dds_vr4.extend_from_slice(&[0u8; 8]);
+            dds_vr4.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            dds_vr4.extend_from_slice(frame);
+        }
+        source.insert(AssetRequest::Cv5(Tileset::Jungle), cv5);
+        source.insert(
+            AssetRequest::TilesetDds(Tileset::Jungle, AssetTier::Hd2, ArtPack::Standard),
+            dds_vr4,
+        );
+        let terrain = TerrainTileIds {
+            width: REGION_MAP_W,
+            height: REGION_MAP_H,
+            tiles: (0..REGION_MAP_W * REGION_MAP_H)
+                .map(|_| TileId((noise.next() % MEGATILES as u32) as u16 * 16))
+                .collect(),
+        };
+
+        // HD2 art (2 texels per logical px; frame sizes in 4K units, 4 per logical px).
+        let mut anim = |image_id: u16, canvas: (u16, u16), width: u16, height: u16| {
+            let frame = AnimFrame {
+                texture_x: 0,
+                texture_y: 0,
+                offset_x: 0,
+                offset_y: 0,
+                width,
+                height,
+            };
+            let diffuse = noise_bc1_dds(width as u32 / 2, height as u32 / 2, &mut noise);
+            source.insert(
+                AssetRequest::Anim {
+                    image_id,
+                    tier: AssetTier::Hd2,
+                    pack: ArtPack::Standard,
+                },
+                anim_bytes(2, canvas, frame, &diffuse),
+            );
+        };
+        anim(0, (128, 96), 128, 96); // 32x24 logical px
+        anim(3, (384, 256), 384, 256); // 96x64 logical px: 3x2 tiles
+        anim(4, (300, 200), 384, 256); // its shadow, offset by the differing canvas
+
+        let (map_w, map_h) = (REGION_MAP_W as u32 * 32, REGION_MAP_H as u32 * 32);
+        let mut units: Vec<PlacedUnit> = (0..40)
+            .map(|i| {
+                // Overhang every edge by up to a tile so sprites are cut by the map's edges too.
+                let x = (noise.next() % (map_w + 64)) as i32 - 32;
+                let y = (noise.next() % (map_h + 64)) as i32 - 32;
+                unit(
+                    if i % 3 == 0 { 5 } else { 7 },
+                    Some(11),
+                    x.max(0) as u16,
+                    y.max(0) as u16,
+                )
+            })
+            .collect();
+        // Start-location tokens: one on a tile corner, one cut by the map's right edge, one
+        // straddling a 4-tile region boundary.
+        for (owner, x, y) in [
+            (0u8, 128u16, 96u16),
+            (1, map_w as u16 - 20, 200),
+            (2, 256, 250),
+        ] {
+            units.push(unit(UNIT_ID_START_LOCATION, Some(owner), x, y));
+        }
+        let sprites = (0..15)
+            .map(|i| Sprite {
+                id: if i % 2 == 0 { 2 } else { 0 },
+                x: (noise.next() % map_w) as u16,
+                y: (noise.next() % map_h) as u16,
+                owner: 11,
+                flags: SpriteFlags::DRAW_AS_SPRITE,
+            })
+            .collect();
+
+        RegionWorld {
+            source,
+            terrain,
+            units,
+            sprites,
+        }
+    }
+
+    impl RegionWorld {
+        fn render(&self, opts: &RenderOptions) -> RgbaImage {
+            render_preview(
+                &self.terrain,
+                Tileset::Jungle,
+                &self.units,
+                &self.sprites,
+                &PlayerColors::default(),
+                &self.source,
+                opts,
+            )
+            .unwrap()
+        }
+    }
+
+    /// Options rendering the region world at `ppt` px/tile.
+    fn region_options(ppt: u32, region: Option<TileRect>) -> RenderOptions {
+        RenderOptions {
+            art_style: ArtStyle::Remastered,
+            unit_filter: UnitFilter::AsPlaced,
+            max_dimension: Some(REGION_MAP_W as u32 * ppt),
+            region,
+            ..Default::default()
+        }
+    }
+
+    /// The `region` (already clipped to the map) of a whole-map render at `ppt`.
+    fn crop_region(image: &RgbaImage, region: TileRect, ppt: u32) -> RgbaImage {
+        let (x0, y0) = (region.x * ppt, region.y * ppt);
+        let (width, height) = (region.width * ppt, region.height * ppt);
+        let mut data = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in y0..y0 + height {
+            let start = (y * image.width + x0) as usize * 4;
+            data.extend_from_slice(&image.data[start..start + width as usize * 4]);
+        }
+        RgbaImage {
+            width,
+            height,
+            data,
+        }
+    }
+
+    /// The headline guarantee: a region render is exactly — byte for byte — the same rectangle
+    /// cropped out of the whole-map render with the same options. Checked over a tiling of the
+    /// whole map (so neighbouring regions meet with no seam) and over regions hanging off the
+    /// map, at the art's native resolution (no filtering) and at downscales whose filter windows
+    /// reach into neighbouring tiles (integer and non-integer ratios, down to 1 px/tile, where
+    /// the kernel reaches two tiles past the region). The world puts sprites, shadows and
+    /// start-location tokens across region and map edges.
+    #[test]
+    fn region_renders_are_exact_crops_of_the_whole_map_render() {
+        let world = region_world();
+        let (map_w, map_h) = (REGION_MAP_W as u32, REGION_MAP_H as u32);
+
+        for ppt in [REGION_TILE_PX, 12, 8, 5, 1] {
+            let whole = world.render(&region_options(ppt, None));
+            assert_eq!((whole.width, whole.height), (map_w * ppt, map_h * ppt));
+
+            let mut regions = Vec::new();
+            for y in (0..map_h).step_by(4) {
+                for x in (0..map_w).step_by(4) {
+                    regions.push(TileRect {
+                        x,
+                        y,
+                        width: 4,
+                        height: 4,
+                    });
+                }
+            }
+            regions.extend([
+                TileRect::full(map_w, map_h),
+                TileRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                TileRect {
+                    x: map_w - 1,
+                    y: map_h - 1,
+                    width: 1,
+                    height: 1,
+                },
+                TileRect {
+                    x: 3,
+                    y: 2,
+                    width: 7,
+                    height: 1,
+                },
+                TileRect {
+                    x: 10,
+                    y: 7,
+                    width: 100,
+                    height: 100,
+                },
+            ]);
+
+            for region in regions {
+                let image = world.render(&region_options(ppt, Some(region)));
+                let clipped = region.clip(map_w, map_h);
+                assert!(
+                    image == crop_region(&whole, clipped, ppt),
+                    "ppt {ppt}: region {region:?} differs from the whole-map crop"
+                );
+            }
+        }
+    }
+
+    /// The fixture really does exercise what the crop test claims: units are drawn across every
+    /// region boundary the tiling cuts at, and tokens and doodads are drawn too.
+    #[test]
+    fn region_fixture_cuts_through_sprites_and_tokens() {
+        let world = region_world();
+        let ppt = 8;
+        let full = world.render(&region_options(ppt, None));
+        let opts = RenderOptions {
+            show_doodad_sprites: false,
+            start_locations: StartLocations::Hidden,
+            ..region_options(ppt, None)
+        };
+        let terrain_units = world.render(&opts);
+        let terrain =
+            crate::terrain::render_terrain(&world.terrain, Tileset::Jungle, &world.source, &opts)
+                .unwrap();
+
+        // Along every 4-tile region boundary, some pixels differ from the bare terrain: things
+        // are drawn across the cuts.
+        let differs_on_column = |a: &RgbaImage, b: &RgbaImage, x: u32| {
+            (0..a.height).any(|y| {
+                let o = (y * a.width + x) as usize * 4;
+                a.data[o..o + 4] != b.data[o..o + 4]
+            })
+        };
+        for boundary in [4u32, 8, 12] {
+            assert!(
+                differs_on_column(&terrain_units, &terrain, boundary * ppt),
+                "no unit crosses the region boundary at tile column {boundary}"
+            );
+        }
+        assert_ne!(full, terrain_units, "tokens and doodads are drawn");
+    }
+
+    /// A region plan is a region render: plan-then-execute reproduces it, the plan carries only
+    /// the sprites that can reach the region, and executing it reads only what its manifest names.
+    #[test]
+    fn region_plans_execute_to_the_region_render_and_cull_far_sprites() {
+        use std::cell::RefCell;
+        use std::sync::Arc;
+
+        struct CountingSource<'a> {
+            inner: &'a MemorySource,
+            reads: RefCell<Vec<AssetRequest>>,
+        }
+        impl TilesetDataSource for CountingSource<'_> {
+            fn read(&self, req: &AssetRequest) -> Result<Arc<[u8]>, crate::source::SourceError> {
+                self.reads.borrow_mut().push(req.clone());
+                self.inner.read(req)
+            }
+        }
+
+        let world = region_world();
+        let ppt = 8;
+        let region = TileRect {
+            x: 4,
+            y: 4,
+            width: 4,
+            height: 4,
+        };
+        let plan = |opts: &RenderOptions| {
+            plan_preview(
+                &world.terrain,
+                Tileset::Jungle,
+                &world.units,
+                &world.sprites,
+                &PlayerColors::default(),
+                &world.source,
+                opts,
+            )
+            .unwrap()
+        };
+        let whole_plan = plan(&region_options(ppt, None));
+        let region_plan = plan(&region_options(ppt, Some(region)));
+
+        assert_eq!(whole_plan.region, None);
+        assert_eq!(region_plan.region, Some(region));
+        assert_eq!((region_plan.width, region_plan.height), (32, 32));
+        assert_eq!(region_plan.px_per_tile, whole_plan.px_per_tile);
+        // Culling keeps painter order: the region's sprites are a subsequence of the whole's.
+        let mut rest = whole_plan.sprites.iter();
+        for sprite in &region_plan.sprites {
+            assert!(rest.any(|s| s == sprite), "{sprite:?} out of order");
+        }
+
+        let counting = CountingSource {
+            inner: &world.source,
+            reads: RefCell::new(Vec::new()),
+        };
+        let executed = execute_plan(&region_plan, &counting).unwrap();
+        assert_eq!(executed, world.render(&region_options(ppt, Some(region))));
+        for read in counting.reads.borrow().iter() {
+            assert!(
+                region_plan.manifest.contains(read),
+                "unlisted read {read:?}"
+            );
+        }
+
+        // Culling needs a map larger than the conservative reach of a sprite (16 tiles): on a
+        // 128x128 map, a unit 90 tiles from a corner region is left out of that region's plan.
+        let units = [unit(5, Some(11), 3000, 3000), unit(7, Some(11), 16, 16)];
+        let opts = RenderOptions {
+            max_dimension: Some(128 * ppt),
+            ..region_options(
+                ppt,
+                Some(TileRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+            )
+        };
+        let plan = plan_preview(
+            &square_terrain(128),
+            Tileset::Jungle,
+            &units,
+            &[],
+            &PlayerColors::default(),
+            &world.source,
+            &opts,
+        )
+        .unwrap();
+        let image_ids: Vec<u16> = plan.sprites.iter().map(|s| s.image_id).collect();
+        assert_eq!(image_ids, vec![0]);
+        assert!(!plan.manifest.iter().any(|req| matches!(
+            req,
+            AssetRequest::Anim {
+                image_id: 3 | 4,
+                ..
+            }
+        )));
+    }
+
+    /// The prefetch API agrees with region renders: a source holding only what the two rounds
+    /// name for a region renders that region exactly as the fully-stocked source does, the
+    /// region's art list is a subset of the whole map's, and a region far from some image's
+    /// sprites doesn't ask for that image.
+    #[test]
+    fn region_prefetch_lists_exactly_cover_the_region_render() {
+        let world = region_world();
+        let ppt = 8;
+        let (map_w, map_h) = (REGION_MAP_W as u32, REGION_MAP_H as u32);
+        let data = GameData::load(&world.source).unwrap();
+
+        let whole_graphics = required_preview_graphics(
+            &world.units,
+            &world.sprites,
+            &data,
+            map_w,
+            map_h,
+            &region_options(ppt, None),
+        );
+
+        for region in [
+            TileRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            TileRect {
+                x: 8,
+                y: 4,
+                width: 5,
+                height: 7,
+            },
+        ] {
+            let opts = region_options(ppt, Some(region));
+            let mut requests =
+                crate::options::required_preview_assets(Tileset::Jungle, map_w, map_h, &opts);
+            let graphics =
+                required_preview_graphics(&world.units, &world.sprites, &data, map_w, map_h, &opts);
+            for req in &graphics {
+                assert!(
+                    whole_graphics.contains(req),
+                    "{req:?} not in the whole list"
+                );
+            }
+            requests.extend(graphics);
+
+            let prefetched: MemorySource = requests
+                .iter()
+                .map(|req| (req.clone(), world.source.read(req).unwrap().to_vec()))
+                .collect();
+            let image = render_preview(
+                &world.terrain,
+                Tileset::Jungle,
+                &world.units,
+                &world.sprites,
+                &PlayerColors::default(),
+                &prefetched,
+                &opts,
+            )
+            .unwrap();
+            assert_eq!(image, world.render(&opts), "region {region:?}");
+        }
+
+        // Image 3 is only placed by unit 5; on a 128x128 map with unit 5 far from a one-tile
+        // region in a corner, its art (and its shadow's) isn't requested, while image 0's unit,
+        // which sits on that tile, is.
+        let units = [unit(5, Some(11), 3000, 3000), unit(7, Some(11), 16, 16)];
+        let opts = RenderOptions {
+            max_dimension: Some(128 * ppt),
+            ..region_options(
+                ppt,
+                Some(TileRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }),
+            )
+        };
+        let graphics = required_preview_graphics(&units, &[], &data, 128, 128, &opts);
+        let ids: Vec<u16> = graphics
+            .iter()
+            .filter_map(|req| match req {
+                AssetRequest::Anim { image_id, .. } => Some(*image_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![0]);
+    }
+
+    /// A region entirely off the map renders (and plans, and prefetches art) as nothing.
+    #[test]
+    fn region_off_the_map_is_empty() {
+        let world = region_world();
+        let off = Some(TileRect {
+            x: 50,
+            y: 0,
+            width: 4,
+            height: 4,
+        });
+        let image = world.render(&region_options(8, off));
+        assert_eq!((image.width, image.height), (0, 0));
+        assert!(image.data.is_empty());
+
+        let data = GameData::load(&world.source).unwrap();
+        assert!(
+            required_preview_graphics(
+                &world.units,
+                &world.sprites,
+                &data,
+                REGION_MAP_W as u32,
+                REGION_MAP_H as u32,
+                &region_options(8, off),
+            )
+            .is_empty()
+        );
+    }
+
+    /// A deserialized plan's region is untrusted: it's clipped to the map, never trusted to size
+    /// the output.
+    #[test]
+    fn hostile_plan_region_is_clipped() {
+        let world = region_world();
+        let mut plan = plan_preview(
+            &world.terrain,
+            Tileset::Jungle,
+            &world.units,
+            &world.sprites,
+            &PlayerColors::default(),
+            &world.source,
+            &region_options(4, None),
+        )
+        .unwrap();
+        plan.region = Some(TileRect {
+            x: 9,
+            y: 10,
+            width: u32::MAX,
+            height: u32::MAX,
+        });
+        let image = execute_plan(&plan, &world.source).unwrap();
+        assert_eq!((image.width, image.height), (4 * 4, 4));
+
+        plan.region = Some(TileRect {
+            x: u32::MAX,
+            y: u32::MAX,
+            width: u32::MAX,
+            height: u32::MAX,
+        });
+        let image = execute_plan(&plan, &world.source).unwrap();
+        assert_eq!((image.width, image.height), (0, 0));
     }
 }

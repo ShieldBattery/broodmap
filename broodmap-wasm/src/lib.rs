@@ -36,11 +36,18 @@
 //! complete asset origin. Assets that fail to fetch can simply be skipped — a missing anim/GRP
 //! degrades that one drawable, exactly like the native renderer.
 //!
-//! Options are a JSON string mirroring the CLI's flags (all fields optional):
+//! Options are a JSON string mirroring the CLI's flags (all fields optional; the
+//! `MapRenderOptions` TypeScript interface):
 //! `{ "style": "original"|"remastered"|"cartooned", "unitStyle": ..., "size": 1024,
+//! "maxOutputPixels": 67108864, "region": { "x": 0, "y": 0, "width": 16, "height": 16 },
 //! "startLocations": "block"|"sprite"|"hidden", "asPlaced": false, "showCritters": true,
 //! "showResources": true, "showDoodads": true, "showNeutralBuildings": true,
 //! "showShadows": true, "terrainOnly": false, "scale": 4 }` (`scale` is minimap-only).
+//!
+//! `region` (map tiles) renders just that rectangle of the map, pixel-identical to the same
+//! rectangle of the whole-map render with the same options — for tiled, zoomable viewers that
+//! never hold a whole full-resolution map. Fetch assets with the options *without* `region` to
+//! cover every region at once; with it, only that region's art is listed.
 
 mod analysis;
 mod casc;
@@ -61,9 +68,42 @@ use broodmap::chk::Chk;
 use broodmap::{ResourceLimits, extract_chk_from_map_with_limits};
 use broodmap_render::{
     ArtStyle, AssetRequest, GameData, MemorySource, MinimapOptions, RenderOptions, StartLocations,
-    UnitFilter, plan_chk_preview, render_chk_minimap, render_chk_preview, render_terrain,
+    TileRect, UnitFilter, plan_chk_preview, render_chk_minimap, render_chk_preview, render_terrain,
     required_preview_assets_for_chk, required_preview_graphics_for_chk,
 };
+
+#[wasm_bindgen(typescript_custom_section)]
+const RENDER_OPTIONS_TYPES: &str = r#"
+/**
+ * Render options, passed as JSON to `MapRenderer`'s `requiredAssets`, `requiredGraphics`,
+ * `loadAssets`, `renderRgba`, `renderPng`, `planJson`, `minimapRgba` and `minimapPng`. Every
+ * field is optional. See the README's option table.
+ */
+export interface MapRenderOptions {
+    style?: "original" | "remastered" | "cartooned" | "carbot";
+    unitStyle?: "original" | "remastered" | "cartooned" | "carbot";
+    size?: number;
+    maxOutputPixels?: number;
+    region?: MapRegion;
+    startLocations?: "block" | "sprite" | "hidden";
+    asPlaced?: boolean;
+    showCritters?: boolean;
+    showResources?: boolean;
+    showDoodads?: boolean;
+    showNeutralBuildings?: boolean;
+    showShadows?: boolean;
+    terrainOnly?: boolean;
+    scale?: number;
+}
+
+/** A rectangle of a map in tiles: `MapRenderOptions.region`. */
+export interface MapRegion {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+"#;
 
 /// The JSON options object (see the module docs). Every field is optional; defaults match the
 /// library's own ([`RenderOptions::default`] plus `scale: 1`).
@@ -73,6 +113,8 @@ struct JsOptions {
     style: Option<String>,
     unit_style: Option<String>,
     size: Option<u32>,
+    max_output_pixels: Option<u32>,
+    region: Option<JsRegion>,
     start_locations: Option<String>,
     as_placed: bool,
     show_critters: Option<bool>,
@@ -83,6 +125,16 @@ struct JsOptions {
     terrain_only: bool,
     /// Minimap only: the integer upscale of the native (<= 128 px) minimap image.
     scale: Option<u32>,
+}
+
+/// The JSON `region` object: a rectangle of the map in tiles.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 impl JsOptions {
@@ -99,6 +151,13 @@ impl JsOptions {
             art_style: parse_style(self.style.as_deref())?.unwrap_or_default(),
             unit_style: parse_style(self.unit_style.as_deref())?,
             max_dimension: self.size.or(Some(1024)),
+            max_output_pixels: self.max_output_pixels.unwrap_or(defaults.max_output_pixels),
+            region: self.region.map(|r| TileRect {
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
+            }),
             start_locations: self.start_locations()?,
             unit_filter: self.unit_filter(),
             show_critters: self.show_critters.unwrap_or(defaults.show_critters),
@@ -108,7 +167,6 @@ impl JsOptions {
                 .show_neutral_buildings
                 .unwrap_or(defaults.show_neutral_buildings),
             show_shadows: self.show_shadows.unwrap_or(defaults.show_shadows),
-            ..defaults
         })
     }
 
@@ -313,6 +371,9 @@ impl MapRenderer {
     /// the `requiredAssets`/`requiredGraphics`/`addAsset` prefetch. Returns the CASC paths of
     /// art assets the install doesn't have: those drawables degrade and the render still
     /// succeeds. Throws if a base asset (tileset or `.dat` table) is missing or any read fails.
+    ///
+    /// With a `region` in `options`, only that region's art is loaded; leave it out to load
+    /// what every region of the map needs.
     #[wasm_bindgen(js_name = loadAssets)]
     pub fn load_assets(
         &mut self,
@@ -323,7 +384,10 @@ impl MapRenderer {
         self.load_assets_with(&opts, |req| storage.read(req))
     }
 
-    /// Renders the map preview to RGBA pixels.
+    /// Renders the map preview to RGBA pixels: the whole map, or with `region` set, that
+    /// rectangle of tiles of it (exactly the matching crop of the whole-map render, so regions
+    /// tile seamlessly). A region hanging off the map is clipped to it, so the image can be
+    /// smaller than `region` at the map's edges; one entirely outside the map is 0x0.
     #[wasm_bindgen(js_name = renderRgba)]
     pub fn render_rgba(&self, options: &str) -> Result<RenderedImage, String> {
         let js_opts = JsOptions::parse(options)?;
@@ -483,6 +547,36 @@ mod tests {
         );
         assert_eq!(opts.minimap_options().unwrap().scale, 4);
 
+        let opts = JsOptions::parse(
+            r#"{"region":{"x":16,"y":32,"width":16,"height":8},"maxOutputPixels":1024}"#,
+        )
+        .unwrap()
+        .render_options()
+        .unwrap();
+        assert_eq!(
+            opts.region,
+            Some(TileRect {
+                x: 16,
+                y: 32,
+                width: 16,
+                height: 8
+            })
+        );
+        assert_eq!(opts.max_output_pixels, 1024);
+        assert_eq!(
+            JsOptions::parse("")
+                .unwrap()
+                .render_options()
+                .unwrap()
+                .region,
+            None
+        );
+        assert!(JsOptions::parse(r#"{"region":{"x":0,"y":0,"width":1}}"#).is_err());
+        assert!(
+            JsOptions::parse(r#"{"region":{"x":0,"y":0,"width":1,"height":1,"z":0}}"#).is_err()
+        );
+        assert!(JsOptions::parse(r#"{"region":{"x":-1,"y":0,"width":1,"height":1}}"#).is_err());
+
         assert!(JsOptions::parse(r#"{"styel":"original"}"#).is_err());
         assert!(
             JsOptions::parse(r#"{"style":"hd"}"#)
@@ -577,5 +671,56 @@ mod tests {
             loaded.render_png(options).unwrap(),
             prefetched.render_png(options).unwrap()
         );
+    }
+
+    /// `renderRgba` with a `region` returns exactly that rectangle of the whole-map render, after
+    /// `loadAssets` without a region loaded what every region needs. Needs a real SC:R install.
+    #[test]
+    fn region_render_is_a_crop_of_the_whole_render() {
+        use broodmap_render::{CascSource, SourceError, TilesetDataSource};
+
+        let Some(dir) = std::env::var_os("BROODMAP_TEST_SCR_DIR") else {
+            eprintln!("skipping: BROODMAP_TEST_SCR_DIR not set");
+            return;
+        };
+        let source = CascSource::open(dir).expect("BROODMAP_TEST_SCR_DIR should be a SC:R install");
+        let map_bytes = include_bytes!("../../broodmap/assets/lt.scm");
+        // 16 px/tile on the 128x128 Lost Temple: a 2:1 downscale of the SD art.
+        let whole_options = r#"{"style":"original","size":2048}"#;
+        let opts = JsOptions::parse(whole_options)
+            .unwrap()
+            .render_options()
+            .unwrap();
+
+        let mut map = MapRenderer::new(map_bytes, None).unwrap();
+        let missing = map
+            .load_assets_with(&opts, |req| {
+                source.read(req).map_err(|e| match e {
+                    SourceError::NotFound => ReadFailure::Missing,
+                    e => ReadFailure::Error(e.to_string()),
+                })
+            })
+            .unwrap();
+        assert!(missing.is_empty(), "{missing:?}");
+
+        let whole = map.render_rgba(whole_options).unwrap();
+        assert_eq!((whole.width, whole.height), (2048, 2048));
+        for (x, y, width, height) in [(0, 0, 32, 32), (48, 80, 32, 32), (120, 100, 32, 32)] {
+            let region = map
+                .render_rgba(&format!(
+                    r#"{{"style":"original","size":2048,"region":{{"x":{x},"y":{y},"width":{width},"height":{height}}}}}"#
+                ))
+                .unwrap();
+            let (w, h) = ((width.min(128 - x)) * 16, (height.min(128 - y)) * 16);
+            assert_eq!((region.width, region.height), (w, h));
+            for row in 0..h {
+                let src = (((y * 16 + row) * 2048 + x * 16) * 4) as usize;
+                let dst = (row * w * 4) as usize;
+                assert!(
+                    region.data[dst..dst + w as usize * 4] == whole.data[src..src + w as usize * 4],
+                    "region ({x}, {y}) row {row} differs"
+                );
+            }
+        }
     }
 }
