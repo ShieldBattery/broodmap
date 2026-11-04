@@ -13,6 +13,10 @@
 //! [`render_terrain`] renders terrain alone; [`render_preview`] takes the pieces (terrain,
 //! units, sprites, player colors) individually for callers that already have them.
 //!
+//! [`RenderOptions::region`] renders one rectangle of the map ([`TileRect`], in tiles) instead,
+//! byte-identical to cropping the whole-map render, with cost and memory that follow the region —
+//! for viewers that render zoomed-in tiles on demand.
+//!
 //! Callers that must prefetch (WASM, where fetches are async and the render is sync) use the
 //! two-round API: [`required_preview_assets`] names the terrain assets and `.dat`/`.rel` tables,
 //! then [`required_preview_graphics`] names the `.anim` files those tables resolve the map's
@@ -54,8 +58,8 @@ pub use minimap::{
     render_chk_minimap, render_minimap,
 };
 pub use options::{
-    DEFAULT_MAX_OUTPUT_PIXELS, RenderOptions, StartLocations, UnitFilter, required_preview_assets,
-    required_terrain_assets,
+    DEFAULT_MAX_OUTPUT_PIXELS, RenderOptions, StartLocations, TileRect, UnitFilter,
+    required_preview_assets, required_terrain_assets,
 };
 pub use overlay::{
     Preview, execute_plan, plan_chk_preview, plan_preview, render_chk_preview, render_preview,

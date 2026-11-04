@@ -10,7 +10,7 @@ use broodcasc::cdn::{CachingTransport, HttpTransport};
 use broodmap::extract_chk_from_map;
 use broodmap_render::{
     ArtStyle, AssetRequest, CascSource, CdnSource, DirSource, GameData, MinimapOptions, Preview,
-    RenderOptions, RgbaImage, SourceError, StartLocations, TilesetDataSource, UnitFilter,
+    RenderOptions, RgbaImage, SourceError, StartLocations, TileRect, TilesetDataSource, UnitFilter,
     build_minimap_table, compress_minimap_table, render_chk_minimap, render_chk_preview,
     render_terrain, required_preview_assets_for_chk, required_preview_graphics_for_chk,
     required_style_assets,
@@ -131,6 +131,30 @@ struct RenderArgs {
     /// Render terrain only, skipping the unit/sprite overlay entirely.
     #[arg(long)]
     terrain_only: bool,
+
+    /// Render only this rectangle of the map, in tiles, as `x,y,width,height`. The output is
+    /// exactly that part of the whole-map render (whose resolution `--size` still sets), clipped
+    /// to the map.
+    #[arg(long, value_parser = parse_region)]
+    region: Option<TileRect>,
+}
+
+/// Parses `--region`'s `x,y,width,height`.
+fn parse_region(value: &str) -> Result<TileRect, String> {
+    let parts: Vec<u32> = value
+        .split(',')
+        .map(|part| part.trim().parse::<u32>())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("expected x,y,width,height in tiles: {e}"))?;
+    let [x, y, width, height] = parts[..] else {
+        return Err("expected four numbers: x,y,width,height".to_string());
+    };
+    Ok(TileRect {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 #[derive(clap::Args)]
@@ -352,6 +376,7 @@ fn render(args: RenderArgs) -> Result<()> {
         show_doodad_sprites: !args.no_doodads,
         show_neutral_buildings: !args.no_neutral_buildings,
         show_shadows: !args.no_shadows,
+        region: args.region,
         ..Default::default()
     };
 

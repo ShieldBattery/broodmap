@@ -3,7 +3,7 @@
 use broodmap::chk::tileset::Tileset;
 use broodmap_render::{
     ArtPack, AssetRequest, AssetTier, MemorySource, PlannedBlock, PlannedSprite, RenderPlan,
-    SdCanvasSource, TerrainPlan, execute_plan,
+    SdCanvasSource, TerrainPlan, TileRect, execute_plan,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -12,7 +12,8 @@ use libfuzzer_sys::fuzz_target;
 /// fuzzer bytes (hostile dimensions, `px_per_tile`, sprite/block coordinates, mismatched
 /// megatile grids) and executes it against fuzzer-controlled asset bytes, covering the executor
 /// end to end: terrain rasterize, the anim/mainSD sprite paths, SD GRP canvas resolution, and
-/// block drawing.
+/// block drawing. A hostile `region` (anywhere, any size, including off the map) exercises the
+/// region path: the executor must clip it to the map.
 ///
 /// Work stays bounded by construction, alternating between the two clamp regimes: small tile
 /// dims with an arbitrary (clamped-to-128) `px_per_tile`, or arbitrary (clamped-to-256) tile
@@ -57,6 +58,12 @@ fuzz_target!(|data: &[u8]| {
 
     let flags = carver.u8();
     let small_dims_mode = flags & 1 == 0;
+    let region = (flags & 2 != 0).then(|| TileRect {
+        x: carver.u32() % 300,
+        y: carver.u32() % 300,
+        width: carver.u32(),
+        height: carver.u32(),
+    });
     let (map_w, map_h, ppt) = if small_dims_mode {
         (
             (carver.u16() % MAX_SMALL_DIM as u16 + 1) as u32,
@@ -127,6 +134,7 @@ fuzz_target!(|data: &[u8]| {
         width: carver.u32(),  // informational; executor derives its own
         height: carver.u32(), // informational
         px_per_tile: ppt,
+        region,
         terrain: TerrainPlan {
             tileset: Tileset::Jungle,
             tier,

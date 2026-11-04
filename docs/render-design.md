@@ -446,6 +446,71 @@ it drew a soft checkerboard at exactly the tile pitch, i.e. more grid, not less.
 this from the luminance-noise direction; if it's worth revisiting, the leverage is in the art
 (foliage overlays, or per-instance variant selection), not in post-processing.
 
+### Region renders
+
+`RenderOptions::region` (a `TileRect` in map tiles; WASM `region: { x, y, width, height }`, CLI
+`--region x,y,w,h`) renders one rectangle of the map, for viewers that zoom into maps at full
+detail by rendering tiles on demand rather than holding a whole full-resolution image (256 MiB of
+RGBA for a 256x256 map at SD's native 32 px/tile).
+
+**Contract: a region render is byte-identical to the same rectangle cropped from the whole-map
+render with the same options.** Exact identity, not a tolerance — every step below is either
+translation-invariant by construction or computes with the same global coordinates as the
+whole-map render:
+
+- Resolution and tiers are resolved from the *whole* map (`max_dimension`, `max_output_pixels`
+  keep their whole-map meaning), so every region of a map shares one pixel grid and the region's
+  output origin is a whole pixel (`region.x * ppt`).
+- Terrain: the resampler's tap table for each output sample depends only on that sample's global
+  index and the whole image's native/output sizes, so `resample_linear` builds taps for just the
+  region's output window using the same arithmetic, and accumulates in the same order — the window
+  is bit-identical to the whole resample. The compositor builds only the tile columns those taps
+  reach (`source_span`: the region plus the kernel's reach, two output pixels' worth of native
+  pixels per side, which is at most one tile at 2 px/tile and up) and only the rows the vertical
+  taps request. At native resolution there's no filter and no margin.
+- Sprites and shadows: placement is computed in whole-image output pixels exactly as before, then
+  translated by the region's integer origin; a sprite's scaled tile never depends on where it
+  lands. Clipping is per pixel, and compositing is per pixel in painter order, so sprites that
+  can't reach the region can be skipped without changing any pixel in it. The cull is the
+  existing conservative position test (`MAX_PLAUSIBLE_SPRITE_HALF_EXTENT_LOGICAL_PX`, 16 tiles of
+  reach) applied to the region's viewport, plus the exact frame-rect test; an image's atlases are
+  decoded only once one of its frames is known to land on the output.
+- Start-location tokens: their corners are rounded in whole-image pixels and translated, and the
+  token's shading reads positions relative to those corners only (exact in `f32`: integers and
+  half-integers well under 2^24), so a cut token draws exactly its share.
+
+Tests: synthetic fixtures in `overlay.rs` (random megatiles and BC1 art with transparent holes,
+units with shadows and doodads across and off every edge, tokens on region boundaries) compare a
+full tiling plus edge/off-map regions against the whole render at native and 4/3, 2, 3.2 and 16:1
+downscales; a mutation dropping the kernel margin fails them. An env-gated real-install test
+(`real_assets.rs`) does the same on corpus maps — every 512px tile at SD 32 and 16 px/tile and
+HD2 at 16 px/tile, plus an unaligned region — from a `MemorySource` prefetched with the whole-map
+lists, and `broodmap-wasm` checks `renderRgba` the same way.
+
+Plans carry the region (`RenderPlan::region`, clipped; `width`/`height` are the region's), list
+only the sprites that can reach it, and so only their art in the manifest;
+`required_preview_graphics` applies the same cull. Without a region, the lists cover every region
+of the map, which is what a tiling consumer prefetches once.
+
+Cost, measured on `(7)Continental Divide.scm` (256x256, 226 units, 245 THG2 sprites), native
+release build on a desktop, assets prefetched into a `MemorySource`, one 512px tile vs. the whole
+map:
+
+| style / density        | whole map            | one 512px tile (mean) | all tiles, summed |
+|------------------------|----------------------|-----------------------|-------------------|
+| Original, 32 px/tile   | 8192x8192, ~75 ms    | ~0.7 ms               | ~190 ms           |
+| Original, 16 px/tile   | 4096x4096, ~410 ms   | ~7 ms                 | ~470 ms           |
+| Original, 8 px/tile    | 2048x2048, ~315 ms   | ~20 ms                | ~325 ms           |
+| Remastered, 32 px/tile | 8192x8192, ~1.7 s    | ~8 ms                 | ~1.9 s            |
+| Remastered, 16 px/tile | 4096x4096, ~1.2 s    | ~21 ms                | ~1.3 s            |
+
+A tile's cost is dominated by compositing and filtering the native terrain under it (1024x1024
+native SD pixels per tile at 16 px/tile, 2048x2048 at 8) — the same work the whole render does
+per area — plus small per-render overhead (planning, `.dat` parsing, the `mainSD.anim`
+directory). Peak memory is the region's output plus one strip of its tile columns
+(`(region + margin) * tile_px` x `tile_px`) plus a ring of a few resampled region-width rows, and
+the decoded atlases of images that actually land on it.
+
 ### Minimap
 
 Not a downsampled preview, and not "1 output pixel per map tile" either: the real game builds its

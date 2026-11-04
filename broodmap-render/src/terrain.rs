@@ -9,8 +9,14 @@
 //! what makes that affordable, since the full native image is never materialized — a 256x256 map
 //! at HD's 128 px/tile would be 32Ki x 32Ki, 4 GiB of RGBA. See `crate::resample`'s module docs
 //! for the measurements.
+//!
+//! A region render (`RenderOptions::region`) composites only the tile columns and rows the
+//! region's filter windows reach (the region plus the kernel's margin, see
+//! [`crate::resample::source_span`]) and resamples just the region's window of the output, which
+//! is bit-identical to cropping the whole-map render.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use broodmap::chk::terrain::TerrainTileIds;
 use broodmap::chk::tileset::Tileset;
@@ -19,8 +25,8 @@ use broodmap_formats::{DdsFormat, DdsVr4, Frame, parse_cv5, parse_dds};
 use crate::bc::{decode_bc1, decode_bc3};
 use crate::error::RenderError;
 use crate::image::{RgbaImage, scale_rgba};
-use crate::options::{RenderOptions, resolve_tier};
-use crate::resample::{NativeRows, resample_linear};
+use crate::options::{RenderOptions, TileRect, resolve_tier};
+use crate::resample::{NativeRows, resample_linear, source_span};
 use crate::source::{AssetRequest, TilesetDataSource};
 use crate::tier::{ArtPack, AssetTier};
 
@@ -54,10 +60,11 @@ pub(crate) const MAX_TERRAIN_DIM: usize = 256;
 ///
 /// Output dimensions are `(terrain.width * ppt) x (terrain.height * ppt)`, where `ppt` (pixels
 /// per tile) is resolved from `options` and the map's size (see
-/// [`crate::options::RenderOptions`]). Each unique megatile is decoded once, at the art's native
-/// tile size, and cached; the map is then composited strip by strip and resampled to `ppt`, so
-/// peak memory is the output buffer plus one tile-row strip plus the filter window — never a
-/// full-resolution intermediate.
+/// [`crate::options::RenderOptions`]) — or, with [`RenderOptions::region`] set, that region's
+/// tiles at the same `ppt` (exactly the matching crop of the whole-map render). Each unique
+/// megatile is decoded once, at the art's native tile size, and cached; the map is then
+/// composited strip by strip and resampled to `ppt`, so peak memory is the output buffer plus one
+/// tile-row strip plus the filter window — never a full-resolution intermediate.
 pub fn render_terrain(
     terrain: &TerrainTileIds,
     tileset: Tileset,
@@ -80,11 +87,21 @@ pub fn render_terrain(
     let map_w = terrain.width.min(MAX_TERRAIN_DIM) as u32;
     let map_h = terrain.height.min(MAX_TERRAIN_DIM) as u32;
     let (tier, pack, ppt) = resolve_tier(options, map_w, map_h);
+    let region = options.drawn_tiles(map_w, map_h);
+    if region.is_empty() {
+        return Ok(RgbaImage {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+        });
+    }
 
     let cv5_bytes = source.read(&AssetRequest::Cv5(tileset))?;
     let megatiles = megatile_grid(terrain, cv5_bytes.as_ref(), map_w, map_h);
 
-    rasterize_terrain(&megatiles, map_w, map_h, tileset, tier, pack, ppt, source)
+    rasterize_terrain(
+        &megatiles, map_w, map_h, region, tileset, tier, pack, ppt, source,
+    )
 }
 
 /// The decide half of the terrain render: resolves the CHK's tile IDs to a flat megatile-ID
@@ -124,13 +141,15 @@ pub(crate) fn megatile_grid(
 }
 
 /// The draw half of the terrain render: composites an already-resolved megatile grid at the
-/// art's native size and resamples to `ppt` output pixels per tile. Reads only the tileset's
-/// `.dds.vr4` from `source`.
+/// art's native size and resamples to `ppt` output pixels per tile, producing the `region` tiles
+/// of that whole-map image (`region` must already be clipped to the map and non-empty). Reads
+/// only the tileset's `.dds.vr4` from `source`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_terrain(
     megatiles: &[u16],
     map_w: u32,
     map_h: u32,
+    region: TileRect,
     tileset: Tileset,
     tier: AssetTier,
     pack: ArtPack,
@@ -141,28 +160,44 @@ pub(crate) fn rasterize_terrain(
     let dds_vr4 = DdsVr4::parse(dds_vr4_bytes.as_ref())?;
 
     let native_px = native_tile_px(&dds_vr4, tier.tile_px(), ppt);
-    let out_w = map_w * ppt;
-    let out_h = map_h * ppt;
-
-    let mut compositor = StripCompositor::new(megatiles, map_w, &dds_vr4, native_px);
+    // The whole map's output size, which fixes the resampling ratio and every filter window's
+    // position; the region is a window of it.
+    let full_w = map_w * ppt;
+    let full_h = map_h * ppt;
+    let out_x = region.x * ppt..(region.x + region.width) * ppt;
+    let out_y = region.y * ppt..(region.y + region.height) * ppt;
+    let out_w = out_x.len() as u32;
+    let out_h = out_y.len() as u32;
 
     let data = if native_px == ppt {
         // Native-resolution render: the composite *is* the output, byte for byte what a straight
-        // per-tile blit produces. No filtering to do.
+        // per-tile blit produces. No filtering to do, so no margin either.
+        let tile_cols = region.x..region.x + region.width;
+        let mut compositor = StripCompositor::new(megatiles, map_w, tile_cols, &dds_vr4, native_px);
         let mut data = vec![0u8; out_w as usize * out_h as usize * 4];
         let row_bytes = out_w as usize * 4;
-        for y in 0..out_h {
-            let start = y as usize * row_bytes;
+        for (i, y) in out_y.enumerate() {
+            let start = i * row_bytes;
             data[start..start + row_bytes].copy_from_slice(compositor.row(y));
         }
         data
     } else {
+        // Composite only the tile columns the region's horizontal filter windows reach. Rows
+        // need no such bound here: the resampler only ever asks for the ones its vertical
+        // windows reach, and the compositor builds tile rows on demand.
+        let native_cols = source_span(map_w * native_px, full_w, out_x.clone());
+        let tile_cols = native_cols.start / native_px..native_cols.end.div_ceil(native_px);
+        let row_origin = tile_cols.start * native_px;
+        let mut compositor = StripCompositor::new(megatiles, map_w, tile_cols, &dds_vr4, native_px);
         resample_linear(
             &mut compositor,
             map_w * native_px,
             map_h * native_px,
-            out_w,
-            out_h,
+            full_w,
+            full_h,
+            out_x,
+            out_y,
+            row_origin,
         )
     };
 
@@ -197,16 +232,18 @@ fn native_tile_px(dds_vr4: &DdsVr4, tier_px: u32, ppt: u32) -> u32 {
         .max(ppt)
 }
 
-/// Composites the map one tile row at a time, handing out native-resolution rows in order.
+/// Composites tile columns `tile_cols` of the map one tile row at a time, handing out
+/// native-resolution rows (starting at native column `tile_cols.start * tile_px`) in order.
 ///
 /// Only the strip currently being read is held: [`crate::resample::resample_linear`] pulls rows
 /// monotonically, so once a tile row has been fully consumed it can be overwritten by the next.
 struct StripCompositor<'a> {
     megatiles: &'a [u16],
     map_w: u32,
+    tile_cols: Range<u32>,
     dds_vr4: &'a DdsVr4<'a>,
     tile_px: u32,
-    /// `map_w * tile_px` wide, `tile_px` tall, RGBA8.
+    /// `tile_cols.len() * tile_px` wide, `tile_px` tall, RGBA8.
     strip: Vec<u8>,
     /// The tile row currently composited into `strip`.
     strip_row: Option<u32>,
@@ -219,13 +256,16 @@ impl<'a> StripCompositor<'a> {
     fn new(
         megatiles: &'a [u16],
         map_w: u32,
+        tile_cols: Range<u32>,
         dds_vr4: &'a DdsVr4<'a>,
         tile_px: u32,
     ) -> StripCompositor<'a> {
-        let native_w = map_w as usize * tile_px as usize;
+        let tile_cols = tile_cols.start.min(map_w)..tile_cols.end.min(map_w);
+        let native_w = tile_cols.len() * tile_px as usize;
         StripCompositor {
             megatiles,
             map_w,
+            tile_cols,
             dds_vr4,
             tile_px,
             strip: vec![0u8; native_w * tile_px as usize * 4],
@@ -236,8 +276,8 @@ impl<'a> StripCompositor<'a> {
     }
 
     fn composite_tile_row(&mut self, tile_row: u32) {
-        let native_w = self.map_w * self.tile_px;
-        for tx in 0..self.map_w {
+        let native_w = self.tile_cols.len() as u32 * self.tile_px;
+        for tx in self.tile_cols.clone() {
             let megatile_id = self
                 .megatiles
                 .get((tile_row * self.map_w + tx) as usize)
@@ -250,7 +290,7 @@ impl<'a> StripCompositor<'a> {
                 self.cache.insert(megatile_id, tile);
             }
 
-            let dst_x = tx * self.tile_px;
+            let dst_x = (tx - self.tile_cols.start) * self.tile_px;
             match self.cache.get(&megatile_id) {
                 Some(tile) => blit_tile(&mut self.strip, native_w, tile, self.tile_px, dst_x, 0),
                 // Cache budget exhausted: decode on demand rather than growing without bound.
@@ -270,7 +310,7 @@ impl NativeRows for StripCompositor<'_> {
         if self.strip_row != Some(tile_row) {
             self.composite_tile_row(tile_row);
         }
-        let row_bytes = self.map_w as usize * self.tile_px as usize * 4;
+        let row_bytes = self.tile_cols.len() * self.tile_px as usize * 4;
         let start = (y % self.tile_px) as usize * row_bytes;
         &self.strip[start..start + row_bytes]
     }

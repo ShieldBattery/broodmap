@@ -33,6 +33,57 @@ WebAssembly memory grows to fit the largest map parsed and never shrinks, so sum
 of maps (especially with raised limits) keeps that much memory for the life of the module. Scan
 from a worker that can be terminated afterwards to give it back.
 
+## Render options
+
+`MapRenderer`'s `requiredAssets`, `requiredGraphics`, `loadAssets`, `renderRgba`, `renderPng` and
+`planJson` take the same options JSON (the `MapRenderOptions` TypeScript interface); every field is
+optional. `minimapRgba`/`minimapPng` read only `startLocations`, `asPlaced` and `scale`.
+
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `style` | `"original"` | Art: `original` (SD), `remastered` or `cartooned` (alias `carbot`). |
+| `unitStyle` | `style` | A different art style for units and sprites. |
+| `size` | `1024` | Maximum output dimension of the whole map, in pixels. Never upscales past the art's native px/tile. |
+| `maxOutputPixels` | `67108864` | Pixel budget for the whole-map image; the resolution is lowered until it fits. |
+| `region` | none | `{ x, y, width, height }` in map tiles: render only that rectangle of the map (see below). |
+| `startLocations` | `"block"` | `block` (player-colored token), `sprite` (the in-game graphic) or `hidden`. |
+| `asPlaced` | `false` | Show every placed unit (UMS view) instead of applying melee rules. |
+| `showCritters`, `showResources`, `showDoodads`, `showNeutralBuildings`, `showShadows` | `true` | Toggle those classes of units and sprites. |
+| `terrainOnly` | `false` | `renderRgba`/`renderPng`: terrain alone, no units or sprites. |
+| `scale` | `1` | Minimap only: integer upscale of the native minimap. |
+
+### Regions
+
+`region` renders a rectangle of the map, for zoomable viewers that render tiles on demand instead
+of holding a whole full-resolution map (a 256x256 map at 32 px/tile is 8192x8192, 256 MB of
+RGBA). The result is pixel-identical to the same rectangle cropped out of the whole-map render
+with the same options, so regions tile with no seams: units, sprites, shadows and start-location
+tokens crossing a region's edge are drawn clipped, and terrain filtering reads past the edge.
+Resolution still comes from `size` and `maxOutputPixels` applied to the *whole* map, so every
+region of a map shares one pixel grid. The region is clipped to the map, so edge regions can come
+back smaller than asked; one entirely off the map renders 0x0.
+
+To render at a fixed density, set `size` to the map's longer side in tiles times the px/tile:
+
+```js
+const ppt = 32 // native SD; 16 or 8 for zoomed-out levels
+const longest = Math.max(map.widthTiles, map.heightTiles)
+const base = { style: 'original', size: longest * ppt }
+map.loadAssets(storage, JSON.stringify(base)) // no region: loads what every region needs
+const span = 512 / ppt // a 512px tile covers 16x16 map tiles at 32 px/tile
+const region = { x: 2 * span, y: 0, width: span, height: span } // the third tile of the top row
+const tile = map.renderRgba(JSON.stringify({ ...base, region }))
+```
+
+The default pixel budget fits a 256x256 map at 32 px/tile exactly; raise `maxOutputPixels` for
+denser renders of big maps (e.g. Remastered at 64 px/tile), which only sizes the virtual
+whole-map image. A region render composites only the terrain under the region plus the filter's
+margin and draws only units and sprites that reach it, so its cost and memory follow the region:
+on a 256x256 map, a 512px tile at 32 px/tile renders in about 1 ms against about 75 ms for the
+whole map, and at 16 px/tile in about 7 ms against 400 ms (native release build, `original`
+style). With a `region`, `requiredGraphics`/`loadAssets` list only that region's art; without
+one they cover every region.
+
 ## Package
 
 Published as `@shieldbattery/broodmap`, an ES module package built once with `wasm-pack --target
