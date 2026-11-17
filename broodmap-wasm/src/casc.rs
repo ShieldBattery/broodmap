@@ -143,6 +143,20 @@ impl CascStorage {
     pub fn cached_bytes(&self) -> usize {
         self.cache.borrow().used
     }
+
+    /// Reads one file out of the install by its catalog path (case-insensitive, either separator),
+    /// such as `webui/dist/lib/images/cmdicons.0.png`, for callers that want game files other than
+    /// render assets. The read bypasses the asset cache, so callers keep what they reuse. Throws if
+    /// the install has no such file, or catalogs it without having it downloaded.
+    #[wasm_bindgen(js_name = readFile)]
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        let read = || {
+            let mut bytes = vec![0; checked_size(&self.storage, path)?];
+            self.storage.read_file_into(path, &mut bytes)?;
+            Ok::<_, CascError>(bytes)
+        };
+        read().map_err(|e| format!("failed to read {path}: {e}"))
+    }
 }
 
 impl CascStorage {
@@ -160,17 +174,22 @@ impl CascStorage {
 
 /// Reads and decodes `path` straight into a new `Arc`: one allocation of exactly its decoded size,
 /// rather than a `Vec` that converting into an `Arc` would copy.
-fn read_shared(storage: &Storage<JsProvider>, path: &str) -> Result<Arc<[u8]>, CascError> {
+/// The decoded size of `path`, within the limit reads are held to.
+fn checked_size(storage: &Storage<JsProvider>, path: &str) -> Result<usize, CascError> {
     // The storage is opened with the default limits, and the size comes from the encoding table, so
     // check it before allocating rather than leaving that to `read_file_into`.
     let limit = ReadLimits::default().max_decoded_bytes;
-    let size = usize::try_from(storage.file_size(path)?)
+    usize::try_from(storage.file_size(path)?)
         .ok()
         .filter(|&size| size <= limit)
         .ok_or(CascError::LimitExceeded {
             what: "decoded file",
             limit,
-        })?;
+        })
+}
+
+fn read_shared(storage: &Storage<JsProvider>, path: &str) -> Result<Arc<[u8]>, CascError> {
+    let size = checked_size(storage, path)?;
     let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, size).collect();
     storage.read_file_into(path, Arc::get_mut(&mut bytes).expect("a new Arc is unique"))?;
     Ok(bytes)

@@ -38,4 +38,13 @@ export function renderFromInstall(files: CascFiles, mapBytes: Uint8Array): Uint8
   }
 }
 
+export function readIcon(files: CascFiles): Uint8Array {
+  const storage = new CascStorage(files)
+  try {
+    return storage.readFile('webui/dist/lib/images/cmdicons.0.png')
+  } finally {
+    storage.free()
+  }
+}
+
 export { initSync }

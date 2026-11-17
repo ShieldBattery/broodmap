@@ -96,6 +96,11 @@ needs the ~38 MB `SD/mainSD.anim`). `new CascStorage(files, '{"cacheBytes": N}')
 cache (default 128 MiB, about the whole `original`-style set). `storage.version` is the
 install's game version, for keying rendered-image caches. `free()` the storage to close its files.
 
+`storage.readFile(path)` reads any other file out of the install by its catalog path
+(case-insensitive, either separator) as a `Uint8Array`, such as the command card icons the game
+ships for its web UI (`webui/dist/lib/images/cmdicons.0.png`). These reads skip the asset cache, so
+keep what you reuse. It throws if the install has no such file or hasn't downloaded it.
+
 `pkg/` and `examples/assets/` are build/game-data artifacts and are gitignored;
 the assets are Blizzard's and must never be committed.
 

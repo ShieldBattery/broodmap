@@ -102,3 +102,18 @@ test('renders from a SC:R install through CascStorage', async t => {
   assert.equal(storage.cachedBytes, cached, 'a second render of the same map reads only from the cache')
   storage.free()
 })
+
+test('reads any file from a SC:R install through CascStorage', t => {
+  const installDir = process.env.BROODMAP_TEST_SCR_DIR
+  if (!installDir) {
+    t.skip('BROODMAP_TEST_SCR_DIR not set')
+    return
+  }
+  const storage = new esm.CascStorage(nodeCascFiles(installDir))
+  const icon = storage.readFile(String.raw`WEBUI\dist\lib\images\cmdicons.0.png`)
+  assert.ok(icon instanceof Uint8Array)
+  assert.deepEqual([...icon.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47])
+  assert.equal(storage.cachedBytes, 0, 'reads outside rendering bypass the asset cache')
+  assert.throws(() => storage.readFile('no/such/file.png'), /failed to read no\/such\/file\.png/)
+  storage.free()
+})
